@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "千浩翻译 · Kilocean Translate",
+  "version": "1.2.0",
+  "description": "Kilocean 千浩翻译：用 DeepSeek API 渐进式翻译网页，并自动跟译新加载内容。权限极小，Key 只存在本机。",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://api.deepseek.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "千浩翻译",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}
