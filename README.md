@@ -43,13 +43,19 @@ Chrome / Edge 扩展：用你自己的 DeepSeek API Key，渐进式翻译当前�
 
 ## 质量门禁 / Quality Gate
 
-合并前请阅读 [AI-Native Quality Gate](docs/ai-native-quality-gate.md)：CI 绿灯必要但不充分，还需自测清单 + AI review。
+合并前请阅读：
+
+- [Merge gates](docs/MERGE_GATES.md) — Codex Review Gate + conversation resolution + Build；禁止只靠 Build 合入；Copilot 配额耗尽可人工豁免 Copilot
+- [Quality](docs/QUALITY.md) — CI / AI review 配置
+- [AI-Native Quality Gate](docs/ai-native-quality-gate.md) — 自测清单
 
 本地检查：
 
 ```bash
 node scripts/ci-check.mjs
 ```
+
+Agent 简报：[`AGENTS.md`](AGENTS.md)。
 
 ## 许可
 
