@@ -40,6 +40,17 @@ Chrome / Edge 扩展：用你自己的 DeepSeek API Key，渐进式翻译当前�
 
 网页文本会发往 DeepSeek API 以完成翻译；开发者不接收、不存储网页内容或你的 API Key。本扩展为独立第三方工具，与 DeepSeek 官方无隶属关系。
 
+
+## 质量门禁 / Quality Gate
+
+合并前请阅读 [AI-Native Quality Gate](docs/ai-native-quality-gate.md)：CI 绿灯必要但不充分，还需自测清单 + AI review。
+
+本地检查：
+
+```bash
+node scripts/ci-check.mjs
+```
+
 ## 许可
 
 个人 / 团队维护中。Issues / PR 欢迎。
