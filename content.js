@@ -709,7 +709,7 @@
         return;
       }
       if (event.key === "Shift" || event.key.startsWith("Arrow")) {
-        onSelectionMaybeTranslate();
+        onSelectionMaybeTranslate(event);
       }
     }, true);
     document.addEventListener("mousedown", (event) => {
@@ -720,17 +720,48 @@
     }, true);
   }
 
-  function onSelectionMaybeTranslate() {
+  function onSelectionMaybeTranslate(event) {
     if (selectionTimer) {
       clearTimeout(selectionTimer);
     }
     selectionTimer = setTimeout(() => {
       selectionTimer = null;
-      handleSelectionTranslate();
+      handleSelectionTranslate(event);
     }, 180);
   }
 
-  async function handleSelectionTranslate() {
+  function isSelectionInsideTranslatorUi(selection, event) {
+    const host = document.getElementById("kilocean-selection-host");
+    if (host) {
+      // closest() does not cross shadow roots; ignore events/selection inside the panel.
+      if (event?.target?.getRootNode?.() === host.shadowRoot) {
+        return true;
+      }
+      if (host.shadowRoot) {
+        const anchorRoot = selection.anchorNode?.getRootNode?.();
+        const focusRoot = selection.focusNode?.getRootNode?.();
+        if (anchorRoot === host.shadowRoot || focusRoot === host.shadowRoot) {
+          return true;
+        }
+      }
+      if (
+        (selection.anchorNode && host.contains(selection.anchorNode)) ||
+        (selection.focusNode && host.contains(selection.focusNode))
+      ) {
+        return true;
+      }
+    }
+
+    for (const node of [selection.anchorNode, selection.focusNode]) {
+      const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+      if (el?.closest?.("[data-deepseek-translator-ui], #kilocean-selection-host")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function handleSelectionTranslate(event) {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
       return;
@@ -741,8 +772,7 @@
       return;
     }
 
-    const anchorNode = selection.anchorNode;
-    if (anchorNode?.parentElement?.closest?.("[data-deepseek-translator-ui], #kilocean-selection-host")) {
+    if (isSelectionInsideTranslatorUi(selection, event)) {
       return;
     }
 
