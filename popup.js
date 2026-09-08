@@ -1,9 +1,12 @@
 "use strict";
 
+const Utils = globalThis.DeepSeekTranslatorUtils;
+
 const DEFAULT_SETTINGS = {
   apiKey: "",
   model: "deepseek-v4-flash",
-  targetLanguage: "zh-CN"
+  targetLanguage: "zh-CN",
+  displayMode: Utils.DISPLAY_MODES.bilingual
 };
 
 const elements = {
@@ -18,11 +21,13 @@ const elements = {
   printPdf: document.getElementById("print-pdf"),
   statusCard: document.querySelector(".status-card"),
   statusTitle: document.getElementById("status-title"),
-  statusDetail: document.getElementById("status-detail")
+  statusDetail: document.getElementById("status-detail"),
+  modeButtons: [...document.querySelectorAll(".mode-button")]
 };
 
 let currentTab = null;
 let statusTimer = null;
+let currentDisplayMode = Utils.DISPLAY_MODES.bilingual;
 
 initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
 
@@ -31,6 +36,36 @@ elements.toggleKey.addEventListener("click", () => {
   elements.apiKey.type = revealing ? "text" : "password";
   elements.toggleKey.textContent = revealing ? "隐藏" : "显示";
   elements.toggleKey.setAttribute("aria-label", revealing ? "隐藏 API Key" : "显示 API Key");
+});
+
+elements.modeButtons.forEach((button) => {
+  button.addEventListener("click", async () => {
+    const mode = Utils.normalizeDisplayMode(button.dataset.mode);
+    currentDisplayMode = mode;
+    renderDisplayMode();
+    await chrome.storage.local.set({ displayMode: mode });
+
+    if (!currentTab?.id) {
+      return;
+    }
+
+    try {
+      await ensureContentScript(currentTab.id);
+      const response = await chrome.tabs.sendMessage(currentTab.id, {
+        type: "SET_DISPLAY_MODE",
+        displayMode: mode
+      });
+      if (response?.ok) {
+        if (response.status?.displayMode) {
+          currentDisplayMode = Utils.normalizeDisplayMode(response.status.displayMode);
+          renderDisplayMode();
+        }
+        renderTranslationStatus(response.status);
+      }
+    } catch {
+      // Page may not allow injection yet; mode is still saved for next translate.
+    }
+  });
 });
 
 elements.testConnection.addEventListener("click", async () => {
@@ -68,7 +103,7 @@ elements.translate.addEventListener("click", async () => {
   }
 
   elements.translate.disabled = true;
-  setStatus("正在启动翻译", "识别当前页面中的文本内容", "loading");
+  setStatus("正在启动翻译", "识别当前页面中的段落内容", "loading");
 
   try {
     const settings = await saveSettings();
@@ -77,7 +112,8 @@ elements.translate.addEventListener("click", async () => {
       type: "START_TRANSLATION",
       options: {
         targetLanguage: settings.targetLanguage,
-        model: settings.model
+        model: settings.model,
+        displayMode: settings.displayMode
       }
     });
 
@@ -95,14 +131,18 @@ elements.translate.addEventListener("click", async () => {
 
 elements.restore.addEventListener("click", async () => {
   try {
+    await ensureContentScript(currentTab.id);
     const response = await chrome.tabs.sendMessage(currentTab.id, { type: "RESTORE_ORIGINAL" });
     if (!response?.ok) {
       throw new Error("恢复失败");
     }
+    currentDisplayMode = Utils.DISPLAY_MODES.bilingual;
+    renderDisplayMode();
+    await chrome.storage.local.set({ displayMode: Utils.DISPLAY_MODES.bilingual });
     renderTranslationStatus(response.status);
     stopStatusPolling();
   } catch {
-    setStatus("当前页面尚未翻译", "点击“翻译当前网页”开始", "idle");
+    setStatus("当前页面尚未翻译", "点击“翻译当前网页”开始，或划词翻译", "idle");
   }
 });
 
@@ -132,21 +172,28 @@ async function initialize() {
   elements.apiKey.value = settings.apiKey;
   elements.targetLanguage.value = settings.targetLanguage;
   elements.model.value = settings.model;
+  currentDisplayMode = Utils.normalizeDisplayMode(settings.displayMode);
+  renderDisplayMode();
 
   if (!currentTab?.id) {
     throw new Error("找不到当前标签页");
   }
 
   try {
+    await ensureContentScript(currentTab.id);
     const response = await chrome.tabs.sendMessage(currentTab.id, { type: "GET_STATUS" });
     if (response?.ok) {
+      if (response.status.displayMode) {
+        currentDisplayMode = Utils.normalizeDisplayMode(response.status.displayMode);
+        renderDisplayMode();
+      }
       renderTranslationStatus(response.status);
       if (response.status.active) {
         startStatusPolling();
       }
     }
   } catch {
-    // Content script is injected only after the user clicks translate.
+    // Restricted pages cannot be injected.
   }
 }
 
@@ -154,10 +201,19 @@ async function saveSettings() {
   const settings = {
     apiKey: elements.apiKey.value.trim(),
     targetLanguage: elements.targetLanguage.value,
-    model: elements.model.value
+    model: elements.model.value,
+    displayMode: Utils.normalizeDisplayMode(currentDisplayMode)
   };
   await chrome.storage.local.set(settings);
   return settings;
+}
+
+function renderDisplayMode() {
+  elements.modeButtons.forEach((button) => {
+    const active = button.dataset.mode === currentDisplayMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-checked", active ? "true" : "false");
+  });
 }
 
 function validateApiKey() {
@@ -210,13 +266,13 @@ function renderTranslationStatus(status) {
   updateExportAvailability(status);
 
   if (!status?.active) {
-    setStatus("准备就绪", "点击下方按钮开始翻译当前网页", "idle");
+    setStatus("准备就绪", "可整页翻译，或在页面上划词查看译文", "idle");
     return;
   }
 
   if (status.phase === "translating") {
     const progress = status.total > 0
-      ? `已完成 ${status.translated} / ${status.total} 条`
+      ? `已完成 ${status.translated} / ${status.total} 段`
       : "正在识别网页内容";
     setStatus("正在翻译", progress, "loading");
     return;
@@ -227,8 +283,13 @@ function renderTranslationStatus(status) {
     return;
   }
 
-  const failureText = status.failed > 0 ? `，${status.failed} 条失败` : "";
-  setStatus("翻译已开启", `已翻译 ${status.translated} 条${failureText}，将自动处理新内容`, "success");
+  const failureText = status.failed > 0 ? `，${status.failed} 段失败` : "";
+  const modeLabel = {
+    bilingual: "双语对照",
+    "translation-only": "仅译文",
+    original: "原文"
+  }[status.displayMode] || "双语对照";
+  setStatus("翻译已开启", `已翻译 ${status.translated} 段${failureText} · ${modeLabel} · 自动跟译新内容`, "success");
 }
 
 async function runExportAction(type, pendingTitle, successDetail) {
