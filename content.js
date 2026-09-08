@@ -27,6 +27,7 @@
   let generation = 0;
   let toastTimer = null;
   let selectionTimer = null;
+  let selectionGeneration = 0;
   let styleHost = null;
 
   const state = {
@@ -126,6 +127,7 @@
     );
     if (displayMode === Utils.DISPLAY_MODES.original) {
       displayMode = Utils.DISPLAY_MODES.bilingual;
+      chrome.storage.local.set({ displayMode });
     }
 
     if (state.active && state.targetLanguage === targetLanguage && state.phase === "translating") {
@@ -759,6 +761,10 @@
       return;
     }
 
+    // Bump generation so a newer selection or dismiss invalidates in-flight work.
+    selectionGeneration += 1;
+    const requestId = selectionGeneration;
+
     const panel = ensureSelectionPanel();
     positionSelectionPanel(panel, rect);
     setSelectionPanelState(panel, "loading", "正在翻译选中文本…");
@@ -769,6 +775,10 @@
         model: state.model,
         apiKey: ""
       });
+
+      if (requestId !== selectionGeneration) {
+        return;
+      }
 
       if (!String(stored.apiKey || "").trim()) {
         setSelectionPanelState(panel, "error", "请先在扩展弹窗中填写 API Key");
@@ -784,6 +794,10 @@
         model
       });
 
+      if (requestId !== selectionGeneration) {
+        return;
+      }
+
       if (!response?.ok) {
         throw new Error(response?.error || "翻译失败");
       }
@@ -795,6 +809,9 @@
 
       setSelectionPanelState(panel, "success", translation, text);
     } catch (error) {
+      if (requestId !== selectionGeneration) {
+        return;
+      }
       setSelectionPanelState(panel, "error", error.message || "翻译失败");
     }
   }
@@ -924,6 +941,8 @@
   }
 
   function hideSelectionPanel() {
+    // Invalidate any in-flight TRANSLATE_BATCH so a late response cannot reopen the panel.
+    selectionGeneration += 1;
     const host = document.getElementById("kilocean-selection-host");
     if (host) {
       host.hidden = true;

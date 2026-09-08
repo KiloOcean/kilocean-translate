@@ -120,6 +120,10 @@ elements.translate.addEventListener("click", async () => {
     if (!response?.ok) {
       throw new Error(response?.error || "无法启动翻译");
     }
+    if (response.status?.displayMode) {
+      currentDisplayMode = Utils.normalizeDisplayMode(response.status.displayMode);
+      renderDisplayMode();
+    }
     renderTranslationStatus(response.status);
     startStatusPolling();
   } catch (error) {
@@ -136,9 +140,11 @@ elements.restore.addEventListener("click", async () => {
     if (!response?.ok) {
       throw new Error("恢复失败");
     }
-    currentDisplayMode = Utils.DISPLAY_MODES.bilingual;
-    renderDisplayMode();
-    await chrome.storage.local.set({ displayMode: Utils.DISPLAY_MODES.bilingual });
+    // Preserve the user's displayMode preference in chrome.storage and the radiogroup.
+    if (response.status?.displayMode) {
+      currentDisplayMode = Utils.normalizeDisplayMode(response.status.displayMode);
+      renderDisplayMode();
+    }
     renderTranslationStatus(response.status);
     stopStatusPolling();
   } catch {
@@ -247,6 +253,13 @@ function startStatusPolling() {
     try {
       const response = await chrome.tabs.sendMessage(currentTab.id, { type: "GET_STATUS" });
       if (response?.ok) {
+        if (response.status?.displayMode) {
+          const nextMode = Utils.normalizeDisplayMode(response.status.displayMode);
+          if (nextMode !== currentDisplayMode) {
+            currentDisplayMode = nextMode;
+            renderDisplayMode();
+          }
+        }
         renderTranslationStatus(response.status);
       }
     } catch {
