@@ -379,16 +379,29 @@
     }
   }
 
+  function discardBlockRecord(block) {
+    const record = blockRecords.get(block);
+    if (!record) {
+      return false;
+    }
+    teardownBlockRecord(record);
+    blockRecords.delete(block);
+    // Keep total aligned with live records — dynamic re-translate adds total again.
+    if (state.translated > 0) {
+      state.translated -= 1;
+    }
+    if (state.total > 0) {
+      state.total -= 1;
+    }
+    return true;
+  }
+
   function pruneDetachedBlockRecords() {
     for (const [block, record] of [...blockRecords.entries()]) {
       if (block.isConnected) {
         continue;
       }
-      teardownBlockRecord(record);
-      blockRecords.delete(block);
-      if (state.translated > 0) {
-        state.translated -= 1;
-      }
+      discardBlockRecord(block);
     }
   }
 
@@ -724,6 +737,11 @@
     }
 
     if (segments.length === 0 || runId !== generation) {
+      // Dynamic schedule may have marked translating before discovery found work.
+      if (isDynamic && runId === generation && state.active && state.phase === "translating") {
+        state.phase = state.failed > 0 && state.translated === 0 ? "error" : "translated";
+        notifyPopupStatus();
+      }
       return;
     }
 
@@ -873,6 +891,15 @@
     return `${leftStr}${sep}${rightStr}`;
   }
 
+  function translationOrNull(value) {
+    const raw = String(value ?? "");
+    // Reject empty/whitespace-only halves so joinSplitTranslations cannot hide a missing half.
+    if (!raw.trim()) {
+      return null;
+    }
+    return raw;
+  }
+
   async function translateSegmentTextWithSplit(text, runId, runSettings) {
     // Proactively bisect oversized text before any request: a whole-body
     // TRANSLATE_BATCH can fail with a non-canSplit error (X long posts are a
@@ -885,16 +912,16 @@
         if (!translations) {
           return null;
         }
-        return String(translations[0] || "");
+        return translationOrNull(translations[0]);
       }
       const leftSource = text.slice(0, splitAt);
       const rightSource = text.slice(splitAt);
       const left = await translateSegmentTextWithSplit(leftSource, runId, runSettings);
-      if (left == null || runId !== generation) {
+      if (left == null || !String(left).trim() || runId !== generation) {
         return null;
       }
       const right = await translateSegmentTextWithSplit(rightSource, runId, runSettings);
-      if (right == null || runId !== generation) {
+      if (right == null || !String(right).trim() || runId !== generation) {
         return null;
       }
       // Preserve boundary whitespace from the original slice join.
@@ -906,7 +933,7 @@
       if (!translations) {
         return null;
       }
-      return String(translations[0] || "");
+      return translationOrNull(translations[0]);
     } catch (error) {
       if (!error.canSplit || runId !== generation) {
         throw error;
@@ -918,11 +945,11 @@
       const leftSource = text.slice(0, splitAt);
       const rightSource = text.slice(splitAt);
       const left = await translateSegmentTextWithSplit(leftSource, runId, runSettings);
-      if (left == null || runId !== generation) {
+      if (left == null || !String(left).trim() || runId !== generation) {
         return null;
       }
       const right = await translateSegmentTextWithSplit(rightSource, runId, runSettings);
-      if (right == null || runId !== generation) {
+      if (right == null || !String(right).trim() || runId !== generation) {
         return null;
       }
       // Preserve boundary whitespace from the original slice join.
@@ -1092,6 +1119,13 @@
         "DFN", "ABBR", "TIME", "SUB", "SUP", "U", "S", "VAR", "OUTPUT"
       ]);
       const wrapTag = inlineHosts.has(block.tagName) ? "span" : "div";
+      // True phrasing hosts need inline companions — block display would break
+      // button/strong flex items. Blockish span hosts (P/H1/LI/…) keep block.
+      const phrasingCompanionHosts = new Set([
+        "A", "SPAN", "LABEL",
+        "BUTTON", "STRONG", "EM", "B", "I", "SMALL", "MARK", "CITE", "Q",
+        "DFN", "ABBR", "TIME", "SUB", "SUP", "U", "S", "VAR", "OUTPUT"
+      ]);
       let placement = getTranslationPlacement(block);
       // Nested translated descendants must stay visible in translation-only mode;
       // after-host would hide the whole nowrap flex host including those nested blocks.
@@ -1107,6 +1141,9 @@
       companion.setAttribute("data-deepseek-translator-ui", "true");
       companion.setAttribute("lang", getRunSettings().targetLanguage);
       companion.textContent = translation;
+      if (phrasingCompanionHosts.has(block.tagName)) {
+        companion.classList.add("kilocean-translation--inline");
+      }
 
       if (placement === "after-host" && block.parentNode && block !== document.body && block !== document.documentElement) {
         // nowrap flex: full-width flex item would squeeze siblings — place as block sibling.
@@ -1255,6 +1292,12 @@
         line-height: inherit;
         white-space: pre-wrap;
       }
+      [data-kilocean-block] > .kilocean-translation.kilocean-translation--inline {
+        display: inline;
+        margin-top: 0;
+        padding-top: 0;
+        border-top: 0;
+      }
       [data-kilocean-block][data-kilocean-layout="flow"] > .kilocean-translation--flow {
         flex: 0 0 100%;
         width: 100%;
@@ -1262,7 +1305,7 @@
         grid-column: 1 / -1;
         box-sizing: border-box;
       }
-      .kilocean-translation--after {
+      .kilocean-translation--after[data-deepseek-translator-ui] {
         display: block;
         width: 100%;
         max-width: 100%;
@@ -1273,7 +1316,7 @@
         line-height: inherit;
         white-space: pre-wrap;
       }
-      li.kilocean-translation--after {
+      li.kilocean-translation--after[data-deepseek-translator-ui] {
         list-style: none;
       }
       html[data-kilocean-display="bilingual"] [data-kilocean-block] [data-kilocean-original-wrap] {
@@ -1283,7 +1326,10 @@
         display: block;
         opacity: 0.96;
       }
-      html[data-kilocean-display="bilingual"] .kilocean-translation--after {
+      html[data-kilocean-display="bilingual"] [data-kilocean-block] > .kilocean-translation.kilocean-translation--inline {
+        display: inline;
+      }
+      html[data-kilocean-display="bilingual"] .kilocean-translation--after[data-deepseek-translator-ui] {
         opacity: 0.96;
       }
       html[data-kilocean-display="translation-only"] [data-kilocean-block] [data-kilocean-original-wrap] {
@@ -1296,7 +1342,10 @@
         padding-top: 0;
         border-top: 0;
       }
-      html[data-kilocean-display="translation-only"] .kilocean-translation--after {
+      html[data-kilocean-display="translation-only"] [data-kilocean-block] > .kilocean-translation.kilocean-translation--inline {
+        display: inline;
+      }
+      html[data-kilocean-display="translation-only"] .kilocean-translation--after[data-deepseek-translator-ui] {
         display: block;
         margin-top: 0;
         padding-top: 0;
@@ -1306,7 +1355,7 @@
         display: contents;
       }
       html[data-kilocean-display="original"] [data-kilocean-block] > .kilocean-translation,
-      html[data-kilocean-display="original"] .kilocean-translation--after {
+      html[data-kilocean-display="original"] .kilocean-translation--after[data-deepseek-translator-ui] {
         display: none !important;
       }
     `;
@@ -1401,6 +1450,51 @@
     }
   }
 
+  function collectRemovedRecordedBlocks(removedNodes) {
+    const found = new Set();
+    for (const node of removedNodes) {
+      if (!node || node.nodeType !== Node.ELEMENT_NODE) {
+        continue;
+      }
+      if (blockRecords.has(node)) {
+        found.add(node);
+      }
+      // Unrecorded wrappers around recorded nested blocks (e.g. remove <div>
+      // from <section>Hello<div><p>World</p></div></section>) must count too.
+      for (const block of blockRecords.keys()) {
+        if (block !== node && node.contains(block)) {
+          found.add(block);
+        }
+      }
+    }
+    return found;
+  }
+
+  function isRemovalOfOnlyRecordedContent(node, removedRecordedBlocks) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) {
+      return false;
+    }
+    if (removedRecordedBlocks.has(node)) {
+      return true;
+    }
+    const nested = [...removedRecordedBlocks].filter((block) => node.contains(block));
+    if (nested.length === 0) {
+      return false;
+    }
+    // Detached subtrees cannot use getComputedStyle-backed collectors — walk text
+    // nodes directly and ignore text owned by the nested recorded blocks.
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    let textNode;
+    let leftover = "";
+    while ((textNode = walker.nextNode())) {
+      if (nested.some((block) => block.contains(textNode))) {
+        continue;
+      }
+      leftover += textNode.data || "";
+    }
+    return !/\S/u.test(leftover);
+  }
+
   function startObserving() {
     stopObserving();
     mutationObserver = new MutationObserver((records) => {
@@ -1428,22 +1522,20 @@
                 endApplyingDom(styleGen);
               }
             }
-            // Snapshot recorded removed children BEFORE prune deletes their
-            // records — permanently removed nested translated blocks must not
-            // look like content edits of the still-connected ancestor.
-            const removedRecordedBlocks = new Set(
-              [...record.removedNodes].filter(
-                (node) => node.nodeType === Node.ELEMENT_NODE && blockRecords.has(node)
-              )
-            );
+            // Snapshot recorded removed children/descendants BEFORE prune deletes
+            // their records — permanently removed nested translated blocks must
+            // not look like content edits of the still-connected ancestor.
+            const removedRecordedBlocks = collectRemovedRecordedBlocks(record.removedNodes);
             pruneDetachedBlockRecords();
             // Removal-only SPA updates never appear in addedNodes — refresh via target.
-            // Recorded blocks in removedNodes are moves or permanent removals —
-            // do not queue the ancestor for teardown/rebill when source is unchanged.
+            // Recorded blocks in removedNodes (direct or inside an unrecorded wrapper)
+            // are moves or permanent removals — do not queue the ancestor for
+            // teardown/rebill when the wrapper contributes no other source text.
             const removedOnlyUi = [...record.removedNodes].every((node) =>
               isIgnoredTranslatorMutation(node) ||
               isReparentIntoOriginalWrap(node) ||
-              removedRecordedBlocks.has(node)
+              removedRecordedBlocks.has(node) ||
+              isRemovalOfOnlyRecordedContent(node, removedRecordedBlocks)
             );
             if (!removedOnlyUi) {
               const refreshHost = findRefreshHostForMutation(record.target);
@@ -1517,18 +1609,18 @@
     if (dynamicTimer) {
       clearTimeout(dynamicTimer);
     }
+    // Mark busy before the debounce window so export cannot race pending work.
+    if (state.active) {
+      state.phase = "translating";
+      notifyPopupStatus();
+    }
     dynamicTimer = setTimeout(() => {
       dynamicTimer = null;
       pruneDetachedBlockRecords();
 
       for (const block of pendingRefreshBlocks) {
-        const record = blockRecords.get(block);
-        if (record) {
-          teardownBlockRecord(record);
-          blockRecords.delete(block);
-          if (state.translated > 0) {
-            state.translated -= 1;
-          }
+        if (blockRecords.has(block)) {
+          discardBlockRecord(block);
         }
         if (block?.isConnected) {
           pendingRoots.add(block);
@@ -1540,6 +1632,13 @@
       pendingRoots.clear();
       const blocks = roots.flatMap((root) => collectBlocks(root));
       const runId = generation;
+      if (blocks.length === 0) {
+        if (runId === generation && state.active && state.phase === "translating") {
+          state.phase = state.failed > 0 && state.translated === 0 ? "error" : "translated";
+          notifyPopupStatus();
+        }
+        return;
+      }
       workQueue = workQueue.then(() => translateBlocks(blocks, runId, true));
     }, 450);
   }
