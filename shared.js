@@ -120,6 +120,16 @@
       throw new Error("DeepSeek 返回结果缺少 translations 数组");
     }
 
+    // A single multi-paragraph segment sometimes comes back as one entry per
+    // paragraph; rejoin with the original \n\n separator so counts match again.
+    if (
+      expectedCount === 1 &&
+      translations.length > 1 &&
+      translations.every((item) => typeof item === "string")
+    ) {
+      return [translations.join("\n\n")];
+    }
+
     if (translations.length !== expectedCount) {
       throw new Error(`DeepSeek 返回 ${translations.length} 条结果，预期 ${expectedCount} 条`);
     }

@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -139,6 +140,73 @@ function extractContentFunction(name) {
   return match ? match[0] : null;
 }
 
+
+function checkParseTranslationPayload() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for parseTranslationPayload test: ${error.message}`);
+    return;
+  }
+  const { parseTranslationPayload } = utils;
+  if (typeof parseTranslationPayload !== "function") {
+    fail("shared.js: parseTranslationPayload export missing");
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertThrows = (fn, label) => {
+    let threw = false;
+    try {
+      fn();
+    } catch {
+      threw = true;
+    }
+    if (!threw) {
+      fail(`${label}: expected throw`);
+    }
+  };
+
+  // expectedCount 1 + N>1 all-string translations → join with \n\n
+  assertEqual(
+    parseTranslationPayload(JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }), 1),
+    ["甲段\n\n乙段\n\n丙段"],
+    "parseTranslationPayload: join N>1 when expectedCount===1"
+  );
+
+  // expectedCount 1 + exact 1 string → unchanged
+  assertEqual(
+    parseTranslationPayload(JSON.stringify({ translations: ["单段译文"] }), 1),
+    ["单段译文"],
+    "parseTranslationPayload: single string passthrough"
+  );
+
+  // expectedCount 2 + 2 strings → ok
+  assertEqual(
+    parseTranslationPayload(JSON.stringify({ translations: ["一", "二"] }), 2),
+    ["一", "二"],
+    "parseTranslationPayload: matching multi-count"
+  );
+
+  // expectedCount 2 + 3 strings → throws
+  assertThrows(
+    () => parseTranslationPayload(JSON.stringify({ translations: ["一", "二", "三"] }), 2),
+    "parseTranslationPayload: mismatch when expectedCount>1"
+  );
+
+  // expectedCount 1 + N>1 with a non-string item → throws
+  assertThrows(
+    () => parseTranslationPayload(JSON.stringify({ translations: ["甲", 2, "丙"] }), 1),
+    "parseTranslationPayload: non-string items must not join"
+  );
+}
+
 function checkSegmentSplitLogic() {
   const splitFnSource = extractContentFunction("findSegmentSplitIndex");
   if (!splitFnSource) {
@@ -256,6 +324,7 @@ function main() {
   }
 
   checkSegmentSplitLogic();
+  checkParseTranslationPayload();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -265,7 +334,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload");
   process.exit(0);
 }
 
