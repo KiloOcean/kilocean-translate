@@ -185,11 +185,15 @@ function checkParseTranslationPayload() {
   assertEqual(hasMultiParagraphSource("a\nb"), true, "hasMultiParagraphSource: single-newline lines");
   assertEqual(hasMultiParagraphSource("单段原文"), false, "hasMultiParagraphSource: single line");
   assertEqual(hasMultiParagraphSource(""), false, "hasMultiParagraphSource: empty");
+  assertEqual(hasMultiParagraphSource("第一段\n \n第二段"), true, "hasMultiParagraphSource: whitespace-only blank line");
+  assertEqual(hasMultiParagraphSource("第一段\r\n\r\n第二段"), true, "hasMultiParagraphSource: CRLF blank line");
 
   assertEqual(countSourceParagraphUnits("第一段\n\n第二段\n\n第三段"), 3, "countSourceParagraphUnits: blank-line paras");
   assertEqual(countSourceParagraphUnits("第一段\n第二段\n第三段"), 3, "countSourceParagraphUnits: single-newline lines");
   assertEqual(countSourceParagraphUnits("单段原文"), 1, "countSourceParagraphUnits: single line");
   assertEqual(countSourceParagraphUnits(""), 0, "countSourceParagraphUnits: empty");
+  assertEqual(countSourceParagraphUnits("第一段\n \n第二段"), 2, "countSourceParagraphUnits: whitespace-only blank line paras");
+  assertEqual(countSourceParagraphUnits("第一段\r\n\r\n第二段"), 2, "countSourceParagraphUnits: CRLF blank line paras");
 
   // expectedCount 1 + N>1 all-string + multi-paragraph source → join with \n\n
   assertEqual(
@@ -211,6 +215,58 @@ function checkParseTranslationPayload() {
     ),
     ["甲段\n乙段\n丙段"],
     "parseTranslationPayload: join N>1 on single-\\n multi-line source"
+  );
+
+  // Recovered entries are trimmed before joining so edge whitespace cannot
+  // stack newlines/gaps around the separator.
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段\n", "\n乙段"] }),
+      1,
+      "第一段\n\n第二段"
+    ),
+    ["甲段\n\n乙段"],
+    "parseTranslationPayload: trim recovered entries before \\n\\n join"
+  );
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段  ", " 乙段"] }),
+      1,
+      "第一段\n第二段"
+    ),
+    ["甲段\n乙段"],
+    "parseTranslationPayload: trim recovered entries before \\n join"
+  );
+
+  // Whitespace-only / CRLF blank lines still count as paragraph breaks: the
+  // join must use \n\n, not collapse to a single \n.
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段"] }),
+      1,
+      "第一段\n \n第二段"
+    ),
+    ["甲段\n\n乙段"],
+    "parseTranslationPayload: whitespace-only blank line joins with \\n\\n"
+  );
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段"] }),
+      1,
+      "第一段\r\n\r\n第二段"
+    ),
+    ["甲段\n\n乙段"],
+    "parseTranslationPayload: CRLF blank line joins with \\n\\n"
+  );
+
+  // Normalized blank-line counting must still fail closed on count mismatch
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }),
+      1,
+      "第一段\n \n第二段"
+    ),
+    "parseTranslationPayload: must not join on whitespace-only blank line with extra translations"
   );
 
   // Join recovery must only run when returned entry count matches source units
