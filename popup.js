@@ -31,6 +31,35 @@ let currentDisplayMode = Utils.DISPLAY_MODES.bilingual;
 
 initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
 
+// Keep radiogroup in sync when content coerces original→bilingual mid-start.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.displayMode) {
+    return;
+  }
+  const nextMode = Utils.normalizeDisplayMode(changes.displayMode.newValue);
+  if (nextMode !== currentDisplayMode) {
+    currentDisplayMode = nextMode;
+    renderDisplayMode();
+  }
+});
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type !== "CONTENT_STATUS" || !message.status) {
+    return;
+  }
+  if (message.status.displayMode) {
+    const nextMode = Utils.normalizeDisplayMode(message.status.displayMode);
+    if (nextMode !== currentDisplayMode) {
+      currentDisplayMode = nextMode;
+      renderDisplayMode();
+    }
+  }
+  renderTranslationStatus(message.status);
+  if (message.status.active && message.status.phase === "translating") {
+    startStatusPolling();
+  }
+});
+
 elements.toggleKey.addEventListener("click", () => {
   const revealing = elements.apiKey.type === "password";
   elements.apiKey.type = revealing ? "text" : "password";

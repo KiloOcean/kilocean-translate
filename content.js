@@ -31,6 +31,10 @@
   let selectionGeneration = 0;
   let styleHost = null;
   let applyingDom = false;
+  /** @type {{ targetLanguage: string, model: string } | null} */
+  let activeRunSettings = null;
+  /** @type {{ targetLanguage?: string, model?: string } | null} */
+  let deferredRunSettings = null;
 
   const state = {
     active: false,
@@ -74,10 +78,24 @@
       refreshAllBlockDisplays();
     }
     if (changes.targetLanguage?.newValue) {
-      state.targetLanguage = changes.targetLanguage.newValue;
+      if (state.phase === "translating") {
+        deferredRunSettings = {
+          ...(deferredRunSettings || {}),
+          targetLanguage: changes.targetLanguage.newValue
+        };
+      } else {
+        state.targetLanguage = changes.targetLanguage.newValue;
+      }
     }
     if (changes.model?.newValue) {
-      state.model = changes.model.newValue;
+      if (state.phase === "translating") {
+        deferredRunSettings = {
+          ...(deferredRunSettings || {}),
+          model: changes.model.newValue
+        };
+      } else {
+        state.model = changes.model.newValue;
+      }
     }
   });
 
@@ -145,8 +163,10 @@
     let displayMode = Utils.normalizeDisplayMode(
       options.displayMode || state.displayMode || Utils.DISPLAY_MODES.bilingual
     );
+    let coercedFromOriginal = false;
     if (displayMode === Utils.DISPLAY_MODES.original) {
       displayMode = Utils.DISPLAY_MODES.bilingual;
+      coercedFromOriginal = true;
       chrome.storage.local.set({ displayMode });
     }
 
@@ -160,6 +180,8 @@
 
     generation += 1;
     const runId = generation;
+    deferredRunSettings = null;
+    activeRunSettings = { targetLanguage, model };
     Object.assign(state, {
       active: true,
       phase: "translating",
@@ -172,6 +194,10 @@
       displayMode
     });
     applyDocumentDisplayMode(displayMode);
+    // Sync popup immediately when coercing original→bilingual (before long batches).
+    if (coercedFromOriginal) {
+      notifyPopupStatus();
+    }
 
     showToast("正在识别网页内容…", "loading");
     startObserving();
@@ -181,7 +207,9 @@
 
     if (blocks.length === 0) {
       state.phase = "translated";
+      finishRunSettings();
       showToast("没有发现需要翻译的内容", "info");
+      notifyPopupStatus();
       return;
     }
 
@@ -191,6 +219,8 @@
     }
 
     state.phase = state.failed > 0 && state.translated === 0 ? "error" : "translated";
+    finishRunSettings();
+    notifyPopupStatus();
     if (state.phase === "error") {
       showToast(state.error || "翻译失败", "error", 6000);
     } else if (state.failed > 0) {
@@ -200,9 +230,42 @@
     }
   }
 
+  function finishRunSettings() {
+    activeRunSettings = null;
+    if (deferredRunSettings?.targetLanguage) {
+      state.targetLanguage = deferredRunSettings.targetLanguage;
+    }
+    if (deferredRunSettings?.model) {
+      state.model = deferredRunSettings.model;
+    }
+    deferredRunSettings = null;
+  }
+
+  function getRunSettings() {
+    return activeRunSettings || {
+      targetLanguage: state.targetLanguage,
+      model: state.model
+    };
+  }
+
+  function notifyPopupStatus() {
+    try {
+      chrome.runtime.sendMessage({
+        type: "CONTENT_STATUS",
+        status: getPublicStatus()
+      }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch {
+      // Popup may be closed; storage + final START_TRANSLATION response still sync.
+    }
+  }
+
   function restoreOriginal(options = {}) {
     generation += 1;
     stopObserving();
+    activeRunSettings = null;
+    deferredRunSettings = null;
 
     for (const record of blockRecords.values()) {
       teardownBlockRecord(record);
@@ -210,6 +273,7 @@
 
     blockRecords.clear();
     pendingRoots.clear();
+    pendingRefreshBlocks.clear();
     Object.assign(state, {
       active: false,
       phase: "idle",
@@ -231,24 +295,22 @@
     const prev = applyingDom;
     applyingDom = true;
     try {
-      if (!record.block?.isConnected) {
-        record.companion?.remove();
-        return;
-      }
-
       const { block, wrap, companion } = record;
       companion?.remove();
 
-      if (wrap?.isConnected && wrap.parentNode === block) {
+      // Fully unwrap even when the host is detached (virtualized lists / SPA reuse).
+      if (block && wrap && wrap.parentNode === block) {
         while (wrap.firstChild) {
           block.insertBefore(wrap.firstChild, wrap);
         }
         wrap.remove();
       }
 
-      block.removeAttribute("data-kilocean-block");
-      block.removeAttribute("data-kilocean-display");
-      block.removeAttribute("data-kilocean-layout");
+      if (block) {
+        block.removeAttribute("data-kilocean-block");
+        block.removeAttribute("data-kilocean-display");
+        block.removeAttribute("data-kilocean-layout");
+      }
     } finally {
       applyingDom = prev;
     }
@@ -271,6 +333,7 @@
     const textNodes = collectTextNodes(root);
     const blocks = [];
     const seen = new Set();
+    const targetLanguage = getRunSettings().targetLanguage;
 
     for (const node of textNodes) {
       const block = getBlockAncestor(node);
@@ -278,17 +341,33 @@
         continue;
       }
       const fullText = extractBlockText(block);
-      if (!fullText || !Utils.isTranslatableText(fullText, state.targetLanguage)) {
+      if (!fullText || !Utils.isTranslatableText(fullText, targetLanguage)) {
         continue;
       }
       seen.add(block);
       blocks.push(block);
     }
 
-    // Prefer deepest blocks so ancestor+descendant pairs are not both translated.
-    return blocks.filter(
+    // Prefer deepest blocks, but keep ancestors that still own direct text.
+    const deepest = blocks.filter(
       (block) => !blocks.some((other) => other !== block && block.contains(other))
     );
+    const deepestSet = new Set(deepest);
+    const withOwnText = [];
+    for (const block of blocks) {
+      if (deepestSet.has(block)) {
+        continue;
+      }
+      const nested = deepest.filter((other) => block.contains(other));
+      if (nested.length === 0) {
+        continue;
+      }
+      const ownText = extractBlockText(block, nested);
+      if (ownText && Utils.isTranslatableText(ownText, targetLanguage)) {
+        withOwnText.push(block);
+      }
+    }
+    return [...deepest, ...withOwnText];
   }
 
   function collectTextNodes(root) {
@@ -430,37 +509,107 @@
     return fallback;
   }
 
-  function extractBlockText(block) {
-    const nodes = collectRawTextNodes(block);
+  function extractBlockText(block, excludeBlocks = []) {
+    const exclude = excludeBlocks.filter(Boolean);
+    const nodes = collectRawTextNodes(block).filter((node) => (
+      !exclude.some((other) => other !== block && other.contains(node))
+    ));
+    return joinRawTextNodes(nodes);
+  }
+
+  function joinRawTextNodes(nodes) {
     if (nodes.length === 0) {
       return "";
     }
-    return nodes.map((node) => node.data).join("").replace(/\s+/gu, " ").trim();
+
+    let result = nodes[0].data;
+    for (let i = 1; i < nodes.length; i += 1) {
+      const sep = textNodeBoundarySeparator(nodes[i - 1], nodes[i]);
+      const next = nodes[i].data;
+      if (sep === "\n") {
+        result = `${result.replace(/\s+$/gu, "")}\n${next.replace(/^\s+/gu, "")}`;
+      } else if (sep === " ") {
+        if (/\s$/u.test(result) || /^\s/u.test(next)) {
+          result += next;
+        } else {
+          result += ` ${next}`;
+        }
+      } else {
+        result += next;
+      }
+    }
+
+    return result
+      .replace(/[^\S\n]+/gu, " ")
+      .replace(/\s*\n\s*/gu, "\n")
+      .trim();
+  }
+
+  function textNodeBoundarySeparator(left, right) {
+    try {
+      const range = document.createRange();
+      range.setStart(left, left.length);
+      range.setEnd(right, 0);
+      const holder = document.createElement("div");
+      holder.appendChild(range.cloneContents());
+      if (holder.querySelector("br, hr")) {
+        return "\n";
+      }
+      for (const el of holder.querySelectorAll("*")) {
+        if (BLOCK_TAGS.has(el.tagName) || el.tagName === "DIV" || el.tagName === "TR") {
+          return "\n";
+        }
+      }
+      const between = holder.textContent || "";
+      if (/\s/u.test(between)) {
+        return "";
+      }
+    } catch {
+      return " ";
+    }
+
+    const leftParent = left.parentElement;
+    const rightParent = right.parentElement;
+    if (
+      leftParent &&
+      rightParent &&
+      leftParent !== rightParent &&
+      !leftParent.contains(rightParent) &&
+      !rightParent.contains(leftParent)
+    ) {
+      return " ";
+    }
+    return "";
   }
 
   async function translateBlocks(blocks, runId, isDynamic) {
-    const uniqueBlocks = [...new Set(blocks)].filter((block) => {
-      if (!block?.isConnected || blockRecords.has(block)) {
-        return false;
-      }
-      const fullText = extractBlockText(block);
-      return Boolean(fullText) && Utils.isTranslatableText(fullText, state.targetLanguage);
-    });
+    const runSettings = getRunSettings();
+    const candidates = [...new Set(blocks)].filter((block) => block?.isConnected && !blockRecords.has(block));
 
-    if (uniqueBlocks.length === 0 || runId !== generation) {
+    const segments = [];
+    for (const block of candidates) {
+      const nested = candidates.filter((other) => other !== block && block.contains(other));
+      const text = extractBlockText(block, nested);
+      if (!text || !Utils.isTranslatableText(text, runSettings.targetLanguage)) {
+        continue;
+      }
+      segments.push({
+        block,
+        text,
+        nested,
+        companionOnly: nested.length > 0
+      });
+    }
+
+    if (segments.length === 0 || runId !== generation) {
       return;
     }
 
     if (isDynamic) {
       state.phase = "translating";
-      state.total += uniqueBlocks.length;
+      state.total += segments.length;
       showToast("正在翻译新加载的内容…", "loading");
     }
-
-    const segments = uniqueBlocks.map((block) => ({
-      block,
-      text: extractBlockText(block)
-    })).filter((segment) => segment.text);
 
     const batches = Utils.chunkSegments(segments, 5000, 24);
 
@@ -468,7 +617,7 @@
       if (runId !== generation) {
         return;
       }
-      await translateBatchWithFallback(batch, runId);
+      await translateBatchWithFallback(batch, runId, runSettings);
     }
 
     if (isDynamic && runId === generation) {
@@ -477,13 +626,13 @@
     }
   }
 
-  async function translateBatchWithFallback(batch, runId) {
+  async function translateBatchWithFallback(batch, runId, runSettings = getRunSettings()) {
     try {
       const response = await chrome.runtime.sendMessage({
         type: "TRANSLATE_BATCH",
         texts: batch.map((segment) => segment.text),
-        targetLanguage: state.targetLanguage,
-        model: state.model
+        targetLanguage: runSettings.targetLanguage,
+        model: runSettings.model
       });
 
       if (!response?.ok) {
@@ -502,7 +651,7 @@
           return;
         }
 
-        const currentText = extractBlockText(segment.block);
+        const currentText = extractBlockText(segment.block, segment.nested || []);
         if (currentText !== segment.text) {
           return;
         }
@@ -512,14 +661,16 @@
           return;
         }
 
-        applyBlockTranslation(segment.block, segment.text, rendered);
+        applyBlockTranslation(segment.block, segment.text, rendered, {
+          companionOnly: Boolean(segment.companionOnly)
+        });
         state.translated += 1;
       });
     } catch (error) {
       if (error.canSplit && batch.length > 1 && runId === generation) {
         const middle = Math.ceil(batch.length / 2);
-        await translateBatchWithFallback(batch.slice(0, middle), runId);
-        await translateBatchWithFallback(batch.slice(middle), runId);
+        await translateBatchWithFallback(batch.slice(0, middle), runId, runSettings);
+        await translateBatchWithFallback(batch.slice(middle), runId, runSettings);
         return;
       }
 
@@ -528,7 +679,7 @@
     }
   }
 
-  function applyBlockTranslation(block, originalText, translation) {
+  function applyBlockTranslation(block, originalText, translation, options = {}) {
     if (blockRecords.has(block)) {
       return;
     }
@@ -541,30 +692,43 @@
         "FIGCAPTION", "TD", "TH", "CAPTION", "SUMMARY", "A", "SPAN", "LABEL"
       ]);
       const wrapTag = inlineHosts.has(block.tagName) ? "span" : "div";
-      const flowLayout = isFlexOrGridElement(block);
+      let placement = getTranslationPlacement(block);
+      if (options.companionOnly && placement !== "after-host") {
+        placement = "companion";
+      }
       let wrap = null;
+      let layout = "wrap";
 
       const companion = document.createElement(wrapTag);
       companion.className = "kilocean-translation";
       companion.setAttribute("data-deepseek-translator-ui", "true");
-      companion.setAttribute("lang", state.targetLanguage);
+      companion.setAttribute("lang", getRunSettings().targetLanguage);
       companion.textContent = translation;
 
-      if (flowLayout) {
-        // Preserve flex/grid item structure: do not wrap existing children.
+      if (placement === "after-host" && block.parentNode && block !== document.body && block !== document.documentElement) {
+        // nowrap flex: full-width flex item would squeeze siblings — place as block sibling.
+        companion.classList.add("kilocean-translation--after");
+        block.parentNode.insertBefore(companion, block.nextSibling);
+        block.setAttribute("data-kilocean-layout", "after");
+        layout = "after";
+      } else if (placement === "flow" || placement === "companion") {
+        // Preserve flex/grid / nested-block structure: do not wrap existing children.
         companion.classList.add("kilocean-translation--flow");
         block.appendChild(companion);
         block.setAttribute("data-kilocean-layout", "flow");
+        layout = "flow";
       } else {
         wrap = document.createElement(wrapTag);
         wrap.className = "kilocean-original-wrap";
-        wrap.setAttribute("data-deepseek-translator-ui", "true");
+        // Intentionally NOT marked as translator UI: SPA mutations to original content
+        // must still refresh this block (companion stays UI-marked).
         while (block.firstChild) {
           wrap.appendChild(block.firstChild);
         }
         block.appendChild(wrap);
         block.appendChild(companion);
         block.setAttribute("data-kilocean-layout", "wrap");
+        layout = "wrap";
       }
 
       block.setAttribute("data-kilocean-block", "true");
@@ -575,13 +739,29 @@
         translation,
         wrap,
         companion,
-        layout: flowLayout ? "flow" : "wrap"
+        layout
       };
       blockRecords.set(block, record);
       applyBlockDisplay(record);
     } finally {
       applyingDom = prev;
     }
+  }
+
+  function getTranslationPlacement(block) {
+    const style = getComputedStyle(block);
+    const display = style.display;
+    if (display === "grid" || display === "inline-grid") {
+      return "flow";
+    }
+    if (display === "flex" || display === "inline-flex") {
+      // flex-wrap:nowrap (default) cannot break a 100% basis item onto its own row.
+      if ((style.flexWrap || "nowrap") === "nowrap") {
+        return "after-host";
+      }
+      return "flow";
+    }
+    return "wrap";
   }
 
   function applyBlockDisplay(record) {
@@ -625,11 +805,25 @@
         grid-column: 1 / -1;
         box-sizing: border-box;
       }
+      .kilocean-translation--after {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
+        margin-top: 0.4em;
+        padding-top: 0.3em;
+        border-top: 1px dashed rgba(112, 135, 255, 0.38);
+        line-height: inherit;
+        white-space: pre-wrap;
+      }
       html[data-kilocean-display="bilingual"] [data-kilocean-block] > .kilocean-original-wrap {
         display: contents;
       }
       html[data-kilocean-display="bilingual"] [data-kilocean-block] > .kilocean-translation {
         display: block;
+        opacity: 0.96;
+      }
+      html[data-kilocean-display="bilingual"] .kilocean-translation--after {
         opacity: 0.96;
       }
       html[data-kilocean-display="translation-only"] [data-kilocean-block] > .kilocean-original-wrap {
@@ -638,7 +832,16 @@
       html[data-kilocean-display="translation-only"] [data-kilocean-block][data-kilocean-layout="flow"] > :not(.kilocean-translation) {
         display: none !important;
       }
+      html[data-kilocean-display="translation-only"] [data-kilocean-block][data-kilocean-layout="after"] {
+        display: none !important;
+      }
       html[data-kilocean-display="translation-only"] [data-kilocean-block] > .kilocean-translation {
+        display: block;
+        margin-top: 0;
+        padding-top: 0;
+        border-top: 0;
+      }
+      html[data-kilocean-display="translation-only"] .kilocean-translation--after {
         display: block;
         margin-top: 0;
         padding-top: 0;
@@ -647,11 +850,49 @@
       html[data-kilocean-display="original"] [data-kilocean-block] > .kilocean-original-wrap {
         display: contents;
       }
-      html[data-kilocean-display="original"] [data-kilocean-block] > .kilocean-translation {
+      html[data-kilocean-display="original"] [data-kilocean-block] > .kilocean-translation,
+      html[data-kilocean-display="original"] .kilocean-translation--after {
         display: none !important;
       }
     `;
     (document.head || document.documentElement).appendChild(styleHost);
+  }
+
+  function isInsideOriginalWrap(el) {
+    return Boolean(el?.closest?.(".kilocean-original-wrap"));
+  }
+
+  function isIgnoredTranslatorMutation(node) {
+    const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    if (!el) {
+      return true;
+    }
+    const ui = el.closest?.("[data-deepseek-translator-ui]");
+    if (!ui) {
+      return false;
+    }
+    // Original wrap holds live page content; never ignore those mutations as UI chrome.
+    return !isInsideOriginalWrap(el) && !ui.classList?.contains("kilocean-original-wrap");
+  }
+
+  function findRefreshHostForMutation(node) {
+    const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    if (!el) {
+      return null;
+    }
+    const host = el.closest?.("[data-kilocean-block]");
+    if (!host || !blockRecords.has(host)) {
+      return null;
+    }
+    // Ignore mutations that only touch the translation companion.
+    const ui = el.closest?.("[data-deepseek-translator-ui]");
+    if (ui && (ui.classList?.contains("kilocean-translation") || ui.classList?.contains("kilocean-translation--after"))) {
+      return null;
+    }
+    if (ui && !isInsideOriginalWrap(el) && !ui.classList?.contains("kilocean-original-wrap") && ui !== host) {
+      return null;
+    }
+    return host;
   }
 
   function startObserving() {
@@ -667,16 +908,12 @@
             pruneDetachedBlockRecords();
           }
           record.addedNodes.forEach((node) => {
-            if (node.nodeType === Node.ELEMENT_NODE && node.closest?.("[data-deepseek-translator-ui]")) {
+            const refreshHost = findRefreshHostForMutation(node);
+            if (refreshHost) {
+              pendingRefreshBlocks.add(refreshHost);
               return;
             }
-            if (node.parentElement?.closest?.("[data-deepseek-translator-ui]")) {
-              return;
-            }
-            const host = (node.nodeType === Node.ELEMENT_NODE ? node.parentElement : node.parentElement)
-              ?.closest?.("[data-kilocean-block]");
-            if (host && blockRecords.has(host)) {
-              pendingRefreshBlocks.add(host);
+            if (isIgnoredTranslatorMutation(node)) {
               return;
             }
             pendingRoots.add(node);
@@ -686,12 +923,12 @@
 
         if (record.type === "characterData") {
           const node = record.target;
-          if (node.parentElement?.closest?.("[data-deepseek-translator-ui]")) {
+          const refreshHost = findRefreshHostForMutation(node);
+          if (refreshHost) {
+            pendingRefreshBlocks.add(refreshHost);
             continue;
           }
-          const host = node.parentElement?.closest?.("[data-kilocean-block]");
-          if (host && blockRecords.has(host)) {
-            pendingRefreshBlocks.add(host);
+          if (isIgnoredTranslatorMutation(node)) {
             continue;
           }
           pendingRoots.add(node);
@@ -951,6 +1188,8 @@
 
     const text = selection.toString().replace(/\s+/gu, " ").trim();
     if (text.length < 2 || text.length > 5000) {
+      // Invalidate before rejecting so a prior in-flight response cannot reopen the panel.
+      hideSelectionPanel();
       return;
     }
 
