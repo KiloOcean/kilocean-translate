@@ -29,6 +29,8 @@
   let toastTimer = null;
   let selectionTimer = null;
   let selectionGeneration = 0;
+  /** Last selection translate key (target\0model\0text) to avoid rebill on Shift release. */
+  let lastSelectionKey = "";
   let styleHost = null;
   let applyingDom = false;
   let applyingDomGeneration = 0;
@@ -656,17 +658,9 @@
       return " ";
     }
 
-    const leftParent = left.parentElement;
-    const rightParent = right.parentElement;
-    if (
-      leftParent &&
-      rightParent &&
-      leftParent !== rightParent &&
-      !leftParent.contains(rightParent) &&
-      !rightParent.contains(leftParent)
-    ) {
-      return " ";
-    }
+    // Only insert a separator when the cloned range has whitespace or a visual
+    // block break. Distinct inline parents with no intervening whitespace
+    // (<span>foo</span><strong>bar</strong>) must stay adjacent.
     return "";
   }
 
@@ -777,6 +771,24 @@
     return response.translations;
   }
 
+  function joinSplitTranslations(left, right, leftSource, rightSource) {
+    const leftStr = String(left || "");
+    const rightStr = String(right || "");
+    // If either translated half already retains edge whitespace, keep direct concat.
+    if (/\s$/u.test(leftStr) || /^\s/u.test(rightStr)) {
+      return `${leftStr}${rightStr}`;
+    }
+    // DeepSeek often trims each half; restore a boundary from the source split edge.
+    const leftTrail = (String(leftSource || "").match(/\s+$/u) || [""])[0];
+    const rightLead = (String(rightSource || "").match(/^\s+/u) || [""])[0];
+    const boundary = leftTrail || rightLead;
+    if (!boundary) {
+      return `${leftStr}${rightStr}`;
+    }
+    const sep = /\n/u.test(boundary) ? "\n" : " ";
+    return `${leftStr}${sep}${rightStr}`;
+  }
+
   async function translateSegmentTextWithSplit(text, runId, runSettings) {
     try {
       const translations = await requestSegmentTranslations([text], runId, runSettings);
@@ -792,16 +804,18 @@
       if (splitAt < 1) {
         throw error;
       }
-      const left = await translateSegmentTextWithSplit(text.slice(0, splitAt), runId, runSettings);
+      const leftSource = text.slice(0, splitAt);
+      const rightSource = text.slice(splitAt);
+      const left = await translateSegmentTextWithSplit(leftSource, runId, runSettings);
       if (left == null || runId !== generation) {
         return null;
       }
-      const right = await translateSegmentTextWithSplit(text.slice(splitAt), runId, runSettings);
+      const right = await translateSegmentTextWithSplit(rightSource, runId, runSettings);
       if (right == null || runId !== generation) {
         return null;
       }
       // Preserve boundary whitespace from the original slice join.
-      return `${left}${right}`;
+      return joinSplitTranslations(left, right, leftSource, rightSource);
     }
   }
 
@@ -904,8 +918,8 @@
       if (!textNode?.isConnected || textNode.parentElement == null) {
         continue;
       }
-      if (textNode.parentElement.classList?.contains("kilocean-original-wrap")) {
-        // Already wrapped (e.g. prior pass) — do not adopt page-owned same-class nodes.
+      if (textNode.parentElement.hasAttribute?.("data-kilocean-original-wrap")) {
+        // Already wrapped by us (e.g. prior pass) — do not adopt page-owned same-class nodes.
         continue;
       }
       if (!/\S/u.test(textNode.data || "")) {
@@ -913,6 +927,7 @@
       }
       const wrap = document.createElement(wrapTag === "div" ? "span" : wrapTag);
       wrap.className = "kilocean-original-wrap";
+      wrap.setAttribute("data-kilocean-original-wrap", "true");
       // Not UI-marked: SPA edits to owned original text must still refresh.
       textNode.parentNode.insertBefore(wrap, textNode);
       wrap.appendChild(textNode);
@@ -967,7 +982,9 @@
         block.setAttribute("data-kilocean-layout", "companion");
         layout = "companion";
       } else if (placement === "flow") {
-        // Preserve flex/grid structure: do not wrap existing children.
+        // Preserve flex/grid element children, but wrap owned text nodes so
+        // translation-only can hide them (CSS cannot target bare text nodes).
+        ({ firstWrap: wrap, wraps: createdWraps } = wrapTextNodesForToggle(block, options.nested || [], wrapTag));
         companion.classList.add("kilocean-translation--flow");
         block.appendChild(companion);
         block.setAttribute("data-kilocean-layout", "flow");
@@ -1066,7 +1083,7 @@
         line-height: inherit;
         white-space: pre-wrap;
       }
-      html[data-kilocean-display="bilingual"] [data-kilocean-block] .kilocean-original-wrap {
+      html[data-kilocean-display="bilingual"] [data-kilocean-block] [data-kilocean-original-wrap] {
         display: contents;
       }
       html[data-kilocean-display="bilingual"] [data-kilocean-block] > .kilocean-translation {
@@ -1076,7 +1093,7 @@
       html[data-kilocean-display="bilingual"] .kilocean-translation--after {
         opacity: 0.96;
       }
-      html[data-kilocean-display="translation-only"] [data-kilocean-block] .kilocean-original-wrap {
+      html[data-kilocean-display="translation-only"] [data-kilocean-block] [data-kilocean-original-wrap] {
         display: none !important;
       }
       html[data-kilocean-display="translation-only"] [data-kilocean-block][data-kilocean-layout="flow"] > :not(.kilocean-translation) {
@@ -1097,7 +1114,7 @@
         padding-top: 0;
         border-top: 0;
       }
-      html[data-kilocean-display="original"] [data-kilocean-block] .kilocean-original-wrap {
+      html[data-kilocean-display="original"] [data-kilocean-block] [data-kilocean-original-wrap] {
         display: contents;
       }
       html[data-kilocean-display="original"] [data-kilocean-block] > .kilocean-translation,
@@ -1108,18 +1125,22 @@
     (document.head || document.documentElement).appendChild(styleHost);
   }
 
+  function isOwnedOriginalWrap(el) {
+    return Boolean(el?.hasAttribute?.("data-kilocean-original-wrap"));
+  }
+
   function isInsideOriginalWrap(el) {
-    return Boolean(el?.closest?.(".kilocean-original-wrap"));
+    return Boolean(el?.closest?.("[data-kilocean-original-wrap]"));
   }
 
   function isExtensionOwnedNode(node) {
     // Only the extension chrome nodes themselves — not page content living inside
-    // .kilocean-original-wrap (SPA edits there must still refresh the block).
+    // owned original wraps (SPA edits there must still refresh the block).
     if (!node || node.nodeType !== Node.ELEMENT_NODE) {
       return false;
     }
     return Boolean(
-      node.classList?.contains("kilocean-original-wrap") ||
+      isOwnedOriginalWrap(node) ||
       node.classList?.contains("kilocean-translation") ||
       node.classList?.contains("kilocean-translation--after") ||
       node.classList?.contains("kilocean-translation--flow") ||
@@ -1130,7 +1151,7 @@
   function isReparentIntoOriginalWrap(node) {
     // After we wrap a text node, MutationObserver removedNodes still point at the
     // text whose new parent is our wrap — treat that as extension-owned reparent.
-    return Boolean(node?.parentElement?.classList?.contains("kilocean-original-wrap"));
+    return isOwnedOriginalWrap(node?.parentElement);
   }
 
   function isIgnoredTranslatorMutation(node) {
@@ -1148,7 +1169,7 @@
       return false;
     }
     // Original wrap holds live page content; never ignore those mutations as UI chrome.
-    return !isInsideOriginalWrap(el) && !ui.classList?.contains("kilocean-original-wrap");
+    return !isInsideOriginalWrap(el) && !isOwnedOriginalWrap(ui);
   }
 
   function findRefreshHostForMutation(node) {
@@ -1165,7 +1186,7 @@
     if (ui && (ui.classList?.contains("kilocean-translation") || ui.classList?.contains("kilocean-translation--after"))) {
       return null;
     }
-    if (ui && !isInsideOriginalWrap(el) && !ui.classList?.contains("kilocean-original-wrap") && ui !== host) {
+    if (ui && !isInsideOriginalWrap(el) && !isOwnedOriginalWrap(ui) && ui !== host) {
       return null;
     }
     return host;
@@ -1518,9 +1539,10 @@
       return;
     }
 
-    // Bump generation so a newer selection or dismiss invalidates in-flight work.
-    selectionGeneration += 1;
-    const requestId = selectionGeneration;
+    // Snapshot only — do not bump yet so an unchanged Shift release cannot
+    // cancel an in-flight translation for the same selection.
+    const gate = selectionGeneration;
+    let requestId = 0;
 
     try {
       const stored = await chrome.storage.local.get({
@@ -1529,7 +1551,8 @@
         apiKey: ""
       });
 
-      if (requestId !== selectionGeneration) {
+      // Dismiss / newer work during the storage await.
+      if (gate !== selectionGeneration) {
         return;
       }
 
@@ -1542,11 +1565,25 @@
         return;
       }
 
+      // Deduplicate unchanged selections (e.g. standalone Shift release) before
+      // bumping generation or issuing another billable TRANSLATE_BATCH.
+      const selectionKey = `${targetLanguage}\0${model}\0${text}`;
+      if (selectionKey === lastSelectionKey) {
+        return;
+      }
+
+      // Claim + bump atomically (no await between) so overlapping handlers
+      // cannot double-bill the same selection.
+      lastSelectionKey = selectionKey;
+      selectionGeneration += 1;
+      requestId = selectionGeneration;
+
       const panel = ensureSelectionPanel();
       positionSelectionPanel(panel, rect);
       setSelectionPanelState(panel, "loading", "正在翻译选中文本…");
 
       if (!String(stored.apiKey || "").trim()) {
+        lastSelectionKey = "";
         setSelectionPanelState(panel, "error", "请先在扩展弹窗中填写 API Key");
         return;
       }
@@ -1573,9 +1610,11 @@
 
       setSelectionPanelState(panel, "success", translation, text);
     } catch (error) {
-      if (requestId !== selectionGeneration) {
+      if (requestId && requestId !== selectionGeneration) {
         return;
       }
+      // Allow retry after a failed attempt for the same selection.
+      lastSelectionKey = "";
       const panel = ensureSelectionPanel();
       setSelectionPanelState(panel, "error", error.message || "翻译失败");
     }
@@ -1708,6 +1747,7 @@
   function hideSelectionPanel() {
     // Invalidate any in-flight TRANSLATE_BATCH so a late response cannot reopen the panel.
     selectionGeneration += 1;
+    lastSelectionKey = "";
     if (selectionTimer) {
       clearTimeout(selectionTimer);
       selectionTimer = null;
