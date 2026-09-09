@@ -12,7 +12,7 @@
         <div class="brand-mark" aria-hidden="true">译</div>
         <div>
           <h1>千浩翻译</h1>
-          <p>Kilocean · 渐进翻译网页，并自动跟译新内容</p>
+          <p>Kilocean · 双语对照整页翻译，划词即译</p>
         </div>
       </header>
 
@@ -54,6 +54,34 @@
         <button id="test-connection" class="text-button" type="button">测试 API 连接</button>
       </section>
 
+      <section class="panel display-panel" aria-labelledby="display-title">
+        <div class="section-heading">
+          <h2 id="display-title">显示模式</h2>
+          <span class="hint">默认双语对照</span>
+        </div>
+        <div class="mode-toggle" role="radiogroup" aria-label="显示模式">
+          <button id="mode-bilingual" class="mode-button" type="button" role="radio" aria-checked="true" data-mode="bilingual">双语对照</button>
+          <button id="mode-translation" class="mode-button" type="button" role="radio" aria-checked="false" data-mode="translation-only">仅译文</button>
+          <button id="mode-original" class="mode-button" type="button" role="radio" aria-checked="false" data-mode="original">原文</button>
+        </div>
+        <p class="mode-help">双语对照 / 仅译文 / 原文可随时切换；“清除译文”会彻底还原并停止跟译。划词选中即可弹出译文。</p>
+      </section>
+
+      <section id="selection-confirm-panel" class="panel selection-confirm-panel" hidden aria-labelledby="selection-confirm-title">
+        <div class="section-heading">
+          <h2 id="selection-confirm-title">划词待确认</h2>
+          <span class="hint">扩展内确认，不走网页按钮</span>
+        </div>
+        <p id="selection-confirm-text" class="selection-confirm-text"></p>
+        <div class="selection-confirm-actions">
+          <button id="selection-confirm-btn" class="primary-button" type="button">
+            <span>翻译选中文本</span>
+            <span aria-hidden="true">→</span>
+          </button>
+          <button id="selection-confirm-dismiss" class="secondary-button" type="button">取消</button>
+        </div>
+      </section>
+
       <section class="status-card" aria-live="polite">
         <span id="status-dot" class="status-dot"></span>
         <div>
@@ -67,7 +95,7 @@
           <span>翻译当前网页</span>
           <span aria-hidden="true">→</span>
         </button>
-        <button id="restore" class="secondary-button" type="button">恢复原文</button>
+        <button id="restore" class="secondary-button" type="button">清除译文</button>
       </div>
 
       <section class="export-panel" aria-labelledby="export-title">
@@ -82,8 +110,9 @@
         <p>HTML 会保留当前译文和原页面样式；PDF 将打开 Chrome 打印窗口。</p>
       </section>
 
-      <p class="privacy-note">API Key 仅保存在本机 Chrome 中。网页文本会发送至 DeepSeek 完成翻译。</p>
+      <p class="privacy-note">API Key 仅保存在本机 Chrome 中。网页文本会发送至 DeepSeek 完成翻译。无登录、无会员墙。</p>
     </main>
+    <script src="shared.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

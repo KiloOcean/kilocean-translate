@@ -326,3 +326,86 @@ select:focus {
 @keyframes pulse {
   50% { opacity: 0.45; transform: scale(0.8); }
 }
+
+.display-panel {
+  margin-top: 12px;
+}
+
+.display-panel .hint,
+.mode-help {
+  color: #7f879b;
+  font-size: 10px;
+}
+
+.mode-toggle {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.mode-button {
+  height: 34px;
+  padding: 0 6px;
+  color: #c7ccda;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.mode-button:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.mode-button.active {
+  color: #ffffff;
+  border-color: rgba(145, 164, 255, 0.55);
+  background: rgba(102, 124, 255, 0.22);
+  box-shadow: 0 0 0 3px rgba(112, 135, 255, 0.12);
+}
+
+.mode-help {
+  margin-top: 10px;
+  line-height: 1.45;
+}
+
+
+.selection-confirm-panel {
+  margin-bottom: 12px;
+  border-color: rgba(145, 164, 255, 0.35);
+  background: rgba(102, 124, 255, 0.08);
+}
+
+.selection-confirm-panel .hint {
+  color: #91a4ff;
+  font-size: 10px;
+}
+
+.selection-confirm-text {
+  margin: 0 0 12px;
+  max-height: 96px;
+  overflow: auto;
+  color: #d9ddec;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.selection-confirm-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}
+
+.selection-confirm-actions .primary-button {
+  height: 36px;
+  font-size: 12px;
+}
+
+.selection-confirm-actions .secondary-button {
+  height: 36px;
+  padding: 0 12px;
+  font-size: 12px;
+}
