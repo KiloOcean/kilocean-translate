@@ -204,6 +204,24 @@ function checkParseTranslationPayload() {
     "parseTranslationPayload: join N>1 on single-\\n multi-line source"
   );
 
+  // Empty / whitespace-only entries must not join — fall through to length mismatch
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["第一段译文", ""] }),
+      1,
+      "第一段\n\n第二段"
+    ),
+    "parseTranslationPayload: must not join empty-string entries in N>1 recovery"
+  );
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["第一段译文", "   "] }),
+      1,
+      "第一段\n\n第二段"
+    ),
+    "parseTranslationPayload: must not join whitespace-only entries in N>1 recovery"
+  );
+
   // expectedCount 1 + N>1 all-string but single-paragraph source → throws
   assertThrows(
     () => parseTranslationPayload(

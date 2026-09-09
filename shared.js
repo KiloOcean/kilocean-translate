@@ -142,7 +142,7 @@
     if (
       expectedCount === 1 &&
       translations.length > 1 &&
-      translations.every((item) => typeof item === "string") &&
+      translations.every((item) => typeof item === "string" && item.trim() !== "") &&
       typeof sourceText === "string" &&
       hasMultiParagraphSource(sourceText)
     ) {
