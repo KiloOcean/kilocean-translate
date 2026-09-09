@@ -15,9 +15,19 @@
     ko: "한국어",
     en: "English"
   });
+  const DISPLAY_MODES = Object.freeze({
+    bilingual: "bilingual",
+    translationOnly: "translation-only"
+  });
 
   function getTargetLanguageName(code) {
     return TARGET_LANGUAGE_NAMES[code] || code || "简体中文";
+  }
+
+  function normalizeDisplayMode(value) {
+    return value === DISPLAY_MODES.translationOnly
+      ? DISPLAY_MODES.translationOnly
+      : DISPLAY_MODES.bilingual;
   }
 
   function isTranslatableText(value, targetLanguage) {
@@ -135,7 +145,9 @@
   }
 
   return {
+    DISPLAY_MODES,
     TARGET_LANGUAGE_NAMES,
+    normalizeDisplayMode,
     getTargetLanguageName,
     isTranslatableText,
     preserveWhitespace,
