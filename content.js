@@ -966,14 +966,22 @@
   function joinSplitTranslations(left, right, leftSource, rightSource, targetLanguage) {
     const leftStr = String(left || "");
     const rightStr = String(right || "");
+    // Derive source boundary first so blank-line splits win over partial
+    // translated edge whitespace (DeepSeek may leave only a single \n).
+    const leftTrail = (String(leftSource || "").match(/\s+$/u) || [""])[0];
+    const rightLead = (String(rightSource || "").match(/^\s+/u) || [""])[0];
+    const boundary = leftTrail || rightLead;
+
+    // Source blank-line always rejoins with \n\n after trimming translated edges.
+    if (/\n\n/u.test(boundary)) {
+      return `${leftStr.replace(/\s+$/u, "")}\n\n${rightStr.replace(/^\s+/u, "")}`;
+    }
+
     // If either translated half already retains edge whitespace, keep direct concat.
     if (/\s$/u.test(leftStr) || /^\s/u.test(rightStr)) {
       return `${leftStr}${rightStr}`;
     }
-    // DeepSeek often trims each half; restore a boundary from the source split edge.
-    const leftTrail = (String(leftSource || "").match(/\s+$/u) || [""])[0];
-    const rightLead = (String(rightSource || "").match(/^\s+/u) || [""])[0];
-    const boundary = leftTrail || rightLead;
+
     if (!boundary) {
       // Midpoint char-split (e.g. CJK with no nearby whitespace) would otherwise
       // glue whitespace-delimited target halves: lastwordNextword.
@@ -986,7 +994,7 @@
       }
       return `${leftStr}${rightStr}`;
     }
-    const sep = /\n\n/u.test(boundary) ? "\n\n" : /\n/u.test(boundary) ? "\n" : " ";
+    const sep = /\n/u.test(boundary) ? "\n" : " ";
     return `${leftStr}${sep}${rightStr}`;
   }
 

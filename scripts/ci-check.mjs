@@ -421,6 +421,18 @@ function checkJoinSplitTranslations() {
     "joinSplitTranslations: preserve blank-line from right lead"
   );
 
+  // Source blank-line must win over partial translated edge whitespace.
+  assertEqual(
+    joinSplitTranslations("甲\n", "乙", "甲\n\n", "乙", "zh"),
+    "甲\n\n乙",
+    "joinSplitTranslations: source blank-line wins over left translated trailing newline"
+  );
+  assertEqual(
+    joinSplitTranslations("甲", "\n乙", "甲", "\n\n乙", "zh"),
+    "甲\n\n乙",
+    "joinSplitTranslations: source blank-line wins over right translated leading newline"
+  );
+
   // Single newline boundary.
   assertEqual(
     joinSplitTranslations("甲", "乙", "甲\n", "乙", "zh"),
