@@ -605,6 +605,15 @@
     return style.display === "none" || style.visibility === "hidden";
   }
 
+  function hasHiddenAncestor(el) {
+    for (let cur = el; cur; cur = cur.parentElement) {
+      if (isHiddenElement(cur)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function isFlexOrGridDisplay(display) {
     return display === "flex" || display === "grid" || display === "inline-flex" || display === "inline-grid";
   }
@@ -627,7 +636,7 @@
     if (parent.closest('[translate="no"], [contenteditable="true"], [data-deepseek-translator-ui]')) {
       return false;
     }
-    return !isHiddenElement(parent);
+    return !hasHiddenAncestor(parent);
   }
 
   function shouldTranslateTextNode(node) {
@@ -656,7 +665,7 @@
 
     if (root.nodeType === Node.TEXT_NODE) {
       const parent = root.parentElement;
-      if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || isHiddenElement(parent)) {
+      if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent)) {
         return [];
       }
       if (parent.closest('[translate="no"], [contenteditable="true"]')) {
@@ -669,7 +678,7 @@
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         const parent = node.parentElement;
-        if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || isHiddenElement(parent)) {
+        if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent)) {
           return NodeFilter.FILTER_REJECT;
         }
         if (parent.closest('[translate="no"], [contenteditable="true"]')) {

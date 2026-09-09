@@ -28,6 +28,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   void clearPendingSelection(tabId);
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  // Same-tab navigation destroys the content script; drop stale pending
+  // selection + badge so the popup cannot confirm against a new document.
+  if (changeInfo.url != null || changeInfo.status === "loading") {
+    void clearPendingSelection(tabId);
+  }
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) {
     return false;
