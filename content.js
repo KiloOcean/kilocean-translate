@@ -35,6 +35,8 @@
   let selectionGeneration = 0;
   /** Last selection translate key (target\0model\0text\0range) to avoid rebill on Shift release. */
   let lastSelectionKey = "";
+  /** @type {string} text\0rangeIdentity of the selection last scheduled for translate. */
+  let lastScheduledSelectionSnapshot = "";
   let nextSelectionNodeId = 1;
   const selectionNodeIds = new WeakMap();
   let styleHost = null;
@@ -393,11 +395,13 @@
       if (!block || seen.has(block) || blockRecords.has(block)) {
         continue;
       }
+      // Mark considered before extract/filter so multi-fragment rejected
+      // blocks are not re-walked per text node (quadratic discovery).
+      seen.add(block);
       const fullText = extractBlockText(block);
       if (!fullText || !Utils.isTranslatableText(fullText, targetLanguage)) {
         continue;
       }
-      seen.add(block);
       blocks.push(block);
     }
 
@@ -1317,6 +1321,15 @@
             if (isIgnoredTranslatorMutation(node)) {
               return;
             }
+            // Whole recorded block reparented/reordered — treat as a move, not
+            // a content edit (avoids teardown + rebill on sortable lists).
+            if (
+              node.nodeType === Node.ELEMENT_NODE &&
+              blockRecords.has(node) &&
+              node.isConnected
+            ) {
+              return;
+            }
             const refreshHost = findRefreshHostForMutation(node);
             if (refreshHost) {
               pendingRefreshBlocks.add(refreshHost);
@@ -1558,6 +1571,19 @@
   }
 
   function onSelectionMaybeTranslate(event) {
+    // Invalidate in-flight storage awaits when the live selection actually
+    // changed (keyboard mid-await). Unchanged Shift must not bump or an
+    // in-flight TRANSLATE_BATCH response would be discarded.
+    const live = window.getSelection();
+    let snapshot = "";
+    if (live && !live.isCollapsed && live.rangeCount > 0) {
+      const liveText = live.toString().replace(/\s+/gu, " ").trim();
+      snapshot = `${liveText}\0${getSelectionRangeIdentity(live)}`;
+    }
+    if (snapshot !== lastScheduledSelectionSnapshot) {
+      lastScheduledSelectionSnapshot = snapshot;
+      selectionGeneration += 1;
+    }
     if (selectionTimer) {
       clearTimeout(selectionTimer);
     }
@@ -1612,9 +1638,12 @@
       return;
     }
 
-    const text = selection.toString().replace(/\s+/gu, " ").trim();
+    let text = selection.toString().replace(/\s+/gu, " ").trim();
     if (text.length < 2 || text.length > 5000) {
-      // Invalidate before rejecting so a prior in-flight response cannot reopen the panel.
+      // Rejected non-collapsed selection — clear prior key so reselecting a
+      // previously translated range A is not silently no-op'd by stale dedupe.
+      // hideSelectionPanel keeps the key for ×/Escape on an unchanged range.
+      lastSelectionKey = "";
       hideSelectionPanel();
       return;
     }
@@ -1634,6 +1663,9 @@
       return;
     }
 
+    const preAwaitRangeId = getSelectionRangeIdentity(selection);
+    const preAwaitText = text;
+
     // Snapshot only — do not bump yet so an unchanged Shift release cannot
     // cancel an in-flight translation for the same selection.
     const gate = selectionGeneration;
@@ -1651,11 +1683,40 @@
         return;
       }
 
+      // Revalidate live Selection — keyboard changes may not bump via mousedown.
+      const liveSel = window.getSelection();
+      if (!liveSel || liveSel.isCollapsed || liveSel.rangeCount === 0) {
+        lastSelectionKey = "";
+        hideSelectionPanel();
+        return;
+      }
+      const liveText = liveSel.toString().replace(/\s+/gu, " ").trim();
+      const liveRangeId = getSelectionRangeIdentity(liveSel);
+      if (liveText !== preAwaitText || liveRangeId !== preAwaitRangeId) {
+        return;
+      }
+      if (liveText.length < 2 || liveText.length > 5000) {
+        lastSelectionKey = "";
+        hideSelectionPanel();
+        return;
+      }
+      text = liveText;
+      try {
+        rect = liveSel.getRangeAt(0).getBoundingClientRect();
+      } catch {
+        return;
+      }
+      if (!rect || (rect.width === 0 && rect.height === 0)) {
+        return;
+      }
+
       // Keep selection target/model local — never clobber pinned page-run state.
       const targetLanguage = stored.targetLanguage || state.targetLanguage;
       const model = stored.model || state.model;
 
       if (!Utils.isTranslatableText(text, targetLanguage)) {
+        // Range changed to non-translatable text — drop stale dedupe key.
+        lastSelectionKey = "";
         hideSelectionPanel();
         return;
       }
@@ -1664,7 +1725,7 @@
       // bumping generation or issuing another billable TRANSLATE_BATCH.
       // Include range identity so the same words elsewhere (or a fresh re-select
       // after collapse) still reopen/reposition the panel.
-      const selectionKey = `${targetLanguage}\0${model}\0${text}\0${getSelectionRangeIdentity(selection)}`;
+      const selectionKey = `${targetLanguage}\0${model}\0${text}\0${liveRangeId}`;
       if (selectionKey === lastSelectionKey) {
         return;
       }
