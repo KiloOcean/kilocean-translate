@@ -11,6 +11,9 @@
     "SCRIPT", "STYLE", "NOSCRIPT", "CODE", "PRE", "TEXTAREA", "INPUT",
     "SELECT", "OPTION", "KBD", "SAMP", "SVG", "MATH", "CANVAS"
   ]);
+  // Mutation roots that can never yield translatable text — never queued, so
+  // script/style/template churn cannot pin the dynamic phase busy.
+  const NON_CONTENT_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
   const BLOCK_TAGS = new Set([
     "P", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "BLOCKQUOTE",
     "FIGCAPTION", "DT", "DD", "SUMMARY", "CAPTION", "TD", "TH",
@@ -31,6 +34,8 @@
   const blockRecords = new Map();
   const pendingRoots = new Set();
   const pendingRefreshBlocks = new Set();
+  /** Blocks holding a failure slot in state.failed — a retry replaces the slot. */
+  const failedBlocks = new Set();
 
   let mutationObserver = null;
   let dynamicTimer = null;
@@ -50,6 +55,8 @@
   let nextSelectionNodeId = 1;
   const selectionNodeIds = new WeakMap();
   let styleHost = null;
+  /** Owned selection panel host — pages may duplicate the id, so keep the ref. */
+  let selectionHostEl = null;
   let applyingDom = false;
   let applyingDomGeneration = 0;
   /** @type {{ targetLanguage: string, model: string } | null} */
@@ -174,7 +181,9 @@
       }
       pendingSelectionGesture = null;
       sendSelectionTranslation(gesture)
-        .then(() => sendResponse({ ok: true }))
+        .then((result) => sendResponse(result?.ok === false
+          ? { ok: false, error: result.error || "划词翻译失败" }
+          : { ok: true }))
         .catch((error) => sendResponse({ ok: false, error: error.message }));
       return true;
     }
@@ -242,6 +251,10 @@
 
     generation += 1;
     const runId = generation;
+    // Detach from the cancelled run's queue tail: its in-flight network results
+    // are already invalidated by the bump, so this run must not wait on them.
+    // The stale chain keeps its own catch, so its late settle cannot reject here.
+    workQueue = Promise.resolve();
     deferredRunSettings = null;
     activeRunSettings = { targetLanguage, model };
     Object.assign(state, {
@@ -355,9 +368,13 @@
 
   function restoreOriginal(options = {}) {
     generation += 1;
+    // Drop the cancelled run's queue tail — a fresh startTranslation chained on
+    // the old workQueue would otherwise wait on stale in-flight requests.
+    workQueue = Promise.resolve();
     stopObserving();
     activeRunSettings = null;
     deferredRunSettings = null;
+    failedBlocks.clear();
 
     for (const record of blockRecords.values()) {
       teardownBlockRecord(record);
@@ -444,6 +461,19 @@
         continue;
       }
       discardBlockRecord(block);
+    }
+    // Failed blocks that left the page release their failed/total slots too.
+    for (const block of [...failedBlocks]) {
+      if (block.isConnected) {
+        continue;
+      }
+      failedBlocks.delete(block);
+      if (state.failed > 0) {
+        state.failed -= 1;
+      }
+      if (state.total > 0) {
+        state.total -= 1;
+      }
     }
   }
 
@@ -791,7 +821,15 @@
 
     if (isDynamic) {
       state.phase = "translating";
-      state.total += segments.length;
+      // Blocks already holding a failure slot keep their total slot — a retry
+      // of the same block must not be counted in total a second time.
+      let newTotalSlots = 0;
+      for (const segment of segments) {
+        if (!failedBlocks.has(segment.block)) {
+          newTotalSlots += 1;
+        }
+      }
+      state.total += newTotalSlots;
       showToast("正在翻译新加载的内容…", "loading");
     }
 
@@ -1008,6 +1046,20 @@
     }
   }
 
+  function noteSegmentFailure(segment) {
+    const block = segment?.block;
+    // A block already holding a failure slot keeps it: when the observer
+    // retries the same block, the retry must replace the slot (see the
+    // success path below), never stack a second failed/total count.
+    if (block && failedBlocks.has(block)) {
+      return;
+    }
+    if (block) {
+      failedBlocks.add(block);
+    }
+    state.failed += 1;
+  }
+
   function applyTranslatedSegment(segment, translation) {
     if (!segment.block.isConnected || blockRecords.has(segment.block)) {
       return false;
@@ -1027,6 +1079,13 @@
       companionOnly: Boolean(segment.companionOnly),
       nested: segment.nested || []
     });
+    if (failedBlocks.delete(segment.block)) {
+      // Dynamic retry landed for a previously failed block — reclaim its
+      // failure slot instead of counting the block as both failed and translated.
+      if (state.failed > 0) {
+        state.failed -= 1;
+      }
+    }
     state.translated += 1;
     return true;
   }
@@ -1041,7 +1100,7 @@
           return;
         }
         if (!applyTranslatedSegment(segment, joined)) {
-          state.failed += 1;
+          noteSegmentFailure(segment);
         }
         return;
       } catch (error) {
@@ -1049,7 +1108,7 @@
           // Stale run — must not pollute the replacement run's failure counts.
           return;
         }
-        state.failed += 1;
+        noteSegmentFailure(segment);
         state.error = error.message;
         return;
       }
@@ -1070,7 +1129,7 @@
         // Stale/empty/disconnected segments reject here — count them so the
         // run summary does not silently under-report.
         if (!applyTranslatedSegment(batch[index], translation)) {
-          state.failed += 1;
+          noteSegmentFailure(batch[index]);
         }
       });
     } catch (error) {
@@ -1098,7 +1157,7 @@
             return;
           }
           if (!applyTranslatedSegment(segment, joined)) {
-            state.failed += 1;
+            noteSegmentFailure(segment);
           }
           return;
         } catch (splitError) {
@@ -1106,13 +1165,15 @@
             // Stale run — must not pollute the replacement run's failure counts.
             return;
           }
-          state.failed += 1;
+          noteSegmentFailure(segment);
           state.error = splitError.message;
           return;
         }
       }
 
-      state.failed += batch.length;
+      for (const segment of batch) {
+        noteSegmentFailure(segment);
+      }
       state.error = error.message;
     }
   }
@@ -1458,6 +1519,16 @@
     return isOwnedOriginalWrap(node?.parentElement);
   }
 
+  function isDefinitelyIneligibleNode(node) {
+    // Script/style/noscript/template churn can never hold translatable text —
+    // skip it before queueing so it cannot mark the run busy or reset the debounce.
+    if (node?.nodeType === Node.ELEMENT_NODE) {
+      return NON_CONTENT_TAGS.has(node.tagName);
+    }
+    const parent = node?.parentElement;
+    return Boolean(parent && NON_CONTENT_TAGS.has(parent.tagName));
+  }
+
   function isIgnoredTranslatorMutation(node) {
     if (isExtensionOwnedNode(node)) {
       return true;
@@ -1514,6 +1585,37 @@
       host.parentNode.insertBefore(record.companion, host.nextSibling);
     } finally {
       endApplyingDom(gen);
+    }
+  }
+
+  function restoreRemovedCompanions(removedNodes) {
+    // A page update that removes only our companion (innerHTML wipes, framework
+    // child swaps) leaves the record claiming "translated" while the UI is gone
+    // forever — re-insert the cached companion while the source block survives.
+    // Restore from the cached record only; never rebill.
+    for (const record of blockRecords.values()) {
+      const { block, companion } = record;
+      if (!block?.isConnected || !companion || companion.isConnected) {
+        continue;
+      }
+      const wasRemoved = [...removedNodes].some((node) => (
+        node === companion || node?.contains?.(companion)
+      ));
+      if (!wasRemoved) {
+        continue;
+      }
+      if (record.layout === "after") {
+        // relocateAfterHostCompanion re-inserts the detached sibling after the
+        // host and manages its own applyingDom guard.
+        relocateAfterHostCompanion(record);
+      } else {
+        const gen = beginApplyingDom();
+        try {
+          block.appendChild(companion);
+        } finally {
+          endApplyingDom(gen);
+        }
+      }
     }
   }
 
@@ -1575,6 +1677,7 @@
         return;
       }
 
+      let queuedDynamicWork = false;
       for (const record of records) {
         if (record.type === "childList") {
           if (record.removedNodes.length > 0) {
@@ -1594,6 +1697,9 @@
             // not look like content edits of the still-connected ancestor.
             const removedRecordedBlocks = collectRemovedRecordedBlocks(record.removedNodes);
             pruneDetachedBlockRecords();
+            // A companion-only removal must be restored even though the batch is
+            // otherwise ignorable — without it the record claims translated forever.
+            restoreRemovedCompanions(record.removedNodes);
             // Removal-only SPA updates never appear in addedNodes — refresh via target.
             // Recorded blocks in removedNodes (direct or inside an unrecorded wrapper)
             // are moves or permanent removals — do not queue the ancestor for
@@ -1608,15 +1714,17 @@
               const refreshHost = findRefreshHostForMutation(record.target);
               if (refreshHost) {
                 pendingRefreshBlocks.add(refreshHost);
+                queuedDynamicWork = true;
               } else if (record.target?.isConnected) {
                 // In-flight translate may have no blockRecords yet — queue target
                 // so discovery retries after the pending request rejects the stale segment.
                 pendingRoots.add(record.target);
+                queuedDynamicWork = true;
               }
             }
           }
           record.addedNodes.forEach((node) => {
-            if (isIgnoredTranslatorMutation(node)) {
+            if (isDefinitelyIneligibleNode(node) || isIgnoredTranslatorMutation(node)) {
               return;
             }
             // Whole recorded block reparented/reordered — treat as a move, not
@@ -1632,9 +1740,11 @@
             const refreshHost = findRefreshHostForMutation(node);
             if (refreshHost) {
               pendingRefreshBlocks.add(refreshHost);
+              queuedDynamicWork = true;
               return;
             }
             pendingRoots.add(node);
+            queuedDynamicWork = true;
           });
           continue;
         }
@@ -1644,16 +1754,23 @@
           const refreshHost = findRefreshHostForMutation(node);
           if (refreshHost) {
             pendingRefreshBlocks.add(refreshHost);
+            queuedDynamicWork = true;
             continue;
           }
-          if (isIgnoredTranslatorMutation(node)) {
+          if (isDefinitelyIneligibleNode(node) || isIgnoredTranslatorMutation(node)) {
             continue;
           }
           pendingRoots.add(node);
+          queuedDynamicWork = true;
         }
       }
 
-      scheduleDynamicTranslation();
+      // Only real pending work may mark the phase translating / reset the
+      // 450 ms debounce — ineligible churn (script/style swaps, noise inside
+      // ignored nodes) must not keep exports disabled forever.
+      if (queuedDynamicWork) {
+        scheduleDynamicTranslation();
+      }
     });
 
     mutationObserver.observe(document.documentElement, {
@@ -1915,7 +2032,7 @@
     if (!claimSelectionEvent(event)) {
       return;
     }
-    const host = document.getElementById("kilocean-selection-host");
+    const host = selectionHostEl;
     if (host && event.target !== host && !host.contains(event.target)) {
       // A trusted outside press starts a fresh pointer gesture — drop the
       // dedupe key so re-selecting the same range reopens the panel.
@@ -2006,7 +2123,9 @@
   }
 
   function isSelectionInsideTranslatorUi(selection, event) {
-    const host = document.getElementById("kilocean-selection-host");
+    // Owned ref only — a page element carrying our host id must not influence
+    // whether we treat a selection as extension UI.
+    const host = selectionHostEl;
     if (host) {
       // closest() does not cross shadow roots; ignore events/selection inside the panel.
       if (event?.target?.getRootNode?.() === host.shadowRoot) {
@@ -2029,7 +2148,8 @@
 
     for (const node of [selection.anchorNode, selection.focusNode]) {
       const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
-      if (el?.closest?.("[data-deepseek-translator-ui], #kilocean-selection-host")) {
+      // Marker attribute only — our host carries it; a page id impostor does not.
+      if (el?.closest?.("[data-deepseek-translator-ui]")) {
         return true;
       }
     }
@@ -2114,13 +2234,16 @@
    * Billable selection path — runs only after extension-popup confirm
    * (CONFIRM_SELECTION_TRANSLATE), with the stored gesture snapshot
    * (never a fresh selection read). Never triggered by page-DOM controls.
+   * Guard rejections resolve to { ok: false, error } so the popup learns the
+   * confirm did not produce a translation; only superseded requests (a newer
+   * selection generation claimed the slot) resolve without a rejection.
    */
   async function sendSelectionTranslation(gesture) {
     // The gesture snapshot the panel previewed is the only billable payload.
     if (!gesture?.text || !gesture.rangeId) {
       lastSelectionKey = "";
       hideSelectionPanel();
-      return;
+      return { ok: false, error: "没有待确认的划词翻译" };
     }
 
     const selection = window.getSelection();
@@ -2128,7 +2251,7 @@
       // Real selection change (collapse / clear) — allow the same words again later.
       lastSelectionKey = "";
       hideSelectionPanel();
-      return;
+      return { ok: false, error: "划词已收起，请重新选中后确认" };
     }
 
     // Require the live Selection to still be exactly what the panel previewed:
@@ -2140,22 +2263,22 @@
     ) {
       lastSelectionKey = "";
       hideSelectionPanel();
-      return;
+      return { ok: false, error: "划词已变化，请重新选中后确认" };
     }
 
     if (isSelectionInsideTranslatorUi(selection)) {
-      return;
+      return { ok: false, error: "划词位于扩展界面内，请重新选择页面文本" };
     }
 
     let rect;
     try {
       rect = selection.getRangeAt(0).getBoundingClientRect();
     } catch {
-      return;
+      return { ok: false, error: "无法定位划词位置，请重新选中后确认" };
     }
 
     if (!rect || (rect.width === 0 && rect.height === 0)) {
-      return;
+      return { ok: false, error: "无法定位划词位置，请重新选中后确认" };
     }
 
     // Snapshot only — do not bump yet so an unchanged Shift release cannot
@@ -2180,7 +2303,7 @@
       if (!liveSel || liveSel.isCollapsed || liveSel.rangeCount === 0) {
         lastSelectionKey = "";
         hideSelectionPanel();
-        return;
+        return { ok: false, error: "划词已收起，请重新选中后确认" };
       }
       const liveText = liveSel.toString().replace(/\s+/gu, " ").trim();
       const liveRangeId = getSelectionRangeIdentity(liveSel);
@@ -2189,19 +2312,19 @@
       if (liveText !== gesture.text || liveRangeId !== gesture.rangeId) {
         lastSelectionKey = "";
         hideSelectionPanel();
-        return;
+        return { ok: false, error: "划词已变化，请重新选中后确认" };
       }
       try {
         rect = liveSel.getRangeAt(0).getBoundingClientRect();
       } catch {
         lastSelectionKey = "";
         hideSelectionPanel();
-        return;
+        return { ok: false, error: "无法定位划词位置，请重新选中后确认" };
       }
       if (!rect || (rect.width === 0 && rect.height === 0)) {
         lastSelectionKey = "";
         hideSelectionPanel();
-        return;
+        return { ok: false, error: "无法定位划词位置，请重新选中后确认" };
       }
 
       // Keep selection target/model local — never clobber pinned page-run state.
@@ -2212,7 +2335,7 @@
         // Range changed to non-translatable text — drop stale dedupe key.
         lastSelectionKey = "";
         hideSelectionPanel();
-        return;
+        return { ok: false, error: "选中文本无需翻译" };
       }
 
       // Deduplicate unchanged selections (e.g. standalone Shift release) before
@@ -2241,7 +2364,7 @@
       if (!String(stored.apiKey || "").trim()) {
         lastSelectionKey = "";
         setSelectionPanelState(panel, "error", "请先在扩展弹窗中填写 API Key");
-        return;
+        return { ok: false, error: "请先在扩展弹窗中填写 API Key" };
       }
 
       // Worker-side SELECTION_TRANSLATE_BATCH enforces the 1s / 8-per-10s quota
@@ -2265,7 +2388,7 @@
       if (!postNetworkSel || postNetworkSel.isCollapsed || postNetworkSel.rangeCount === 0) {
         lastSelectionKey = "";
         hideSelectionPanel();
-        return;
+        return { ok: false, error: "划词已收起，译文已丢弃" };
       }
       const postNetworkText = postNetworkSel.toString().replace(/\s+/gu, " ").trim();
       const postNetworkRangeId = getSelectionRangeIdentity(postNetworkSel);
@@ -2274,7 +2397,7 @@
         // the claimed key and hide the stuck loading panel (same as collapse).
         lastSelectionKey = "";
         hideSelectionPanel();
-        return;
+        return { ok: false, error: "划词已变化，译文已丢弃" };
       }
 
       if (!response?.ok) {
@@ -2295,17 +2418,34 @@
       lastSelectionKey = "";
       const panel = ensureSelectionPanel();
       setSelectionPanelState(panel, "error", error.message || "翻译失败");
+      // The popup must learn the confirm did not produce a translation.
+      return { ok: false, error: error.message || "翻译失败" };
     }
   }
 
   function ensureSelectionPanel() {
-    let host = document.getElementById("kilocean-selection-host");
-    if (host?.shadowRoot) {
-      host.hidden = false;
-      return host;
+    // Never trust getElementById alone — a page element may carry the same id
+    // (or adopt ours). Reuse only a host we can prove we own: our marker plus a
+    // shadow root. The module-level ref keeps hide/dismiss on the owned node.
+    if (
+      selectionHostEl?.isConnected &&
+      selectionHostEl.shadowRoot &&
+      selectionHostEl.dataset.deepseekTranslatorUi === "true"
+    ) {
+      selectionHostEl.hidden = false;
+      return selectionHostEl;
     }
 
-    host = document.createElement("div");
+    // Re-injection fallback: adopt only a marked, shadow-bearing host (ours
+    // from a previous injection); a page impostor with the same id never matches.
+    const candidate = document.getElementById("kilocean-selection-host");
+    if (candidate?.shadowRoot && candidate.dataset.deepseekTranslatorUi === "true") {
+      selectionHostEl = candidate;
+      candidate.hidden = false;
+      return candidate;
+    }
+
+    const host = document.createElement("div");
     host.id = "kilocean-selection-host";
     host.dataset.deepseekTranslatorUi = "true";
     Object.assign(host.style, {
@@ -2316,6 +2456,7 @@
       left: "0px"
     });
     document.documentElement.appendChild(host);
+    selectionHostEl = host;
 
     const shadow = host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
@@ -2492,7 +2633,7 @@
       clearTimeout(selectionTimer);
       selectionTimer = null;
     }
-    const host = document.getElementById("kilocean-selection-host");
+    const host = selectionHostEl;
     if (host) {
       host.hidden = true;
     }

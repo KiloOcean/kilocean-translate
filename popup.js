@@ -500,14 +500,20 @@ async function confirmPendingSelection() {
 
   try {
     await saveSettings();
+    // Bind the confirm to the previewed snapshot: the worker rejects if the
+    // stored pending was replaced by a newer selection the popup never showed.
     const confirm = await chrome.runtime.sendMessage({
       type: "CONFIRM_PENDING_SELECTION",
-      tabId: currentTab.id
+      tabId: currentTab.id,
+      text: pendingSelection.text,
+      rangeId: pendingSelection.rangeId
     });
     if (!confirm?.ok || !confirm.pending?.text || !confirm.pending?.rangeId) {
       throw new Error(confirm?.error === "NO_PENDING_SELECTION"
         ? "划词确认已过期，请重新选中文本"
-        : (confirm?.error || "没有待确认的划词"));
+        : confirm?.error === "SELECTION_MISMATCH"
+          ? "划词已变化，请重新选中后确认"
+          : (confirm?.error || "没有待确认的划词"));
     }
 
     const { text, rangeId } = confirm.pending;

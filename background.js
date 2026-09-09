@@ -25,7 +25,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  clearPendingSelection(tabId);
+  void clearPendingSelection(tabId);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -88,16 +88,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: "INVALID_PENDING_SELECTION" });
       return false;
     }
-    pendingSelections.set(tabId, { text, rangeId, createdAt: Date.now() });
-    void setSelectionBadge(tabId, true);
-    sendResponse({ ok: true });
-    return false;
+    storePendingSelection(tabId, { text, rangeId, createdAt: Date.now() })
+      .then(() => {
+        void setSelectionBadge(tabId, true);
+        sendResponse({ ok: true });
+      })
+      .catch(() => sendResponse({ ok: false, error: "PENDING_SELECTION_WRITE_FAILED" }));
+    return true;
   }
 
   if (message?.type === "CLEAR_PENDING_SELECTION") {
     const tabId = sender.tab?.id ?? message.tabId;
     if (tabId != null) {
-      clearPendingSelection(tabId);
+      void clearPendingSelection(tabId);
     }
     sendResponse({ ok: true });
     return false;
@@ -109,9 +112,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, pending: null });
       return false;
     }
-    const pending = pendingSelections.get(tabId) || null;
-    sendResponse({ ok: true, pending });
-    return false;
+    loadPendingSelection(tabId)
+      .then((pending) => sendResponse({ ok: true, pending }))
+      .catch(() => sendResponse({ ok: false, pending: null }));
+    return true;
   }
 
   if (message?.type === "CONFIRM_PENDING_SELECTION") {
@@ -120,15 +124,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: "MISSING_TAB" });
       return false;
     }
-    const pending = pendingSelections.get(tabId) || null;
-    if (!pending) {
-      sendResponse({ ok: false, error: "NO_PENDING_SELECTION" });
-      return false;
-    }
-    // One-shot: clear so a second popup confirm cannot re-bill without a new gesture.
-    clearPendingSelection(tabId);
-    sendResponse({ ok: true, pending });
-    return false;
+    confirmPendingSelection(tabId, {
+      text: String(message.text || "").trim(),
+      rangeId: String(message.rangeId || "")
+    })
+      .then((pending) => sendResponse({ ok: true, pending }))
+      .catch((error) => sendResponse({ ok: false, error: error.code || error.message }));
+    return true;
   }
 
   return false;
@@ -148,9 +150,61 @@ function isSelectionSendRateLimited(now = Date.now()) {
   return selectionSendTimes.length >= SELECTION_SEND_WINDOW_LIMIT;
 }
 
-function clearPendingSelection(tabId) {
+function pendingSelectionStorageKey(tabId) {
+  return `pendingSelection:${tabId}`;
+}
+
+// MV3 service workers suspend at any time — the in-memory Map alone would lose
+// the pending confirm (badge stays, GET returns nothing). Write-through to
+// chrome.storage.session on every change; memory stays a read cache only.
+async function storePendingSelection(tabId, pending) {
+  pendingSelections.set(tabId, pending);
+  await chrome.storage.session.set({ [pendingSelectionStorageKey(tabId)]: pending });
+}
+
+async function loadPendingSelection(tabId) {
+  const cached = pendingSelections.get(tabId);
+  if (cached) {
+    return cached;
+  }
+  try {
+    const key = pendingSelectionStorageKey(tabId);
+    const stored = await chrome.storage.session.get(key);
+    const pending = stored?.[key] || null;
+    if (pending) {
+      pendingSelections.set(tabId, pending);
+    }
+    return pending;
+  } catch {
+    return null;
+  }
+}
+
+async function clearPendingSelection(tabId) {
   pendingSelections.delete(tabId);
+  try {
+    await chrome.storage.session.remove(pendingSelectionStorageKey(tabId));
+  } catch {
+    // Session storage unavailable — memory clear already happened.
+  }
   void setSelectionBadge(tabId, false);
+}
+
+async function confirmPendingSelection(tabId, previewed) {
+  // Bind the billable confirm to exactly what the popup previewed: if a newer
+  // SET_PENDING_SELECTION replaced the stored pending, the popup's snapshot is
+  // stale and must not authorize text the user never saw. Leave the newer
+  // pending intact on mismatch — it is the live gesture state.
+  const pending = await loadPendingSelection(tabId);
+  if (!pending) {
+    throw createError("NO_PENDING_SELECTION", "NO_PENDING_SELECTION");
+  }
+  if (pending.text !== previewed.text || pending.rangeId !== previewed.rangeId) {
+    throw createError("SELECTION_MISMATCH", "SELECTION_MISMATCH");
+  }
+  // One-shot: clear so a second popup confirm cannot re-bill without a new gesture.
+  await clearPendingSelection(tabId);
+  return pending;
 }
 
 async function setSelectionBadge(tabId, active) {
