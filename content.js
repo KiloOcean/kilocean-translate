@@ -41,6 +41,8 @@
   let selectionGeneration = 0;
   /** Last selection translate key (target\0model\0text\0range) to avoid rebill on Shift release. */
   let lastSelectionKey = "";
+  /** Gesture snapshot shown in the panel; billed only by the panel's 「翻译」 click. */
+  let pendingSelectionGesture = null;
   /** @type {string} text\0rangeIdentity of the selection last scheduled for translate. */
   let lastScheduledSelectionSnapshot = "";
   /** Send times of recent selection-path TRANSLATE_BATCHs (rate limiting). */
@@ -435,7 +437,10 @@
       if (deepestSet.has(block)) {
         continue;
       }
-      const nested = (descendantsOf.get(block) || []).filter((other) => deepestSet.has(other));
+      // Exclude every nested candidate when testing ancestor-owned text — a
+      // mid-level candidate (not deepest) must not leak into the ancestor's
+      // provisional ownText and inflate state.total with an untranslatable block.
+      const nested = descendantsOf.get(block) || [];
       if (nested.length === 0) {
         continue;
       }
@@ -738,9 +743,8 @@
 
     if (segments.length === 0 || runId !== generation) {
       // Dynamic schedule may have marked translating before discovery found work.
-      if (isDynamic && runId === generation && state.active && state.phase === "translating") {
-        state.phase = state.failed > 0 && state.translated === 0 ? "error" : "translated";
-        notifyPopupStatus();
+      if (isDynamic && runId === generation) {
+        finalizeDynamicPhase();
       }
       return;
     }
@@ -761,6 +765,13 @@
     }
 
     if (isDynamic && runId === generation) {
+      // Newer dynamic work scheduled while these batches were in flight keeps
+      // the phase busy — do not publish (or toast) completion until it lands,
+      // or export could accept a page with untranslated content.
+      if (hasPendingDynamicWork()) {
+        notifyPopupStatus();
+        return;
+      }
       // Mirror the initial-run outcome so 401/429 etc. are not reported as success.
       if (state.failed > 0 && state.translated === 0) {
         state.phase = "error";
@@ -994,6 +1005,10 @@
         }
         return;
       } catch (error) {
+        if (runId !== generation) {
+          // Stale run — must not pollute the replacement run's failure counts.
+          return;
+        }
         state.failed += 1;
         state.error = error.message;
         return;
@@ -1019,15 +1034,23 @@
         }
       });
     } catch (error) {
-      if (error.canSplit && batch.length > 1 && runId === generation) {
+      if (runId !== generation) {
+        // Stale run — no failure accounting, no further billable recursion.
+        return;
+      }
+      if (error.canSplit && batch.length > 1) {
         const middle = Math.ceil(batch.length / 2);
         await translateBatchWithFallback(batch.slice(0, middle), runId, runSettings);
+        if (runId !== generation) {
+          // Cancellation while the first half was pending — do not send the second.
+          return;
+        }
         await translateBatchWithFallback(batch.slice(middle), runId, runSettings);
         return;
       }
 
       // Single oversized segment: bisect text, translate halves, apply once.
-      if (error.canSplit && batch.length === 1 && runId === generation) {
+      if (error.canSplit && batch.length === 1) {
         const segment = batch[0];
         try {
           const joined = await translateSegmentTextWithSplit(segment.text, runId, runSettings);
@@ -1039,6 +1062,10 @@
           }
           return;
         } catch (splitError) {
+          if (runId !== generation) {
+            // Stale run — must not pollute the replacement run's failure counts.
+            return;
+          }
           state.failed += 1;
           state.error = splitError.message;
           return;
@@ -1605,6 +1632,23 @@
     }
   }
 
+  function hasPendingDynamicWork() {
+    return dynamicTimer != null || pendingRoots.size > 0 || pendingRefreshBlocks.size > 0;
+  }
+
+  function finalizeDynamicPhase() {
+    // Publish the terminal phase for a dynamic pass that ran out of work —
+    // unless newer dynamic work is still pending: it must keep the run
+    // "translating" so export cannot accept untranslated content.
+    if (!state.active || state.phase !== "translating") {
+      return;
+    }
+    if (!hasPendingDynamicWork()) {
+      state.phase = state.failed > 0 && state.translated === 0 ? "error" : "translated";
+    }
+    notifyPopupStatus();
+  }
+
   function scheduleDynamicTranslation() {
     if (dynamicTimer) {
       clearTimeout(dynamicTimer);
@@ -1633,9 +1677,8 @@
       const blocks = roots.flatMap((root) => collectBlocks(root));
       const runId = generation;
       if (blocks.length === 0) {
-        if (runId === generation && state.active && state.phase === "translating") {
-          state.phase = state.failed > 0 && state.translated === 0 ? "error" : "translated";
-          notifyPopupStatus();
+        if (runId === generation) {
+          finalizeDynamicPhase();
         }
         return;
       }
@@ -1790,32 +1833,64 @@
     }
   }
 
+  // Same DOM event reaches both window and document capture listeners. Process
+  // only the first (window) hit so a later document pass cannot overwrite a
+  // good early snapshot after a page window listener poisons Selection.
+  const handledSelectionEvents = new WeakSet();
+
   function setupSelectionTranslate() {
-    document.addEventListener("mouseup", onSelectionMaybeTranslate, true);
-    document.addEventListener("keyup", (event) => {
-      if (event.key === "Escape") {
-        hideSelectionPanel();
-        return;
-      }
-      if (event.key === "Shift" || event.key.startsWith("Arrow")) {
-        onSelectionMaybeTranslate(event);
-      }
-    }, true);
-    document.addEventListener("mousedown", (event) => {
-      const host = document.getElementById("kilocean-selection-host");
-      if (host && event.target !== host && !host.contains(event.target)) {
-        // A trusted outside press starts a fresh pointer gesture — drop the
-        // dedupe key so re-selecting the same range reopens the panel.
-        // ×/Escape still go through hideSelectionPanel with the key retained.
-        if (event.isTrusted !== false) {
-          lastSelectionKey = "";
-        }
-        hideSelectionPanel();
-      }
-    }, true);
+    // Capture on window as well as document, as early as possible: a page's
+    // window-capture listener registered before ours would otherwise always
+    // see (and could replace) the Selection before any listener we own runs.
+    // Best-effort only — the real billable gate is the panel's confirm click.
+    for (const target of [window, document]) {
+      target.addEventListener("mouseup", onSelectionMaybeTranslate, true);
+      target.addEventListener("keyup", onSelectionKeyUp, true);
+      target.addEventListener("mousedown", onSelectionMouseDown, true);
+    }
   }
 
-  function onSelectionMaybeTranslate(event) {
+  function claimSelectionEvent(event) {
+    if (!event || handledSelectionEvents.has(event)) {
+      return false;
+    }
+    handledSelectionEvents.add(event);
+    return true;
+  }
+
+  function onSelectionKeyUp(event) {
+    if (!claimSelectionEvent(event)) {
+      return;
+    }
+    if (event.key === "Escape") {
+      hideSelectionPanel();
+      return;
+    }
+    if (event.key === "Shift" || event.key.startsWith("Arrow")) {
+      onSelectionMaybeTranslate(event, true);
+    }
+  }
+
+  function onSelectionMouseDown(event) {
+    if (!claimSelectionEvent(event)) {
+      return;
+    }
+    const host = document.getElementById("kilocean-selection-host");
+    if (host && event.target !== host && !host.contains(event.target)) {
+      // A trusted outside press starts a fresh pointer gesture — drop the
+      // dedupe key so re-selecting the same range reopens the panel.
+      // ×/Escape still go through hideSelectionPanel with the key retained.
+      if (event.isTrusted !== false) {
+        lastSelectionKey = "";
+      }
+      hideSelectionPanel();
+    }
+  }
+
+  function onSelectionMaybeTranslate(event, alreadyClaimed = false) {
+    if (!alreadyClaimed && !claimSelectionEvent(event)) {
+      return;
+    }
     // Ignore synthetic page-script events that could burn the user's API key.
     if (event && event.isTrusted === false) {
       return;
@@ -1824,6 +1899,9 @@
     // Snapshot the selection synchronously at the trusted gesture: page script
     // can replace window.getSelection() while the debounce is pending, so only
     // this snapshot — never a post-delay read — may become the billable text.
+    // A page window-capture listener registered before any of ours can still
+    // poison the Selection before we see it, so the snapshot alone never bills:
+    // the user must click the extension panel's 「翻译」 button to send.
     const gesture = captureSelectionGesture();
 
     // Invalidate in-flight storage awaits when the live selection actually
@@ -1848,12 +1926,15 @@
     }
     selectionTimer = setTimeout(() => {
       selectionTimer = null;
-      handleSelectionTranslate(event, gesture);
+      showSelectionConfirm(event, gesture);
     }, 180);
   }
 
   /**
    * Capture the current Selection synchronously at a trusted gesture.
+   * A page window-capture listener registered before ours may already have
+   * replaced the Selection — this snapshot is only a billing candidate, never
+   * billed until the panel's 「翻译」 confirm click.
    * @returns {{ text: string, rangeId: string } | null} null unless the user
    *   genuinely holds a non-collapsed selection of billable length.
    */
@@ -1915,12 +1996,11 @@
     return false;
   }
 
-  async function handleSelectionTranslate(event, gesture) {
-    // Ignore synthetic page-script events that could burn the user's API key.
-    if (event && event.isTrusted === false) {
-      return;
-    }
-
+  /**
+   * Open the panel in its confirm state for a gesture snapshot. Never sends:
+   * TRANSLATE_BATCH waits for the extension-owned 「翻译」 click.
+   */
+  function showSelectionConfirm(event, gesture) {
     // The gesture snapshot taken synchronously at the trusted event is the
     // only billable payload (defensive — scheduling always passes one).
     if (!gesture?.text || !gesture.rangeId) {
@@ -1943,15 +2023,70 @@
 
     // Require the live Selection to still be exactly what the user held at the
     // trusted gesture: text swapped in by page script during the debounce must
-    // never reach TRANSLATE_BATCH even though the retained event is trusted.
-    // Any rejection clears the prior key so reselecting a previously
-    // translated range is not silently no-op'd by stale dedupe.
+    // never reach the preview (or the later TRANSLATE_BATCH). Any rejection
+    // clears the prior key so reselecting a previously translated range is not
+    // silently no-op'd by stale dedupe.
     if (
       selection.toString().replace(/\s+/gu, " ").trim() !== gesture.text ||
       getSelectionRangeIdentity(selection) !== gesture.rangeId
     ) {
       lastSelectionKey = "";
       hideSelectionPanel();
+      return;
+    }
+
+    let rect;
+    try {
+      rect = selection.getRangeAt(0).getBoundingClientRect();
+    } catch {
+      return;
+    }
+
+    if (!rect || (rect.width === 0 && rect.height === 0)) {
+      return;
+    }
+
+    // Confirm-first: showing the preview never bills. The stored snapshot is
+    // exactly what the 「翻译」 click may later send.
+    pendingSelectionGesture = gesture;
+    const panel = ensureSelectionPanel();
+    positionSelectionPanel(panel, rect);
+    setSelectionPanelState(panel, "confirm", gesture.text);
+  }
+
+  /**
+   * Billable selection path — runs only from the panel's 「翻译」 confirm
+   * click, with the stored gesture snapshot (never a fresh selection read).
+   */
+  async function sendSelectionTranslation(gesture) {
+    // The gesture snapshot the panel previewed is the only billable payload.
+    if (!gesture?.text || !gesture.rangeId) {
+      lastSelectionKey = "";
+      hideSelectionPanel();
+      return;
+    }
+
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+      // Real selection change (collapse / clear) — allow the same words again later.
+      lastSelectionKey = "";
+      hideSelectionPanel();
+      return;
+    }
+
+    // Require the live Selection to still be exactly what the panel previewed:
+    // text swapped in by page script since the confirm click must never reach
+    // TRANSLATE_BATCH even though the click itself is trusted.
+    if (
+      selection.toString().replace(/\s+/gu, " ").trim() !== gesture.text ||
+      getSelectionRangeIdentity(selection) !== gesture.rangeId
+    ) {
+      lastSelectionKey = "";
+      hideSelectionPanel();
+      return;
+    }
+
+    if (isSelectionInsideTranslatorUi(selection)) {
       return;
     }
 
@@ -2023,6 +2158,10 @@
       // after collapse) still reopen/reposition the panel.
       const selectionKey = `${targetLanguage}\0${model}\0${gesture.text}\0${liveRangeId}`;
       if (selectionKey === lastSelectionKey) {
+        // Already billed this exact selection — the confirm click must not
+        // dead-end silently, but it must not re-bill either.
+        const panel = ensureSelectionPanel();
+        setSelectionPanelState(panel, "success", "该选中文本已翻译");
         return;
       }
 
@@ -2176,6 +2315,23 @@
           overflow: auto;
         }
         .source[hidden] { display: none; }
+        .actions {
+          display: flex;
+          justify-content: flex-end;
+          margin-top: 10px;
+        }
+        .actions[hidden] { display: none; }
+        .confirm {
+          border: 0;
+          border-radius: 8px;
+          background: #4f6bff;
+          color: #f6f8ff;
+          cursor: pointer;
+          font: inherit;
+          font-size: 12px;
+          padding: 6px 16px;
+        }
+        .confirm:hover { background: #6c8cff; }
       </style>
       <div class="panel" role="dialog" aria-label="选中翻译">
         <div class="top">
@@ -2184,6 +2340,9 @@
         </div>
         <div class="body loading">正在翻译选中文本…</div>
         <div class="source" hidden></div>
+        <div class="actions" hidden>
+          <button class="confirm" type="button">翻译</button>
+        </div>
       </div>
     `;
 
@@ -2191,6 +2350,36 @@
       event.preventDefault();
       event.stopPropagation();
       hideSelectionPanel();
+    });
+
+    const confirmButton = shadow.querySelector(".confirm");
+    // The default mousedown action would collapse the document selection
+    // before the click lands — prevent it so the billed gesture survives.
+    confirmButton.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+    });
+    confirmButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      // Only a trusted click on this extension-owned button may bill.
+      if (event.isTrusted === false) {
+        return;
+      }
+      // Drop the show scheduled by this button's own mouseup so the confirm
+      // state cannot resurrect over the loading state.
+      if (selectionTimer) {
+        clearTimeout(selectionTimer);
+        selectionTimer = null;
+      }
+      // Bill the stored snapshot that the panel previewed — never a fresh read.
+      const gesture = pendingSelectionGesture;
+      if (!gesture) {
+        // Consumed by an earlier click (send in flight) — nothing new to bill;
+        // dismissing here would invalidate that in-flight send.
+        return;
+      }
+      pendingSelectionGesture = null;
+      void sendSelectionTranslation(gesture);
     });
 
     return host;
@@ -2216,8 +2405,11 @@
   function setSelectionPanelState(host, tone, message, sourceText) {
     const body = host.shadowRoot.querySelector(".body");
     const source = host.shadowRoot.querySelector(".source");
+    const actions = host.shadowRoot.querySelector(".actions");
     body.className = `body ${tone}`;
     body.textContent = message;
+    // Only the confirm state offers the billable 「翻译」 button.
+    actions.hidden = tone !== "confirm";
     if (tone === "success" && sourceText) {
       source.hidden = false;
       source.textContent = sourceText;
@@ -2258,6 +2450,8 @@
   function hideSelectionPanel() {
     // Invalidate any in-flight TRANSLATE_BATCH so a late response cannot reopen the panel.
     selectionGeneration += 1;
+    // Dismissal (×/Escape/outside press) must never leave a confirm pending.
+    pendingSelectionGesture = null;
     // Keep lastSelectionKey so ×/Escape dismiss does not allow Shift to rebill
     // the same unchanged selection; cleared on failure / real selection change.
     if (selectionTimer) {
