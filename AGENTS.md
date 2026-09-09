@@ -31,6 +31,8 @@ Human merge is **optional** only when every auto-merge gate passes. Copilot ofte
 
 **Never merge on Build alone.** Hard gates: Build and Test + Codex Review Gate (summary covers head + 0 unresolved Codex threads) + conversation resolution. When Copilot quota is dead, Copilot may be waived for manual merge only; Codex + conversation resolution + Build remain mandatory. Auto-merge still requires Copilot by default.
 
+- **评审严重度**：P0/P1 须改代码后再 Resolve；P2 可回复 `P2: defer — <reason>` 或 `P2: won't fix — <reason>` 后 Resolve（无需改代码）。未标注时：正确性/安全/数据丢失→P0/P1，nit/style→P2。详见 `docs/MERGE_GATES.md`「评审严重度」。
+
 ## Cloud agent environment
 
 

@@ -115,6 +115,32 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 
 ---
 
+## 评审严重度 | Review severity (P0 / P1 / P2)
+
+合入前 review 意见按严重度分级。**当前 Gate 仍要求所有 review thread 已 Resolve**；短期路径是：P2 可在回复 rationale 后 Resolve（无需改代码），P0/P1 必须先改代码再 Resolve。
+
+| 级别 | 含义 | 合入前要求 |
+|------|------|------------|
+| **P0** | 阻断：正确性错误、安全漏洞、数据丢失风险 | **必须改代码**，修复后再 Resolve |
+| **P1** | 高优先级：实质性缺陷或明显行为回归 | **必须改代码**，修复后再 Resolve |
+| **P2** | 可选：风格、命名、小优化、非阻塞建议 | **可不改代码**；回复后即可 Resolve |
+
+### P2 无代码改动时的 Resolve 话术
+
+在 thread 中回复其一，再点 Resolve：
+
+- `P2: defer — <reason>`（本次不做，后续再跟）
+- `P2: won't fix — <reason>`（明确不做）
+
+### 未标注严重度时
+
+- 正确性 / 安全 / 数据丢失 → 按 **P0/P1** 处理（须改代码）
+- 纯 nit / style → 按 **P2** 处理（可 Resolve + rationale）
+
+### 对 Copilot / Codex
+
+审查评论应显式标注 **P0 / P1 / P2**，便于作者与 Gate 操作对齐。
+
 ## 相关文件
 
 | 文件 | 角色 |

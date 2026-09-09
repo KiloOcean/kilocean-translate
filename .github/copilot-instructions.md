@@ -41,3 +41,15 @@ Merge policy: docs/MERGE_GATES.md and AGENTS.md — Codex Review Gate + conversa
 - Scope to the issue. Prefer extending existing content/popup paths.
 - Draft PR when uncertain; note what was verified.
 - Human owns merge risk on content-script and permissions.
+
+## Review severity tagging (P0 / P1 / P2)
+
+When leaving review comments (Copilot or Codex), **tag each finding** with severity:
+
+- **P0** — correctness bug, security issue, or data-loss risk → must fix in code before Resolve / merge
+- **P1** — substantive defect or clear behavioral regression → must fix in code before Resolve / merge
+- **P2** — nit, style, optional cleanup → author may Resolve without a code change after replying `P2: defer — <reason>` or `P2: won't fix — <reason>`
+
+Unlabeled comments: treat correctness/security/data-loss as P0/P1; treat nit/style as P2.
+
+The merge Gate still requires **all** review threads resolved; the short-term path for P2 is Resolve + rationale (no code change). See `docs/MERGE_GATES.md`.
