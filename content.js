@@ -1420,20 +1420,31 @@
                 endApplyingDom(styleGen);
               }
             }
+            // Snapshot recorded removed children BEFORE prune deletes their
+            // records — permanently removed nested translated blocks must not
+            // look like content edits of the still-connected ancestor.
+            const removedRecordedBlocks = new Set(
+              [...record.removedNodes].filter(
+                (node) => node.nodeType === Node.ELEMENT_NODE && blockRecords.has(node)
+              )
+            );
             pruneDetachedBlockRecords();
             // Removal-only SPA updates never appear in addedNodes — refresh via target.
-            // Connected recorded blocks in removedNodes are moves/reparents
-            // (same spirit as the addedNodes move guard) — do not queue the
-            // ancestor for teardown/rebill when source is unchanged.
+            // Recorded blocks in removedNodes are moves or permanent removals —
+            // do not queue the ancestor for teardown/rebill when source is unchanged.
             const removedOnlyUi = [...record.removedNodes].every((node) =>
               isIgnoredTranslatorMutation(node) ||
               isReparentIntoOriginalWrap(node) ||
-              (node.nodeType === Node.ELEMENT_NODE && blockRecords.has(node) && node.isConnected)
+              removedRecordedBlocks.has(node)
             );
             if (!removedOnlyUi) {
               const refreshHost = findRefreshHostForMutation(record.target);
               if (refreshHost) {
                 pendingRefreshBlocks.add(refreshHost);
+              } else if (record.target?.isConnected) {
+                // In-flight translate may have no blockRecords yet — queue target
+                // so discovery retries after the pending request rejects the stale segment.
+                pendingRoots.add(record.target);
               }
             }
           }
