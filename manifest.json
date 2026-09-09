@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "千浩翻译 · Kilocean Translate",
-  "version": "1.2.0",
-  "description": "Kilocean 千浩翻译：用 DeepSeek API 渐进式翻译网页，并自动跟译新加载内容。权限极小，Key 只存在本机。",
+  "version": "1.3.0",
+  "description": "Kilocean 千浩翻译：双语对照整页翻译、划词翻译，自动跟译新内容。权限极小，Key 只存在本机。",
   "minimum_chrome_version": "102",
   "permissions": [
     "activeTab",

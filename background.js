@@ -6,7 +6,8 @@ const ALLOWED_TARGET_LANGUAGES = new Set(["zh-CN", "zh-TW", "ja", "ko", "en"]);
 const DEFAULT_SETTINGS = Object.freeze({
   apiKey: "",
   model: "deepseek-v4-flash",
-  targetLanguage: "zh-CN"
+  targetLanguage: "zh-CN",
+  displayMode: "bilingual"
 });
 
 chrome.runtime.onInstalled.addListener(async () => {

@@ -16,8 +16,24 @@
     en: "English"
   });
 
+  const DISPLAY_MODES = Object.freeze({
+    bilingual: "bilingual",
+    translationOnly: "translation-only",
+    original: "original"
+  });
+
   function getTargetLanguageName(code) {
     return TARGET_LANGUAGE_NAMES[code] || code || "简体中文";
+  }
+
+  function normalizeDisplayMode(value) {
+    if (value === DISPLAY_MODES.translationOnly) {
+      return DISPLAY_MODES.translationOnly;
+    }
+    if (value === DISPLAY_MODES.original) {
+      return DISPLAY_MODES.original;
+    }
+    return DISPLAY_MODES.bilingual;
   }
 
   function isTranslatableText(value, targetLanguage) {
@@ -135,7 +151,9 @@
   }
 
   return {
+    DISPLAY_MODES,
     TARGET_LANGUAGE_NAMES,
+    normalizeDisplayMode,
     getTargetLanguageName,
     isTranslatableText,
     preserveWhitespace,
