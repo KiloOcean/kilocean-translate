@@ -530,7 +530,9 @@
     if (!isEligibleTextHost(node.parentElement, { skipRecordedBlock: true })) {
       return false;
     }
-    return Utils.isTranslatableText(node.data, state.targetLanguage);
+    // Discover any non-empty visible fragment here; isTranslatableText applies
+    // only to aggregated block text in collectBlocks (letter-per-span headings).
+    return Boolean(node.data?.trim());
   }
 
   function collectRawTextNodes(root) {
@@ -771,7 +773,13 @@
     return response.translations;
   }
 
-  function joinSplitTranslations(left, right, leftSource, rightSource) {
+  function isWhitespaceDelimitedTarget(targetLanguage) {
+    const code = String(targetLanguage || "").toLowerCase();
+    // CJK scripts generally do not need an inserted inter-word space.
+    return !(code.startsWith("zh") || code.startsWith("ja"));
+  }
+
+  function joinSplitTranslations(left, right, leftSource, rightSource, targetLanguage) {
     const leftStr = String(left || "");
     const rightStr = String(right || "");
     // If either translated half already retains edge whitespace, keep direct concat.
@@ -783,6 +791,15 @@
     const rightLead = (String(rightSource || "").match(/^\s+/u) || [""])[0];
     const boundary = leftTrail || rightLead;
     if (!boundary) {
+      // Midpoint char-split (e.g. CJK with no nearby whitespace) would otherwise
+      // glue whitespace-delimited target halves: lastwordNextword.
+      if (
+        leftStr &&
+        rightStr &&
+        isWhitespaceDelimitedTarget(targetLanguage)
+      ) {
+        return `${leftStr} ${rightStr}`;
+      }
       return `${leftStr}${rightStr}`;
     }
     const sep = /\n/u.test(boundary) ? "\n" : " ";
@@ -815,7 +832,7 @@
         return null;
       }
       // Preserve boundary whitespace from the original slice join.
-      return joinSplitTranslations(left, right, leftSource, rightSource);
+      return joinSplitTranslations(left, right, leftSource, rightSource, runSettings.targetLanguage);
     }
   }
 
@@ -946,9 +963,13 @@
 
     const gen = beginApplyingDom();
     try {
+      // Phrasing-content / common inline hosts must use <span> companions —
+      // a block <div> inside button/strong (flex/grid items) distorts layout.
       const inlineHosts = new Set([
         "P", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "DT", "DD",
-        "FIGCAPTION", "TD", "TH", "CAPTION", "SUMMARY", "A", "SPAN", "LABEL"
+        "FIGCAPTION", "TD", "TH", "CAPTION", "SUMMARY", "A", "SPAN", "LABEL",
+        "BUTTON", "STRONG", "EM", "B", "I", "SMALL", "MARK", "CITE", "Q",
+        "DFN", "ABBR", "TIME", "SUB", "SUP", "U", "S", "VAR", "OUTPUT"
       ]);
       const wrapTag = inlineHosts.has(block.tagName) ? "span" : "div";
       let placement = getTranslationPlacement(block);
@@ -969,6 +990,9 @@
 
       if (placement === "after-host" && block.parentNode && block !== document.body && block !== document.documentElement) {
         // nowrap flex: full-width flex item would squeeze siblings — place as block sibling.
+        // Still wrap owned text so translation-only can hide it without hiding
+        // page-owned images/inputs inside the host.
+        ({ firstWrap: wrap, wraps: createdWraps } = wrapTextNodesForToggle(block, options.nested || [], wrapTag));
         companion.classList.add("kilocean-translation--after");
         block.parentNode.insertBefore(companion, block.nextSibling);
         block.setAttribute("data-kilocean-layout", "after");
@@ -1096,12 +1120,7 @@
       html[data-kilocean-display="translation-only"] [data-kilocean-block] [data-kilocean-original-wrap] {
         display: none !important;
       }
-      html[data-kilocean-display="translation-only"] [data-kilocean-block][data-kilocean-layout="flow"] > :not(.kilocean-translation) {
-        display: none !important;
-      }
-      html[data-kilocean-display="translation-only"] [data-kilocean-block][data-kilocean-layout="after"] {
-        display: none !important;
-      }
+      /* flow/after: hide only owned original wraps — never page-owned images/inputs */
       html[data-kilocean-display="translation-only"] [data-kilocean-block] > .kilocean-translation {
         display: block;
         margin-top: 0;
@@ -1747,7 +1766,8 @@
   function hideSelectionPanel() {
     // Invalidate any in-flight TRANSLATE_BATCH so a late response cannot reopen the panel.
     selectionGeneration += 1;
-    lastSelectionKey = "";
+    // Keep lastSelectionKey so ×/Escape dismiss does not allow Shift to rebill
+    // the same unchanged selection; cleared on failure / real selection change.
     if (selectionTimer) {
       clearTimeout(selectionTimer);
       selectionTimer = null;
