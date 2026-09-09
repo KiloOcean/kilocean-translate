@@ -31,6 +31,9 @@
   let selectionGeneration = 0;
   let styleHost = null;
   let applyingDom = false;
+  let applyingDomGeneration = 0;
+  /** Ignore MutationObserver callbacks until this timestamp (ms since epoch). */
+  let suppressMutationsUntil = 0;
   /** @type {{ targetLanguage: string, model: string } | null} */
   let activeRunSettings = null;
   /** @type {{ targetLanguage?: string, model?: string } | null} */
@@ -78,7 +81,8 @@
       refreshAllBlockDisplays();
     }
     if (changes.targetLanguage?.newValue) {
-      if (state.phase === "translating") {
+      // Keep the active page run stable while translations remain on-screen.
+      if (state.active) {
         deferredRunSettings = {
           ...(deferredRunSettings || {}),
           targetLanguage: changes.targetLanguage.newValue
@@ -88,7 +92,7 @@
       }
     }
     if (changes.model?.newValue) {
-      if (state.phase === "translating") {
+      if (state.active) {
         deferredRunSettings = {
           ...(deferredRunSettings || {}),
           model: changes.model.newValue
@@ -147,7 +151,11 @@
       try {
         assertExportReady();
         sendResponse({ ok: true });
-        setTimeout(() => window.print(), 80);
+        setTimeout(() => {
+          // Live print includes fixed overlays; HTML export already strips the host.
+          hideSelectionPanel();
+          window.print();
+        }, 80);
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
       }
@@ -231,13 +239,10 @@
   }
 
   function finishRunSettings() {
-    activeRunSettings = null;
-    if (deferredRunSettings?.targetLanguage) {
-      state.targetLanguage = deferredRunSettings.targetLanguage;
-    }
-    if (deferredRunSettings?.model) {
-      state.model = deferredRunSettings.model;
-    }
+    // Keep activeRunSettings pinned for dynamic follow-on translations so this
+    // page does not mix languages/models after a mid-run settings save.
+    // Deferred prefs apply on the next startTranslation (via popup options) or
+    // after restoreOriginal clears the session.
     deferredRunSettings = null;
   }
 
@@ -246,6 +251,42 @@
       targetLanguage: state.targetLanguage,
       model: state.model
     };
+  }
+
+  function beginApplyingDom() {
+    applyingDomGeneration += 1;
+    applyingDom = true;
+    return applyingDomGeneration;
+  }
+
+  function endApplyingDom(gen) {
+    // Drain records queued synchronously for our own DOM writes before the
+    // observer callback can run with applyingDom already false.
+    try {
+      mutationObserver?.takeRecords();
+    } catch {
+      // Observer may be disconnected.
+    }
+    if (gen === applyingDomGeneration) {
+      applyingDom = false;
+    }
+    // Short suppress window covers async MutationObserver delivery after wrap.
+    suppressMutationsUntil = Date.now() + 120;
+  }
+
+  function shouldSuppressObserver() {
+    if (applyingDom) {
+      return true;
+    }
+    if (Date.now() < suppressMutationsUntil) {
+      try {
+        mutationObserver?.takeRecords();
+      } catch {
+        // ignore
+      }
+      return true;
+    }
+    return false;
   }
 
   function notifyPopupStatus() {
@@ -292,18 +333,32 @@
       return;
     }
 
-    const prev = applyingDom;
-    applyingDom = true;
+    const gen = beginApplyingDom();
     try {
       const { block, wrap, companion } = record;
       companion?.remove();
 
       // Fully unwrap even when the host is detached (virtualized lists / SPA reuse).
-      if (block && wrap && wrap.parentNode === block) {
-        while (wrap.firstChild) {
-          block.insertBefore(wrap.firstChild, wrap);
+      // Companion layout may create multiple owned-text wraps — unwrap all of them.
+      const wraps = [];
+      if (wrap) {
+        wraps.push(wrap);
+      }
+      if (block) {
+        for (const extra of block.querySelectorAll(":scope > .kilocean-original-wrap")) {
+          if (!wraps.includes(extra)) {
+            wraps.push(extra);
+          }
         }
-        wrap.remove();
+      }
+      for (const owned of wraps) {
+        if (owned.parentNode !== block) {
+          continue;
+        }
+        while (owned.firstChild) {
+          block.insertBefore(owned.firstChild, owned);
+        }
+        owned.remove();
       }
 
       if (block) {
@@ -312,7 +367,7 @@
         block.removeAttribute("data-kilocean-layout");
       }
     } finally {
-      applyingDom = prev;
+      endApplyingDom(gen);
     }
   }
 
@@ -621,8 +676,18 @@
     }
 
     if (isDynamic && runId === generation) {
-      state.phase = "translated";
-      showToast("新内容已翻译", "success");
+      // Mirror the initial-run outcome so 401/429 etc. are not reported as success.
+      if (state.failed > 0 && state.translated === 0) {
+        state.phase = "error";
+        showToast(state.error || "翻译失败", "error", 6000);
+      } else if (state.failed > 0) {
+        state.phase = "translated";
+        showToast(`已翻译 ${state.translated} 条，${state.failed} 条失败`, "warning", 5000);
+      } else {
+        state.phase = "translated";
+        showToast("新内容已翻译", "success");
+      }
+      notifyPopupStatus();
     }
   }
 
@@ -662,7 +727,8 @@
         }
 
         applyBlockTranslation(segment.block, segment.text, rendered, {
-          companionOnly: Boolean(segment.companionOnly)
+          companionOnly: Boolean(segment.companionOnly),
+          nested: segment.nested || []
         });
         state.translated += 1;
       });
@@ -679,13 +745,68 @@
     }
   }
 
+  function wrapOwnedContentForCompanion(block, nestedBlocks, wrapTag) {
+    const nestedSet = new Set(nestedBlocks || []);
+    const children = [...block.childNodes];
+    let pending = [];
+    let firstWrap = null;
+
+    const flush = () => {
+      if (pending.length === 0) {
+        return;
+      }
+      const hasSubstance = pending.some((node) => {
+        if (node.nodeType === Node.TEXT_NODE) {
+          return /\S/u.test(node.data || "");
+        }
+        return node.nodeType === Node.ELEMENT_NODE;
+      });
+      if (!hasSubstance) {
+        pending = [];
+        return;
+      }
+      const wrap = document.createElement(wrapTag);
+      wrap.className = "kilocean-original-wrap";
+      // Not UI-marked: SPA edits to owned original text must still refresh.
+      block.insertBefore(wrap, pending[0]);
+      for (const node of pending) {
+        wrap.appendChild(node);
+      }
+      if (!firstWrap) {
+        firstWrap = wrap;
+      }
+      pending = [];
+    };
+
+    for (const child of children) {
+      if (child.nodeType === Node.ELEMENT_NODE) {
+        if (
+          child.classList?.contains("kilocean-translation") ||
+          child.classList?.contains("kilocean-translation--flow") ||
+          child.classList?.contains("kilocean-original-wrap")
+        ) {
+          flush();
+          continue;
+        }
+        const isNestedRoot = nestedSet.has(child);
+        const containsNested = [...nestedSet].some((nested) => child.contains(nested));
+        if (isNestedRoot || containsNested) {
+          flush();
+          continue;
+        }
+      }
+      pending.push(child);
+    }
+    flush();
+    return firstWrap;
+  }
+
   function applyBlockTranslation(block, originalText, translation, options = {}) {
     if (blockRecords.has(block)) {
       return;
     }
 
-    const prev = applyingDom;
-    applyingDom = true;
+    const gen = beginApplyingDom();
     try {
       const inlineHosts = new Set([
         "P", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "DT", "DD",
@@ -711,8 +832,16 @@
         block.parentNode.insertBefore(companion, block.nextSibling);
         block.setAttribute("data-kilocean-layout", "after");
         layout = "after";
-      } else if (placement === "flow" || placement === "companion") {
-        // Preserve flex/grid / nested-block structure: do not wrap existing children.
+      } else if (placement === "companion") {
+        // Nested ancestor with own text: wrap owned text so translation-only can hide
+        // it, without hiding nested block subtrees (unlike flex/grid flow).
+        wrap = wrapOwnedContentForCompanion(block, options.nested || [], wrapTag);
+        companion.classList.add("kilocean-translation--flow");
+        block.appendChild(companion);
+        block.setAttribute("data-kilocean-layout", "companion");
+        layout = "companion";
+      } else if (placement === "flow") {
+        // Preserve flex/grid structure: do not wrap existing children.
         companion.classList.add("kilocean-translation--flow");
         block.appendChild(companion);
         block.setAttribute("data-kilocean-layout", "flow");
@@ -744,7 +873,7 @@
       blockRecords.set(block, record);
       applyBlockDisplay(record);
     } finally {
-      applyingDom = prev;
+      endApplyingDom(gen);
     }
   }
 
@@ -898,7 +1027,7 @@
   function startObserving() {
     stopObserving();
     mutationObserver = new MutationObserver((records) => {
-      if (!state.active || applyingDom) {
+      if (!state.active || shouldSuppressObserver()) {
         return;
       }
 
@@ -906,6 +1035,16 @@
         if (record.type === "childList") {
           if (record.removedNodes.length > 0) {
             pruneDetachedBlockRecords();
+            // Removal-only SPA updates never appear in addedNodes — refresh via target.
+            const removedOnlyUi = [...record.removedNodes].every((node) =>
+              isIgnoredTranslatorMutation(node)
+            );
+            if (!removedOnlyUi) {
+              const refreshHost = findRefreshHostForMutation(record.target);
+              if (refreshHost) {
+                pendingRefreshBlocks.add(refreshHost);
+              }
+            }
           }
           record.addedNodes.forEach((node) => {
             const refreshHost = findRefreshHostForMutation(node);

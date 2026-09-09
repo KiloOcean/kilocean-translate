@@ -25,22 +25,29 @@
 #   - GraphQL thread lookup failed + any Codex review comments exist → fail
 #
 # Re-runs when Codex posts/edits its summary or submits a review. Resolving
-# threads does not emit an event — Re-run a *pull_request*-originated Gate
+# threads does not emit an event — Re-run a *pull_request_target*-originated Gate
 # job from Actions (reattaches the required check to head SHA), or
 # workflow_dispatch Auto Merge after Gate is already green on that SHA.
 #
-# Security (minimal trust): this workflow keeps only read permissions.
-# It does NOT use checks:write or actions:write. A same-repo PR branch can
-# still replace this evaluator under pull_request, but without write scopes
-# it cannot forge a Checks API success or dispatch Auto Merge. Prefer the
-# pull_request job conclusion (auto-attaches to head SHA). Do NOT switch to
-# pull_request_target that checks out PR code.
+# Security (trusted evaluator):
+#   - Trigger is pull_request_target (plus comment/review/dispatch), so the
+#     workflow YAML always comes from the PR base / default branch — never
+#     from the untrusted PR head. That stops a same-repo contributor from
+#     replacing this evaluator with an always-green job.
+#   - This job uses ONLY actions/github-script + the GitHub API. It must
+#     NEVER actions/checkout the PR head, NEVER run PR-controlled shell, and
+#     NEVER execute code from the PR tree.
+#   - Permissions stay read-only (contents / pull-requests / issues). No
+#     checks:write or actions:write — success is the job conclusion only.
+#   - Why this is safe: the only inputs are PR metadata and comment/thread
+#     state fetched via API; there is no secret exfil surface and no path
+#     for PR YAML/shell to run inside this job.
 #
 # issue_comment / pull_request_review / review_comment / workflow_dispatch
-# still run the evaluator and show a workflow run in Actions, but they do
-# not post a separate Checks API result onto the head SHA. Auto Merge
-# listens to workflow_run for "Codex Review Gate" and does not need Gate
-# to dispatch it.
+# still run the evaluator and show a workflow run in Actions. pull_request_target
+# attaches the job conclusion check to the PR the same way pull_request did.
+# Auto Merge listens to workflow_run for "Codex Review Gate" and does not
+# need Gate to dispatch it.
 #
 # Branch protection / Ruleset required-check name is the *job* name below
 # (`Codex Review Gate`), not an arbitrary workflow title. Keep workflow
@@ -49,7 +56,8 @@
 name: Codex Review Gate
 
 on:
-  pull_request:
+  # Trusted base-branch workflow definition (NOT PR head YAML).
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
   issue_comment:
     types: [created, edited]
@@ -79,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: >-
-      github.event_name == 'pull_request' ||
+      github.event_name == 'pull_request_target' ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'pull_request_review' ||
       github.event_name == 'pull_request_review_comment' ||
@@ -225,7 +233,7 @@ jobs:
 
             if (pr.labels.some((l) => l.name === 'skip-codex-gate')) {
               // Escape hatch for humans/admin only: never report success + dispatch.
-              // pull_request-attached Gate checks become the job conclusion, so we
+              // pull_request_target-attached Gate checks become the job conclusion, so we
               // must setFailed — a bare return would mark Gate success and Auto Merge.
               const msg = 'skip-codex-gate present — Gate fails closed (no Auto Merge). Remove the label and clear Codex threads for auto-merge, or admin-merge manually if policy allows.';
               core.info(`PR #${prNumber}: ${msg}`);
@@ -316,12 +324,12 @@ jobs:
             }
 
             if (unresolvedCodex > 0) {
-              const msg = `${unresolvedCodex} unresolved Codex review thread(s). Resolve them, then re-run a pull_request-originated Gate job (thread resolve does not retrigger; non-PR events do not post Checks API results).`;
+              const msg = `${unresolvedCodex} unresolved Codex review thread(s). Resolve them, then re-run a pull_request_target-originated Gate job (thread resolve does not retrigger; non-PR events do not post Checks API results).`;
               core.setFailed(msg);
               return;
             }
 
             const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved Codex threads`;
             core.info(ok);
-            // Success = job conclusion. pull_request attaches "Codex Review Gate"
-            // to the head SHA. Auto Merge listens via workflow_run — no dispatch.
+            // Success = job conclusion. pull_request_target attaches "Codex Review Gate"
+            // to the PR head check. Auto Merge listens via workflow_run — no dispatch.

@@ -71,13 +71,15 @@ Codex 只发 issue comment（`<!-- codex-pull-request-review-summary -->`）和�
 
 Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有** `checks: write` 或 `actions: write`。
 
-- **不要**把 Gate 改成 `pull_request_target` 并 checkout PR 代码（经典 RCE）。
-- 同仓分支上的 `pull_request` 仍会跑 PR 版 workflow YAML，但无写权限时无法伪造 Checks API 绿勾，也无法 `workflow_dispatch` Auto Merge。
-- **`pull_request` 事件**：job conclusion 会把 check 名 `Codex Review Gate` 挂到 head SHA（branch protection / Auto Merge 认这个）。
-- **`issue_comment` / `pull_request_review` / `pull_request_review_comment` / `workflow_dispatch`**：仍会跑评估并在 Actions UI 显示 run，但**不会**再往 head SHA 单独 `checks.create`。要刷新 required check：对上一次 **`pull_request` 来源**的 Gate job 点 **Re-run**（或再 push / synchronize）。
+- Gate 使用 **`pull_request_target`**（外加 comment / review / dispatch），因此 **workflow YAML 始终来自 base/default 分支**，不受 PR head 篡改。
+- Job **只**跑 `actions/github-script` + GitHub API：**禁止** `actions/checkout` PR head、**禁止**执行任何 PR 控制的 shell/代码。这是安全的：评估输入只有 API 读到的 PR/评论/线程状态，没有密钥、没有 PR 树执行面。
+- **不要**在 Gate 里 checkout PR 代码（那才是经典 RCE）；仅改 trigger 为 `pull_request_target` 且 API-only 是刻意的信任边界。
+- **`pull_request_target` 事件**：job conclusion 把 check 名 `Codex Review Gate` 挂到 PR（branch protection / Auto Merge 认这个）。
+- **`issue_comment` / `pull_request_review` / `pull_request_review_comment` / `workflow_dispatch`**：仍会跑评估并在 Actions UI 显示 run，但**不会**再往 head SHA 单独 `checks.create`。要刷新 required check：对上一次 **`pull_request_target` 来源**的 Gate job 点 **Re-run**（或再 push / synchronize）。
 - Auto Merge 已监听 `workflow_run`（workflow 名 `Codex Review Gate`）；Gate **不必**自己 dispatch Auto Merge。
+- **`ai-review.yml`**：`pull_request` 上只请求 Copilot；**不**把 provider API secrets 注入 PR 控制的 job。
 
-点 Resolve 不会自动重跑。清完线程后：Actions 里对 **pull_request 来源**的 `Codex Review Gate` 点 **Re-run**（重新挂 check 到 head SHA）。Gate 已绿时也可对 Auto Merge 做 `workflow_dispatch`。
+点 Resolve 不会自动重跑。清完线程后：Actions 里对 **pull_request_target 来源**的 `Codex Review Gate` 点 **Re-run**（重新挂 check）。Gate 已绿时也可对 Auto Merge 做 `workflow_dispatch`。
 
 **前置：** org/repo 需安装 ChatGPT Codex connector（或等价 Codex GitHub App）。
 

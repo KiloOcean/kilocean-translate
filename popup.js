@@ -43,8 +43,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type !== "CONTENT_STATUS" || !message.status) {
+    return;
+  }
+  // Ignore status from other tabs while this popup is bound to currentTab.
+  if (
+    sender?.tab?.id != null &&
+    currentTab?.id != null &&
+    sender.tab.id !== currentTab.id
+  ) {
     return;
   }
   if (message.status.displayMode) {
