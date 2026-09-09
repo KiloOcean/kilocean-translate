@@ -1180,6 +1180,11 @@
   }
 
   async function handleSelectionTranslate(event) {
+    // Ignore synthetic page-script events that could burn the user's API key.
+    if (event && event.isTrusted === false) {
+      return;
+    }
+
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
       hideSelectionPanel();
