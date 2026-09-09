@@ -112,6 +112,20 @@
     return nonEmptyLines.length >= 2;
   }
 
+  // Count source paragraph/line units the same way join recovery detects them:
+  // blank-line chunks when \n\n is present, otherwise non-empty trimmed lines.
+  // Single-line text counts as 1 so mismatched extras cannot silently join.
+  function countSourceParagraphUnits(text) {
+    if (typeof text !== "string" || text.length === 0) {
+      return 0;
+    }
+    if (text.includes("\n\n")) {
+      return text.split("\n\n").filter((part) => part.trim() !== "").length;
+    }
+    const nonEmptyLines = text.split("\n").filter((line) => line.trim() !== "");
+    return nonEmptyLines.length === 0 ? 0 : nonEmptyLines.length;
+  }
+
   function parseTranslationPayload(content, expectedCount, sourceText) {
     if (typeof content !== "string" || content.trim() === "") {
       throw new Error("DeepSeek 返回了空内容");
@@ -144,7 +158,8 @@
       translations.length > 1 &&
       translations.every((item) => typeof item === "string" && item.trim() !== "") &&
       typeof sourceText === "string" &&
-      hasMultiParagraphSource(sourceText)
+      hasMultiParagraphSource(sourceText) &&
+      translations.length === countSourceParagraphUnits(sourceText)
     ) {
       const separator = sourceText.includes("\n\n") ? "\n\n" : "\n";
       return [translations.join(separator)];
@@ -189,6 +204,7 @@
     preserveWhitespace,
     chunkSegments,
     hasMultiParagraphSource,
+    countSourceParagraphUnits,
     parseTranslationPayload,
     sanitizeExportFilename,
     buildExportFilename

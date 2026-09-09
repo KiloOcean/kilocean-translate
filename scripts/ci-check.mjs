@@ -150,13 +150,17 @@ function checkParseTranslationPayload() {
     fail(`shared.js: cannot load for parseTranslationPayload test: ${error.message}`);
     return;
   }
-  const { parseTranslationPayload, hasMultiParagraphSource } = utils;
+  const { parseTranslationPayload, hasMultiParagraphSource, countSourceParagraphUnits } = utils;
   if (typeof parseTranslationPayload !== "function") {
     fail("shared.js: parseTranslationPayload export missing");
     return;
   }
   if (typeof hasMultiParagraphSource !== "function") {
     fail("shared.js: hasMultiParagraphSource export missing");
+    return;
+  }
+  if (typeof countSourceParagraphUnits !== "function") {
+    fail("shared.js: countSourceParagraphUnits export missing");
     return;
   }
 
@@ -182,6 +186,11 @@ function checkParseTranslationPayload() {
   assertEqual(hasMultiParagraphSource("单段原文"), false, "hasMultiParagraphSource: single line");
   assertEqual(hasMultiParagraphSource(""), false, "hasMultiParagraphSource: empty");
 
+  assertEqual(countSourceParagraphUnits("第一段\n\n第二段\n\n第三段"), 3, "countSourceParagraphUnits: blank-line paras");
+  assertEqual(countSourceParagraphUnits("第一段\n第二段\n第三段"), 3, "countSourceParagraphUnits: single-newline lines");
+  assertEqual(countSourceParagraphUnits("单段原文"), 1, "countSourceParagraphUnits: single line");
+  assertEqual(countSourceParagraphUnits(""), 0, "countSourceParagraphUnits: empty");
+
   // expectedCount 1 + N>1 all-string + multi-paragraph source → join with \n\n
   assertEqual(
     parseTranslationPayload(
@@ -202,6 +211,24 @@ function checkParseTranslationPayload() {
     ),
     ["甲段\n乙段\n丙段"],
     "parseTranslationPayload: join N>1 on single-\\n multi-line source"
+  );
+
+  // Join recovery must only run when returned entry count matches source units
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段"] }),
+      1,
+      "第一段\n\n第二段\n\n第三段"
+    ),
+    "parseTranslationPayload: must not join when fewer translations than source units"
+  );
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段", "丁段"] }),
+      1,
+      "第一段\n\n第二段\n\n第三段"
+    ),
+    "parseTranslationPayload: must not join when more translations than source units"
   );
 
   // Empty / whitespace-only entries must not join — fall through to length mismatch
