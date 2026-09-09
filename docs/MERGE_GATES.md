@@ -126,3 +126,5 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 | `docs/QUALITY.md` | 本地/CI 质量检查 |
 | `docs/ai-native-quality-gate.md` | 自测清单 + 门禁摘要 |
 | `AGENTS.md` | Agent 操作简报（含 merge policy） |
+
+<!-- gate e2e 2026-09-09 -->
