@@ -1,0 +1,378 @@
+# Auto-merge when CI is green, Copilot finished a review on the head SHA
+# that is not CHANGES_REQUESTED, and every review thread is resolved.
+#
+# Copilot often submits COMMENTED, not APPROVED. Do not require APPROVED.
+# The #33 failure mode (COMMENTED + open inline threads) is blocked by
+# the unresolved-thread gate, not by rejecting COMMENTED itself.
+#
+# Gate (all required):
+#   - PR is open, not draft, base is main, no "no-auto-merge" or "skip-codex-gate" label
+#   - Successful Build & Test (or CI) *check run* on the head SHA
+#     (fail closed if that check run is missing; no combined-status fallback)
+#   - Relevant checks are completed and not failed (ignore Custom LLM Review
+#     and this workflow's own check name). Do NOT ignore Codex Review Gate.
+#     Multiple runs of the same check name: only the latest attempt counts.
+#   - Check "copilot-pull-request-reviewer" must exist on the head SHA
+#     and complete with conclusion success (missing / skipped / neutral skip)
+#   - Check "Codex Review Gate" (job name, not a workflow title) must exist
+#     on the head SHA and complete with conclusion success
+#     (missing / skipped / neutral skip)
+#   - Latest Copilot review for the head SHA exists and is APPROVED or
+#     COMMENTED (not CHANGES_REQUESTED; missing review does not merge)
+#   - GraphQL reviewThreads: every thread isResolved (REST fallback:
+#     fail closed if any review comments exist and resolution is unknown)
+#
+# Blocks: draft, non-main base, no-auto-merge, skip-codex-gate, failed/pending relevant
+# checks, missing Copilot review, CHANGES_REQUESTED, unresolved threads.
+#
+# Re-evaluates when CI succeeds, when Copilot submits a review, when
+# Codex Review Gate succeeds (workflow_run), or manual dispatch.
+# Codex Gate does not dispatch this workflow (Gate is read-only).
+# Note: workflow_run only runs from the default branch once this file is merged.
+# After resolving threads, re-run a pull_request-originated Codex Review Gate
+# job (to refresh the head check), and/or workflow_dispatch this workflow —
+# thread resolution does not emit a workflow event.
+
+name: Auto Merge
+
+on:
+  workflow_run:
+    workflows: ["CI", "Codex Review Gate"]
+    types: [completed]
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to re-evaluate (e.g. after resolving review threads)'
+        required: true
+        type: string
+
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.workflow_run.head_branch || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: read
+
+jobs:
+  auto-merge:
+    name: Squash merge when green
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        (github.event.workflow_run.event == 'pull_request' ||
+          github.event.workflow_run.name == 'Codex Review Gate')) ||
+      (github.event_name == 'pull_request_review' &&
+        contains(fromJSON('["approved", "commented"]'), github.event.review.state) &&
+        contains(fromJSON('["copilot-pull-request-reviewer[bot]", "copilot-pull-request-reviewer"]'), github.event.review.user.login))
+    steps:
+      - name: Resolve PR and decide merge
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const COPILOT_LOGINS = new Set([
+              'copilot-pull-request-reviewer[bot]',
+              'copilot-pull-request-reviewer',
+            ]);
+            const COPILOT_CHECK_RE = /copilot-pull-request-reviewer/i;
+            const CODEX_GATE_NAME = 'Codex Review Gate';
+            const OK_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
+
+            function isIgnoredCheck(name) {
+              const n = (name || '').toLowerCase();
+              if (n.includes('auto merge') || n.includes('squash merge')) return true;
+              if (n.includes('custom llm')) return true;
+              return false;
+            }
+
+            function isCiCheck(name) {
+              return /build\s*&\s*test/i.test(name) || /^ci$/i.test(name) || /build-and-test/i.test(name);
+            }
+
+            // Rank by created_at (not completed_at): an older run can finish
+            // after a newer attempt and must not mask the newer result.
+            function checkRunTime(c) {
+              const t = c.created_at || '';
+              return t ? new Date(t).getTime() : 0;
+            }
+
+            // listForRef can return multiple runs per name (Actions re-runs).
+            // Only the latest attempt should gate merge.
+            function latestPerName(runs) {
+              const byName = new Map();
+              for (const c of runs) {
+                const key = c.name || '';
+                const prev = byName.get(key);
+                if (
+                  !prev ||
+                  checkRunTime(c) > checkRunTime(prev) ||
+                  (checkRunTime(c) === checkRunTime(prev) && (c.id || 0) > (prev.id || 0))
+                ) {
+                  byName.set(key, c);
+                }
+              }
+              return [...byName.values()];
+            }
+
+            function copilotReviewAllowsMerge(review) {
+              const state = review.state;
+              if (state === 'CHANGES_REQUESTED') {
+                return { ok: false, reason: 'CHANGES_REQUESTED' };
+              }
+              if (state === 'APPROVED' || state === 'COMMENTED') {
+                return { ok: true, reason: state };
+              }
+              return { ok: false, reason: state };
+            }
+
+            async function findPrNumber() {
+              if (context.eventName === 'pull_request_review') {
+                return context.payload.pull_request.number;
+              }
+              if (context.eventName === 'workflow_dispatch') {
+                const raw = context.payload.inputs?.pr_number;
+                const n = Number(String(raw ?? '').trim());
+                if (!Number.isInteger(n) || n <= 0) {
+                  throw new Error(`Invalid workflow_dispatch pr_number: ${JSON.stringify(raw)}`);
+                }
+                return n;
+              }
+              const run = context.payload.workflow_run;
+              // Codex Gate often originates from issue_comment; pull_requests is empty.
+              if (run.pull_requests && run.pull_requests.length > 0) {
+                return run.pull_requests[0].number;
+              }
+              const { data: prs } = await github.rest.pulls.list({
+                owner,
+                repo,
+                state: 'open',
+                head: `${owner}:${run.head_branch}`,
+              });
+              return prs[0]?.number ?? null;
+            }
+
+            async function countUnresolvedThreads(prNumber) {
+              let unresolved = 0;
+              let after = null;
+              let hasNextPage = true;
+              while (hasNextPage) {
+                const result = await github.graphql(
+                  `query($owner: String!, $name: String!, $number: Int!, $after: String) {
+                    repository(owner: $owner, name: $name) {
+                      pullRequest(number: $number) {
+                        reviewThreads(first: 100, after: $after) {
+                          nodes { isResolved }
+                          pageInfo { hasNextPage endCursor }
+                        }
+                      }
+                    }
+                  }`,
+                  { owner, name: repo, number: prNumber, after }
+                );
+                const conn = result.repository?.pullRequest?.reviewThreads;
+                if (!conn) {
+                  throw new Error('GraphQL returned no reviewThreads connection');
+                }
+                unresolved += conn.nodes.filter((t) => !t.isResolved).length;
+                hasNextPage = conn.pageInfo.hasNextPage;
+                after = conn.pageInfo.endCursor;
+              }
+              return unresolved;
+            }
+
+            async function countReviewComments(prNumber) {
+              const comments = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner,
+                repo,
+                pull_number: prNumber,
+                per_page: 100,
+              });
+              return comments.length;
+            }
+
+            const prNumber = await findPrNumber();
+            if (!prNumber) {
+              if (context.eventName === 'workflow_dispatch') {
+                core.setFailed('workflow_dispatch pr_number did not resolve to a PR');
+                return;
+              }
+              core.info('No open PR found — skip');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.draft) {
+              core.info(`PR #${prNumber} is draft — skip`);
+              return;
+            }
+            if (pr.merged || pr.state !== 'open') {
+              core.info(`PR #${prNumber} not open — skip`);
+              return;
+            }
+            if (pr.base.ref !== 'main') {
+              core.info(`PR #${prNumber} base is ${pr.base.ref}, not main — skip`);
+              return;
+            }
+            if (pr.labels.some((l) => l.name === 'no-auto-merge')) {
+              core.info(`PR #${prNumber} has no-auto-merge — skip`);
+              return;
+            }
+            if (pr.labels.some((l) => l.name === 'skip-codex-gate')) {
+              // Belt-and-suspenders: Gate must not report success for this label,
+              // but refuse here too so a stale successful Gate cannot auto-merge.
+              core.info(`PR #${prNumber} has skip-codex-gate — skip auto-merge`);
+              return;
+            }
+
+            const sha = pr.head.sha;
+
+            // listForRef returns { total_count, check_runs }. Iterate pages
+            // explicitly so we never treat the wrapper object as an array.
+            const checkRuns = [];
+            for await (const response of github.paginate.iterator(github.rest.checks.listForRef, {
+              owner,
+              repo,
+              ref: sha,
+              per_page: 100,
+            })) {
+              checkRuns.push(...(response.data.check_runs || []));
+            }
+
+            const latestChecks = latestPerName(checkRuns);
+            const relevantChecks = latestChecks.filter((c) => !isIgnoredCheck(c.name));
+
+            const failedChecks = relevantChecks.filter(
+              (c) => c.status === 'completed' && !OK_CONCLUSIONS.has(c.conclusion)
+            );
+            const pendingChecks = relevantChecks.filter((c) => c.status !== 'completed');
+
+            if (failedChecks.length > 0) {
+              core.info(`Checks failed: ${failedChecks.map((c) => c.name).join(', ')} — skip`);
+              return;
+            }
+            if (pendingChecks.length > 0) {
+              core.info(`Checks pending: ${pendingChecks.map((c) => c.name).join(', ')} — skip`);
+              return;
+            }
+
+            // Fail closed: never auto-merge without a successful Build & Test check run.
+            // Do not treat legacy combined commit status as a substitute for CI.
+            const hasCiCheck = relevantChecks.some(
+              (c) => c.conclusion === 'success' && isCiCheck(c.name)
+            );
+            if (!hasCiCheck) {
+              core.info('No successful Build & Test (or CI) check run on head SHA — skip');
+              return;
+            }
+
+            // Required named gates: missing is fail-closed (not optional).
+            function requireNamedCheck(checks, label) {
+              if (checks.length === 0) {
+                core.info(`${label} missing on head SHA — skip`);
+                return false;
+              }
+              const pending = checks.filter((c) => c.status !== 'completed');
+              const bad = checks.filter(
+                (c) => c.status === 'completed' && c.conclusion !== 'success'
+              );
+              if (pending.length > 0) {
+                core.info(`${label} pending: ${pending.map((c) => c.status).join(', ')} — skip`);
+                return false;
+              }
+              if (bad.length > 0) {
+                core.info(`${label} not successful: ${bad.map((c) => c.conclusion).join(', ')} — skip`);
+                return false;
+              }
+              return true;
+            }
+
+            const copilotChecks = relevantChecks.filter((c) => COPILOT_CHECK_RE.test(c.name || ''));
+            if (!requireNamedCheck(copilotChecks, 'copilot-pull-request-reviewer')) return;
+
+            // Required-check name is the job name, not a workflow display title.
+            const codexGates = relevantChecks.filter((c) => (c.name || '') === CODEX_GATE_NAME);
+            if (!requireNamedCheck(codexGates, CODEX_GATE_NAME)) return;
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            const copilotReviews = reviews.filter(
+              (r) => COPILOT_LOGINS.has(r.user?.login || '') && r.state !== 'DISMISSED' && r.state !== 'PENDING'
+            );
+            if (copilotReviews.length === 0) {
+              core.info(`PR #${prNumber}: no Copilot review yet — skip (will retry when review lands)`);
+              return;
+            }
+
+            const withCommit = copilotReviews.filter((r) => r.commit_id);
+            const forHead = withCommit.length
+              ? withCommit.filter((r) => r.commit_id === sha)
+              : copilotReviews;
+            if (forHead.length === 0) {
+              core.info(`PR #${prNumber}: no Copilot review for head ${sha.slice(0, 7)} — skip`);
+              return;
+            }
+
+            const latest = forHead.sort(
+              (a, b) => new Date(b.submitted_at) - new Date(a.submitted_at)
+            )[0];
+
+            const copilotGate = copilotReviewAllowsMerge(latest);
+            if (!copilotGate.ok) {
+              core.info(
+                `PR #${prNumber}: latest Copilot review for head is ${latest.state} (${copilotGate.reason}) — skip`
+              );
+              return;
+            }
+
+            let unresolved;
+            try {
+              unresolved = await countUnresolvedThreads(prNumber);
+            } catch (err) {
+              core.warning(`GraphQL reviewThreads failed (${err.message}); REST fail-closed fallback`);
+              const commentCount = await countReviewComments(prNumber);
+              if (commentCount > 0) {
+                core.info(
+                  `PR #${prNumber}: cannot confirm thread resolution and ${commentCount} review comment(s) exist — skip`
+                );
+                return;
+              }
+              unresolved = 0;
+            }
+
+            if (unresolved > 0) {
+              core.info(`PR #${prNumber}: ${unresolved} unresolved review thread(s) — skip`);
+              return;
+            }
+
+            core.info(
+              `Merging PR #${prNumber} at ${sha.slice(0, 7)} (CI green + Copilot ${copilotGate.reason} + threads resolved)`
+            );
+            await github.rest.pulls.merge({
+              owner,
+              repo,
+              pull_number: prNumber,
+              sha,
+              merge_method: 'squash',
+              commit_title: `${pr.title} (#${prNumber})`,
+              commit_message:
+                'Auto-merged: CI green + Copilot review on head SHA + all review threads resolved.',
+            });
+            core.info(`Squash-merged PR #${prNumber}`);
