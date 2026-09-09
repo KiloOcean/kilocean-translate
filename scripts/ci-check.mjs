@@ -173,16 +173,36 @@ function checkParseTranslationPayload() {
     }
   };
 
-  // expectedCount 1 + N>1 all-string translations → join with \n\n
+  // expectedCount 1 + N>1 all-string + multi-paragraph source → join with \n\n
   assertEqual(
-    parseTranslationPayload(JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }), 1),
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }),
+      1,
+      "第一段\n\n第二段\n\n第三段"
+    ),
     ["甲段\n\n乙段\n\n丙段"],
-    "parseTranslationPayload: join N>1 when expectedCount===1"
+    "parseTranslationPayload: join N>1 when expectedCount===1 and source has \\n\\n"
+  );
+
+  // expectedCount 1 + N>1 all-string but single-paragraph source → throws
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段"] }),
+      1,
+      "单段原文"
+    ),
+    "parseTranslationPayload: must not join without multi-paragraph source"
+  );
+
+  // expectedCount 1 + N>1 all-string with omitted sourceText → throws
+  assertThrows(
+    () => parseTranslationPayload(JSON.stringify({ translations: ["甲段", "乙段"] }), 1),
+    "parseTranslationPayload: must not join when sourceText omitted"
   );
 
   // expectedCount 1 + exact 1 string → unchanged
   assertEqual(
-    parseTranslationPayload(JSON.stringify({ translations: ["单段译文"] }), 1),
+    parseTranslationPayload(JSON.stringify({ translations: ["单段译文"] }), 1, "单段原文"),
     ["单段译文"],
     "parseTranslationPayload: single string passthrough"
   );
@@ -202,7 +222,11 @@ function checkParseTranslationPayload() {
 
   // expectedCount 1 + N>1 with a non-string item → throws
   assertThrows(
-    () => parseTranslationPayload(JSON.stringify({ translations: ["甲", 2, "丙"] }), 1),
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲", 2, "丙"] }),
+      1,
+      "甲\n\n乙\n\n丙"
+    ),
     "parseTranslationPayload: non-string items must not join"
   );
 }

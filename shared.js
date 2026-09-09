@@ -98,7 +98,7 @@
     return chunks;
   }
 
-  function parseTranslationPayload(content, expectedCount) {
+  function parseTranslationPayload(content, expectedCount, sourceText) {
     if (typeof content !== "string" || content.trim() === "") {
       throw new Error("DeepSeek 返回了空内容");
     }
@@ -122,10 +122,14 @@
 
     // A single multi-paragraph segment sometimes comes back as one entry per
     // paragraph; rejoin with the original \n\n separator so counts match again.
+    // Only recover when the source itself is multi-paragraph so selection /
+    // TEST_CONNECTION malformed extras still fail closed.
     if (
       expectedCount === 1 &&
       translations.length > 1 &&
-      translations.every((item) => typeof item === "string")
+      translations.every((item) => typeof item === "string") &&
+      typeof sourceText === "string" &&
+      sourceText.includes("\n\n")
     ) {
       return [translations.join("\n\n")];
     }

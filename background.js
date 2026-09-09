@@ -308,7 +308,11 @@ async function translateBatch(texts, targetLanguage, requestedModel) {
 
   const content = data?.choices?.[0]?.message?.content;
   try {
-    return DeepSeekTranslatorUtils.parseTranslationPayload(content, texts.length);
+    return DeepSeekTranslatorUtils.parseTranslationPayload(
+      content,
+      texts.length,
+      texts.length === 1 ? texts[0] : undefined
+    );
   } catch (error) {
     const parseError = createError(error.message, "INVALID_API_RESPONSE");
     // Also allow bisect when a single multi-paragraph segment got a bad
