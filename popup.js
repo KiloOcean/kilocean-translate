@@ -75,6 +75,39 @@ elements.toggleKey.addEventListener("click", () => {
   elements.toggleKey.setAttribute("aria-label", revealing ? "隐藏 API Key" : "显示 API Key");
 });
 
+// Persist settings as the user edits so selection translate reads fresh storage
+// without requiring Test Connection / full-page Translate first.
+let persistTimer = null;
+function schedulePersistSettings() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+  }
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    void saveSettings();
+  }, 200);
+}
+
+function persistSettingsNow() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  void saveSettings();
+}
+
+elements.apiKey.addEventListener("input", schedulePersistSettings);
+elements.apiKey.addEventListener("change", persistSettingsNow);
+elements.apiKey.addEventListener("blur", persistSettingsNow);
+elements.targetLanguage.addEventListener("change", persistSettingsNow);
+elements.model.addEventListener("change", persistSettingsNow);
+window.addEventListener("pagehide", persistSettingsNow);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    persistSettingsNow();
+  }
+});
+
 elements.modeButtons.forEach((button) => {
   button.addEventListener("click", async () => {
     const mode = Utils.normalizeDisplayMode(button.dataset.mode);

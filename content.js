@@ -32,8 +32,6 @@
   let styleHost = null;
   let applyingDom = false;
   let applyingDomGeneration = 0;
-  /** Ignore MutationObserver callbacks until this timestamp (ms since epoch). */
-  let suppressMutationsUntil = 0;
   /** @type {{ targetLanguage: string, model: string } | null} */
   let activeRunSettings = null;
   /** @type {{ targetLanguage?: string, model?: string } | null} */
@@ -270,23 +268,6 @@
     if (gen === applyingDomGeneration) {
       applyingDom = false;
     }
-    // Short suppress window covers async MutationObserver delivery after wrap.
-    suppressMutationsUntil = Date.now() + 120;
-  }
-
-  function shouldSuppressObserver() {
-    if (applyingDom) {
-      return true;
-    }
-    if (Date.now() < suppressMutationsUntil) {
-      try {
-        mutationObserver?.takeRecords();
-      } catch {
-        // ignore
-      }
-      return true;
-    }
-    return false;
   }
 
   function notifyPopupStatus() {
@@ -345,18 +326,23 @@
         wraps.push(wrap);
       }
       if (block) {
-        for (const extra of block.querySelectorAll(":scope > .kilocean-original-wrap")) {
+        for (const extra of block.querySelectorAll(".kilocean-original-wrap")) {
+          // Skip wraps owned by a nested translated block.
+          if (extra.closest("[data-kilocean-block]") !== block) {
+            continue;
+          }
           if (!wraps.includes(extra)) {
             wraps.push(extra);
           }
         }
       }
       for (const owned of wraps) {
-        if (owned.parentNode !== block) {
+        const parent = owned.parentNode;
+        if (!parent) {
           continue;
         }
         while (owned.firstChild) {
-          block.insertBefore(owned.firstChild, owned);
+          parent.insertBefore(owned.firstChild, owned);
         }
         owned.remove();
       }
@@ -745,59 +731,37 @@
     }
   }
 
-  function wrapOwnedContentForCompanion(block, nestedBlocks, wrapTag) {
-    const nestedSet = new Set(nestedBlocks || []);
-    const children = [...block.childNodes];
-    let pending = [];
+  function wrapTextNodesForToggle(block, nestedBlocks, wrapTag) {
+    // Wrap text nodes only — never reparent element children — so selectors
+    // like `p > a` and interactive descendants stay intact.
+    const nested = (nestedBlocks || []).filter(Boolean);
+    const textNodes = collectRawTextNodes(block).filter((node) => (
+      !nested.some((other) => other !== block && other.contains(node))
+    ));
     let firstWrap = null;
 
-    const flush = () => {
-      if (pending.length === 0) {
-        return;
+    for (const textNode of textNodes) {
+      if (!textNode?.isConnected || textNode.parentElement == null) {
+        continue;
       }
-      const hasSubstance = pending.some((node) => {
-        if (node.nodeType === Node.TEXT_NODE) {
-          return /\S/u.test(node.data || "");
+      if (textNode.parentElement.classList?.contains("kilocean-original-wrap")) {
+        if (!firstWrap) {
+          firstWrap = textNode.parentElement;
         }
-        return node.nodeType === Node.ELEMENT_NODE;
-      });
-      if (!hasSubstance) {
-        pending = [];
-        return;
+        continue;
       }
-      const wrap = document.createElement(wrapTag);
+      if (!/\S/u.test(textNode.data || "")) {
+        continue;
+      }
+      const wrap = document.createElement(wrapTag === "div" ? "span" : wrapTag);
       wrap.className = "kilocean-original-wrap";
       // Not UI-marked: SPA edits to owned original text must still refresh.
-      block.insertBefore(wrap, pending[0]);
-      for (const node of pending) {
-        wrap.appendChild(node);
-      }
+      textNode.parentNode.insertBefore(wrap, textNode);
+      wrap.appendChild(textNode);
       if (!firstWrap) {
         firstWrap = wrap;
       }
-      pending = [];
-    };
-
-    for (const child of children) {
-      if (child.nodeType === Node.ELEMENT_NODE) {
-        if (
-          child.classList?.contains("kilocean-translation") ||
-          child.classList?.contains("kilocean-translation--flow") ||
-          child.classList?.contains("kilocean-original-wrap")
-        ) {
-          flush();
-          continue;
-        }
-        const isNestedRoot = nestedSet.has(child);
-        const containsNested = [...nestedSet].some((nested) => child.contains(nested));
-        if (isNestedRoot || containsNested) {
-          flush();
-          continue;
-        }
-      }
-      pending.push(child);
     }
-    flush();
     return firstWrap;
   }
 
@@ -833,9 +797,9 @@
         block.setAttribute("data-kilocean-layout", "after");
         layout = "after";
       } else if (placement === "companion") {
-        // Nested ancestor with own text: wrap owned text so translation-only can hide
-        // it, without hiding nested block subtrees (unlike flex/grid flow).
-        wrap = wrapOwnedContentForCompanion(block, options.nested || [], wrapTag);
+        // Nested ancestor with own text: wrap owned text nodes so translation-only
+        // can hide them without reparenting nested block subtrees or interactive els.
+        wrap = wrapTextNodesForToggle(block, options.nested || [], wrapTag);
         companion.classList.add("kilocean-translation--flow");
         block.appendChild(companion);
         block.setAttribute("data-kilocean-layout", "companion");
@@ -847,14 +811,8 @@
         block.setAttribute("data-kilocean-layout", "flow");
         layout = "flow";
       } else {
-        wrap = document.createElement(wrapTag);
-        wrap.className = "kilocean-original-wrap";
-        // Intentionally NOT marked as translator UI: SPA mutations to original content
-        // must still refresh this block (companion stays UI-marked).
-        while (block.firstChild) {
-          wrap.appendChild(block.firstChild);
-        }
-        block.appendChild(wrap);
+        // Wrap text nodes only — keep element children in place (p > a, buttons…).
+        wrap = wrapTextNodesForToggle(block, [], wrapTag);
         block.appendChild(companion);
         block.setAttribute("data-kilocean-layout", "wrap");
         layout = "wrap";
@@ -945,7 +903,7 @@
         line-height: inherit;
         white-space: pre-wrap;
       }
-      html[data-kilocean-display="bilingual"] [data-kilocean-block] > .kilocean-original-wrap {
+      html[data-kilocean-display="bilingual"] [data-kilocean-block] .kilocean-original-wrap {
         display: contents;
       }
       html[data-kilocean-display="bilingual"] [data-kilocean-block] > .kilocean-translation {
@@ -955,7 +913,7 @@
       html[data-kilocean-display="bilingual"] .kilocean-translation--after {
         opacity: 0.96;
       }
-      html[data-kilocean-display="translation-only"] [data-kilocean-block] > .kilocean-original-wrap {
+      html[data-kilocean-display="translation-only"] [data-kilocean-block] .kilocean-original-wrap {
         display: none !important;
       }
       html[data-kilocean-display="translation-only"] [data-kilocean-block][data-kilocean-layout="flow"] > :not(.kilocean-translation) {
@@ -976,7 +934,7 @@
         padding-top: 0;
         border-top: 0;
       }
-      html[data-kilocean-display="original"] [data-kilocean-block] > .kilocean-original-wrap {
+      html[data-kilocean-display="original"] [data-kilocean-block] .kilocean-original-wrap {
         display: contents;
       }
       html[data-kilocean-display="original"] [data-kilocean-block] > .kilocean-translation,
@@ -991,7 +949,31 @@
     return Boolean(el?.closest?.(".kilocean-original-wrap"));
   }
 
+  function isExtensionOwnedNode(node) {
+    // Only the extension chrome nodes themselves — not page content living inside
+    // .kilocean-original-wrap (SPA edits there must still refresh the block).
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) {
+      return false;
+    }
+    return Boolean(
+      node.classList?.contains("kilocean-original-wrap") ||
+      node.classList?.contains("kilocean-translation") ||
+      node.classList?.contains("kilocean-translation--after") ||
+      node.classList?.contains("kilocean-translation--flow") ||
+      node.hasAttribute?.("data-deepseek-translator-ui")
+    );
+  }
+
+  function isReparentIntoOriginalWrap(node) {
+    // After we wrap a text node, MutationObserver removedNodes still point at the
+    // text whose new parent is our wrap — treat that as extension-owned reparent.
+    return Boolean(node?.parentElement?.classList?.contains("kilocean-original-wrap"));
+  }
+
   function isIgnoredTranslatorMutation(node) {
+    if (isExtensionOwnedNode(node)) {
+      return true;
+    }
     const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
     if (!el) {
       return true;
@@ -1027,7 +1009,13 @@
   function startObserving() {
     stopObserving();
     mutationObserver = new MutationObserver((records) => {
-      if (!state.active || shouldSuppressObserver()) {
+      if (!state.active) {
+        return;
+      }
+      // Only skip while we are mid-write. Do not blank whole batches for a
+      // post-write suppress window — filter extension-owned records below so
+      // page-owned updates still reach pendingRoots / pendingRefreshBlocks.
+      if (applyingDom) {
         return;
       }
 
@@ -1037,7 +1025,7 @@
             pruneDetachedBlockRecords();
             // Removal-only SPA updates never appear in addedNodes — refresh via target.
             const removedOnlyUi = [...record.removedNodes].every((node) =>
-              isIgnoredTranslatorMutation(node)
+              isIgnoredTranslatorMutation(node) || isReparentIntoOriginalWrap(node)
             );
             if (!removedOnlyUi) {
               const refreshHost = findRefreshHostForMutation(record.target);
@@ -1047,12 +1035,12 @@
             }
           }
           record.addedNodes.forEach((node) => {
+            if (isIgnoredTranslatorMutation(node)) {
+              return;
+            }
             const refreshHost = findRefreshHostForMutation(node);
             if (refreshHost) {
               pendingRefreshBlocks.add(refreshHost);
-              return;
-            }
-            if (isIgnoredTranslatorMutation(node)) {
               return;
             }
             pendingRoots.add(node);
