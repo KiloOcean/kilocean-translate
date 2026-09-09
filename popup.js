@@ -22,7 +22,11 @@ const elements = {
   statusCard: document.querySelector(".status-card"),
   statusTitle: document.getElementById("status-title"),
   statusDetail: document.getElementById("status-detail"),
-  modeButtons: [...document.querySelectorAll(".mode-button")]
+  modeButtons: [...document.querySelectorAll(".mode-button")],
+  selectionConfirmPanel: document.getElementById("selection-confirm-panel"),
+  selectionConfirmText: document.getElementById("selection-confirm-text"),
+  selectionConfirmBtn: document.getElementById("selection-confirm-btn"),
+  selectionConfirmDismiss: document.getElementById("selection-confirm-dismiss")
 };
 
 let currentTab = null;
@@ -30,6 +34,8 @@ let statusTimer = null;
 let currentDisplayMode = Utils.DISPLAY_MODES.bilingual;
 let initialized = false;
 let displayModeOp = 0;
+/** @type {{ text: string, rangeId: string } | null} */
+let pendingSelection = null;
 
 initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
 
@@ -68,6 +74,15 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   if (message.status.active && message.status.phase === "translating") {
     startStatusPolling();
   }
+});
+
+
+elements.selectionConfirmBtn.addEventListener("click", () => {
+  void confirmPendingSelection();
+});
+
+elements.selectionConfirmDismiss.addEventListener("click", () => {
+  void dismissPendingSelection();
 });
 
 elements.toggleKey.addEventListener("click", () => {
@@ -297,6 +312,8 @@ async function initialize() {
   } catch {
     // Restricted pages cannot be injected.
   }
+
+  await refreshPendingSelection();
 }
 
 async function saveSettings() {
@@ -433,6 +450,108 @@ function setStatus(title, detail, tone) {
   elements.statusTitle.textContent = title;
   elements.statusDetail.textContent = detail;
   elements.statusCard.dataset.tone = tone;
+}
+
+
+async function refreshPendingSelection() {
+  pendingSelection = null;
+  hideSelectionConfirmPanel();
+  if (!currentTab?.id) {
+    return;
+  }
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "GET_PENDING_SELECTION",
+      tabId: currentTab.id
+    });
+    if (response?.ok && response.pending?.text && response.pending?.rangeId) {
+      pendingSelection = {
+        text: response.pending.text,
+        rangeId: response.pending.rangeId
+      };
+      showSelectionConfirmPanel(pendingSelection.text);
+    }
+  } catch {
+    // Worker may be waking; fail closed with no confirm UI.
+  }
+}
+
+function showSelectionConfirmPanel(text) {
+  elements.selectionConfirmText.textContent = text;
+  elements.selectionConfirmPanel.hidden = false;
+}
+
+function hideSelectionConfirmPanel() {
+  elements.selectionConfirmPanel.hidden = true;
+  elements.selectionConfirmText.textContent = "";
+}
+
+async function confirmPendingSelection() {
+  if (!pendingSelection || !currentTab?.id) {
+    hideSelectionConfirmPanel();
+    return;
+  }
+  if (!validateApiKey()) {
+    return;
+  }
+
+  elements.selectionConfirmBtn.disabled = true;
+  setStatus("正在翻译划词", "扩展内确认后发送选中文本", "loading");
+
+  try {
+    await saveSettings();
+    const confirm = await chrome.runtime.sendMessage({
+      type: "CONFIRM_PENDING_SELECTION",
+      tabId: currentTab.id
+    });
+    if (!confirm?.ok || !confirm.pending?.text || !confirm.pending?.rangeId) {
+      throw new Error(confirm?.error === "NO_PENDING_SELECTION"
+        ? "划词确认已过期，请重新选中文本"
+        : (confirm?.error || "没有待确认的划词"));
+    }
+
+    const { text, rangeId } = confirm.pending;
+    await ensureContentScript(currentTab.id);
+    const response = await chrome.tabs.sendMessage(currentTab.id, {
+      type: "CONFIRM_SELECTION_TRANSLATE",
+      text,
+      rangeId
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || "划词翻译失败");
+    }
+
+    pendingSelection = null;
+    hideSelectionConfirmPanel();
+    setStatus("划词翻译已发送", "译文将显示在页面选区旁的预览面板", "success");
+  } catch (error) {
+    pendingSelection = null;
+    hideSelectionConfirmPanel();
+    setStatus("划词翻译失败", toFriendlyPageError(error), "error");
+  } finally {
+    elements.selectionConfirmBtn.disabled = false;
+  }
+}
+
+async function dismissPendingSelection() {
+  pendingSelection = null;
+  hideSelectionConfirmPanel();
+  if (!currentTab?.id) {
+    return;
+  }
+  try {
+    await chrome.runtime.sendMessage({
+      type: "CLEAR_PENDING_SELECTION",
+      tabId: currentTab.id
+    });
+  } catch {
+    // Ignore.
+  }
+  try {
+    await chrome.tabs.sendMessage(currentTab.id, { type: "DISMISS_SELECTION" });
+  } catch {
+    // Page may not allow messaging.
+  }
 }
 
 function toFriendlyPageError(error) {

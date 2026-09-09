@@ -67,6 +67,21 @@
         <p class="mode-help">双语对照 / 仅译文 / 原文可随时切换；“清除译文”会彻底还原并停止跟译。划词选中即可弹出译文。</p>
       </section>
 
+      <section id="selection-confirm-panel" class="panel selection-confirm-panel" hidden aria-labelledby="selection-confirm-title">
+        <div class="section-heading">
+          <h2 id="selection-confirm-title">划词待确认</h2>
+          <span class="hint">扩展内确认，不走网页按钮</span>
+        </div>
+        <p id="selection-confirm-text" class="selection-confirm-text"></p>
+        <div class="selection-confirm-actions">
+          <button id="selection-confirm-btn" class="primary-button" type="button">
+            <span>翻译选中文本</span>
+            <span aria-hidden="true">→</span>
+          </button>
+          <button id="selection-confirm-dismiss" class="secondary-button" type="button">取消</button>
+        </div>
+      </section>
+
       <section class="status-card" aria-live="polite">
         <span id="status-dot" class="status-dot"></span>
         <div>

@@ -155,6 +155,36 @@
       return false;
     }
 
+    if (message?.type === "CONFIRM_SELECTION_TRANSLATE") {
+      // Billable consent arrives only from the extension popup (page-inaccessible UI).
+      const text = String(message.text || "").trim();
+      const rangeId = String(message.rangeId || "");
+      const gesture = pendingSelectionGesture;
+      if (
+        !gesture ||
+        !text ||
+        !rangeId ||
+        gesture.text !== text ||
+        gesture.rangeId !== rangeId
+      ) {
+        lastSelectionKey = "";
+        hideSelectionPanel();
+        sendResponse({ ok: false, error: "没有待确认的划词翻译" });
+        return false;
+      }
+      pendingSelectionGesture = null;
+      sendSelectionTranslation(gesture)
+        .then(() => sendResponse({ ok: true }))
+        .catch((error) => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
+
+    if (message?.type === "DISMISS_SELECTION") {
+      hideSelectionPanel();
+      sendResponse({ ok: true });
+      return false;
+    }
+
     if (message?.type === "EXPORT_HTML") {
       try {
         const filename = downloadHtmlSnapshot();
@@ -251,6 +281,16 @@
     workQueue = initialJob.catch(() => {});
     await initialJob;
     if (runId !== generation) {
+      return;
+    }
+
+    // A mutation may have scheduled the 450 ms dynamic debounce during the
+    // initial batches. Keep the busy phase until that pending work drains so
+    // export cannot accept an incomplete snapshot.
+    if (hasPendingDynamicWork()) {
+      state.phase = "translating";
+      finishRunSettings();
+      notifyPopupStatus();
       return;
     }
 
@@ -1842,7 +1882,7 @@
     // Capture on window as well as document, as early as possible: a page's
     // window-capture listener registered before ours would otherwise always
     // see (and could replace) the Selection before any listener we own runs.
-    // Best-effort only — the real billable gate is the panel's confirm click.
+    // Best-effort only — the real billable gate is the extension popup confirm.
     for (const target of [window, document]) {
       target.addEventListener("mouseup", onSelectionMaybeTranslate, true);
       target.addEventListener("keyup", onSelectionKeyUp, true);
@@ -1901,7 +1941,7 @@
     // this snapshot — never a post-delay read — may become the billable text.
     // A page window-capture listener registered before any of ours can still
     // poison the Selection before we see it, so the snapshot alone never bills:
-    // the user must click the extension panel's 「翻译」 button to send.
+    // the user must confirm in the extension popup (page-inaccessible UI).
     const gesture = captureSelectionGesture();
 
     // Invalidate in-flight storage awaits when the live selection actually
@@ -1934,7 +1974,7 @@
    * Capture the current Selection synchronously at a trusted gesture.
    * A page window-capture listener registered before ours may already have
    * replaced the Selection — this snapshot is only a billing candidate, never
-   * billed until the panel's 「翻译」 confirm click.
+   * billed until the extension popup confirms.
    * @returns {{ text: string, rangeId: string } | null} null unless the user
    *   genuinely holds a non-collapsed selection of billable length.
    */
@@ -1997,8 +2037,9 @@
   }
 
   /**
-   * Open the panel in its confirm state for a gesture snapshot. Never sends:
-   * TRANSLATE_BATCH waits for the extension-owned 「翻译」 click.
+   * Open the page panel as a non-billable preview for a gesture snapshot.
+   * TRANSLATE_BATCH / SELECTION_TRANSLATE_BATCH waits for the extension popup
+   * confirm (page-inaccessible UI) — never a control in page-controlled DOM.
    */
   function showSelectionConfirm(event, gesture) {
     // The gesture snapshot taken synchronously at the trusted event is the
@@ -2046,17 +2087,33 @@
       return;
     }
 
-    // Confirm-first: showing the preview never bills. The stored snapshot is
-    // exactly what the 「翻译」 click may later send.
+    // Preview-only: showing this page panel never bills. Consent happens in the
+    // extension popup (page-inaccessible). The stored snapshot is exactly what
+    // CONFIRM_SELECTION_TRANSLATE may later send.
     pendingSelectionGesture = gesture;
     const panel = ensureSelectionPanel();
     positionSelectionPanel(panel, rect);
-    setSelectionPanelState(panel, "confirm", gesture.text);
+    setSelectionPanelState(
+      panel,
+      "confirm",
+      "打开扩展弹窗确认翻译",
+      gesture.text
+    );
+    try {
+      void chrome.runtime.sendMessage({
+        type: "SET_PENDING_SELECTION",
+        text: gesture.text,
+        rangeId: gesture.rangeId
+      });
+    } catch {
+      // Service worker may be waking; popup can still fail closed without pending.
+    }
   }
 
   /**
-   * Billable selection path — runs only from the panel's 「翻译」 confirm
-   * click, with the stored gesture snapshot (never a fresh selection read).
+   * Billable selection path — runs only after extension-popup confirm
+   * (CONFIRM_SELECTION_TRANSLATE), with the stored gesture snapshot
+   * (never a fresh selection read). Never triggered by page-DOM controls.
    */
   async function sendSelectionTranslation(gesture) {
     // The gesture snapshot the panel previewed is the only billable payload.
@@ -2075,8 +2132,8 @@
     }
 
     // Require the live Selection to still be exactly what the panel previewed:
-    // text swapped in by page script since the confirm click must never reach
-    // TRANSLATE_BATCH even though the click itself is trusted.
+    // text swapped in by page script since popup confirm must never reach
+    // SELECTION_TRANSLATE_BATCH even though the popup click itself is trusted.
     if (
       selection.toString().replace(/\s+/gu, " ").trim() !== gesture.text ||
       getSelectionRangeIdentity(selection) !== gesture.rangeId
@@ -2130,14 +2187,20 @@
       // Compare against the gesture snapshot (the payload that would be sent);
       // its 2..5000 bounds are already guaranteed by captureSelectionGesture.
       if (liveText !== gesture.text || liveRangeId !== gesture.rangeId) {
+        lastSelectionKey = "";
+        hideSelectionPanel();
         return;
       }
       try {
         rect = liveSel.getRangeAt(0).getBoundingClientRect();
       } catch {
+        lastSelectionKey = "";
+        hideSelectionPanel();
         return;
       }
       if (!rect || (rect.width === 0 && rect.height === 0)) {
+        lastSelectionKey = "";
+        hideSelectionPanel();
         return;
       }
 
@@ -2158,7 +2221,7 @@
       // after collapse) still reopen/reposition the panel.
       const selectionKey = `${targetLanguage}\0${model}\0${gesture.text}\0${liveRangeId}`;
       if (selectionKey === lastSelectionKey) {
-        // Already billed this exact selection — the confirm click must not
+        // Already billed this exact selection — popup confirm must not
         // dead-end silently, but it must not re-bill either.
         const panel = ensureSelectionPanel();
         setSelectionPanelState(panel, "success", "该选中文本已翻译");
@@ -2181,18 +2244,10 @@
         return;
       }
 
-      // Selection-path rate limit: show a brief non-billing notice instead of
-      // sending, and clear the claimed key so a retry works once the window
-      // frees up. Full-page TRANSLATE_BATCH runs are never limited here.
-      if (isSelectionSendRateLimited()) {
-        lastSelectionKey = "";
-        setSelectionPanelState(panel, "error", "操作过于频繁，请稍后再试");
-        return;
-      }
-      selectionSendTimes.push(Date.now());
-
+      // Worker-side SELECTION_TRANSLATE_BATCH enforces the 1s / 8-per-10s quota
+      // (page DOM cannot bypass it). Full-page TRANSLATE_BATCH is never limited.
       const response = await chrome.runtime.sendMessage({
-        type: "TRANSLATE_BATCH",
+        type: "SELECTION_TRANSLATE_BATCH",
         texts: [gesture.text],
         targetLanguage,
         model
@@ -2315,23 +2370,13 @@
           overflow: auto;
         }
         .source[hidden] { display: none; }
-        .actions {
-          display: flex;
-          justify-content: flex-end;
-          margin-top: 10px;
+        .hint {
+          margin-top: 8px;
+          color: #91a4ff;
+          font-size: 11px;
+          line-height: 1.4;
         }
-        .actions[hidden] { display: none; }
-        .confirm {
-          border: 0;
-          border-radius: 8px;
-          background: #4f6bff;
-          color: #f6f8ff;
-          cursor: pointer;
-          font: inherit;
-          font-size: 12px;
-          padding: 6px 16px;
-        }
-        .confirm:hover { background: #6c8cff; }
+        .hint[hidden] { display: none; }
       </style>
       <div class="panel" role="dialog" aria-label="选中翻译">
         <div class="top">
@@ -2340,9 +2385,7 @@
         </div>
         <div class="body loading">正在翻译选中文本…</div>
         <div class="source" hidden></div>
-        <div class="actions" hidden>
-          <button class="confirm" type="button">翻译</button>
-        </div>
+        <div class="hint" hidden>打开扩展弹窗确认翻译</div>
       </div>
     `;
 
@@ -2352,35 +2395,8 @@
       hideSelectionPanel();
     });
 
-    const confirmButton = shadow.querySelector(".confirm");
-    // The default mousedown action would collapse the document selection
-    // before the click lands — prevent it so the billed gesture survives.
-    confirmButton.addEventListener("mousedown", (event) => {
-      event.preventDefault();
-    });
-    confirmButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      // Only a trusted click on this extension-owned button may bill.
-      if (event.isTrusted === false) {
-        return;
-      }
-      // Drop the show scheduled by this button's own mouseup so the confirm
-      // state cannot resurrect over the loading state.
-      if (selectionTimer) {
-        clearTimeout(selectionTimer);
-        selectionTimer = null;
-      }
-      // Bill the stored snapshot that the panel previewed — never a fresh read.
-      const gesture = pendingSelectionGesture;
-      if (!gesture) {
-        // Consumed by an earlier click (send in flight) — nothing new to bill;
-        // dismissing here would invalidate that in-flight send.
-        return;
-      }
-      pendingSelectionGesture = null;
-      void sendSelectionTranslation(gesture);
-    });
+    // No billable controls in page-controlled DOM (open shadow on attacker-owned
+    // pages can be overlaid). Consent lives in the extension popup only.
 
     return host;
   }
@@ -2405,17 +2421,30 @@
   function setSelectionPanelState(host, tone, message, sourceText) {
     const body = host.shadowRoot.querySelector(".body");
     const source = host.shadowRoot.querySelector(".source");
-    const actions = host.shadowRoot.querySelector(".actions");
+    const hint = host.shadowRoot.querySelector(".hint");
     body.className = `body ${tone}`;
     body.textContent = message;
-    // Only the confirm state offers the billable 「翻译」 button.
-    actions.hidden = tone !== "confirm";
-    if (tone === "success" && sourceText) {
+    // Confirm/preview state: show source text + off-page consent hint.
+    // Never expose a billable control in this page-controlled panel.
+    if (tone === "confirm" && sourceText) {
       source.hidden = false;
       source.textContent = sourceText;
+      if (hint) {
+        hint.hidden = false;
+        hint.textContent = "打开扩展弹窗确认翻译";
+      }
+    } else if (tone === "success" && sourceText) {
+      source.hidden = false;
+      source.textContent = sourceText;
+      if (hint) {
+        hint.hidden = true;
+      }
     } else {
       source.hidden = true;
       source.textContent = "";
+      if (hint) {
+        hint.hidden = true;
+      }
     }
     host.hidden = false;
   }
@@ -2448,10 +2477,15 @@
   }
 
   function hideSelectionPanel() {
-    // Invalidate any in-flight TRANSLATE_BATCH so a late response cannot reopen the panel.
+    // Invalidate any in-flight selection send so a late response cannot reopen the panel.
     selectionGeneration += 1;
     // Dismissal (×/Escape/outside press) must never leave a confirm pending.
     pendingSelectionGesture = null;
+    try {
+      void chrome.runtime.sendMessage({ type: "CLEAR_PENDING_SELECTION" });
+    } catch {
+      // Ignore — worker may be asleep.
+    }
     // Keep lastSelectionKey so ×/Escape dismiss does not allow Shift to rebill
     // the same unchanged selection; cleared on failure / real selection change.
     if (selectionTimer) {

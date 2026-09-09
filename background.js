@@ -10,9 +10,22 @@ const DEFAULT_SETTINGS = Object.freeze({
   displayMode: "bilingual"
 });
 
+/** @type {Map<number, { text: string, rangeId: string, createdAt: number }>} */
+const pendingSelections = new Map();
+
+const SELECTION_SEND_MIN_INTERVAL_MS = 1000;
+const SELECTION_SEND_WINDOW_MS = 10000;
+const SELECTION_SEND_WINDOW_LIMIT = 8;
+/** @type {number[]} */
+let selectionSendTimes = [];
+
 chrome.runtime.onInstalled.addListener(async () => {
   const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
   await chrome.storage.local.set(stored);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  clearPendingSelection(tabId);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -21,6 +34,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "TRANSLATE_BATCH") {
+    translateBatch(message.texts, message.targetLanguage, message.model)
+      .then((translations) => sendResponse({ ok: true, translations }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message,
+        code: error.code || "TRANSLATION_FAILED",
+        canSplit: Boolean(error.canSplit)
+      }));
+    return true;
+  }
+
+  // Selection path only — worker-side consent already happened in the popup;
+  // enforce a 1s / 8-per-10s quota here so page DOM cannot bypass limits.
+  if (message?.type === "SELECTION_TRANSLATE_BATCH") {
+    if (isSelectionSendRateLimited()) {
+      sendResponse({
+        ok: false,
+        error: "操作过于频繁，请稍后再试",
+        code: "SELECTION_RATE_LIMITED",
+        canSplit: false
+      });
+      return false;
+    }
+    selectionSendTimes.push(Date.now());
     translateBatch(message.texts, message.targetLanguage, message.model)
       .then((translations) => sendResponse({ ok: true, translations }))
       .catch((error) => sendResponse({
@@ -43,8 +80,91 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "SET_PENDING_SELECTION") {
+    const tabId = sender.tab?.id;
+    const text = String(message.text || "").trim();
+    const rangeId = String(message.rangeId || "");
+    if (tabId == null || !text || !rangeId) {
+      sendResponse({ ok: false, error: "INVALID_PENDING_SELECTION" });
+      return false;
+    }
+    pendingSelections.set(tabId, { text, rangeId, createdAt: Date.now() });
+    void setSelectionBadge(tabId, true);
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message?.type === "CLEAR_PENDING_SELECTION") {
+    const tabId = sender.tab?.id ?? message.tabId;
+    if (tabId != null) {
+      clearPendingSelection(tabId);
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message?.type === "GET_PENDING_SELECTION") {
+    const tabId = message.tabId;
+    if (tabId == null) {
+      sendResponse({ ok: false, pending: null });
+      return false;
+    }
+    const pending = pendingSelections.get(tabId) || null;
+    sendResponse({ ok: true, pending });
+    return false;
+  }
+
+  if (message?.type === "CONFIRM_PENDING_SELECTION") {
+    const tabId = message.tabId;
+    if (tabId == null) {
+      sendResponse({ ok: false, error: "MISSING_TAB" });
+      return false;
+    }
+    const pending = pendingSelections.get(tabId) || null;
+    if (!pending) {
+      sendResponse({ ok: false, error: "NO_PENDING_SELECTION" });
+      return false;
+    }
+    // One-shot: clear so a second popup confirm cannot re-bill without a new gesture.
+    clearPendingSelection(tabId);
+    sendResponse({ ok: true, pending });
+    return false;
+  }
+
   return false;
 });
+
+function isSelectionSendRateLimited(now = Date.now()) {
+  while (
+    selectionSendTimes.length > 0 &&
+    now - selectionSendTimes[0] >= SELECTION_SEND_WINDOW_MS
+  ) {
+    selectionSendTimes.shift();
+  }
+  const last = selectionSendTimes[selectionSendTimes.length - 1];
+  if (last !== undefined && now - last < SELECTION_SEND_MIN_INTERVAL_MS) {
+    return true;
+  }
+  return selectionSendTimes.length >= SELECTION_SEND_WINDOW_LIMIT;
+}
+
+function clearPendingSelection(tabId) {
+  pendingSelections.delete(tabId);
+  void setSelectionBadge(tabId, false);
+}
+
+async function setSelectionBadge(tabId, active) {
+  try {
+    if (active) {
+      await chrome.action.setBadgeText({ tabId, text: "译" });
+      await chrome.action.setBadgeBackgroundColor({ tabId, color: "#4f6bff" });
+    } else {
+      await chrome.action.setBadgeText({ tabId, text: "" });
+    }
+  } catch {
+    // Tab may already be gone.
+  }
+}
 
 async function translateBatch(texts, targetLanguage, requestedModel) {
   if (!Array.isArray(texts) || texts.length === 0 || texts.length > 24) {
