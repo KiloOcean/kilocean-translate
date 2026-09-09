@@ -17,7 +17,7 @@
     "ARTICLE", "SECTION", "HEADER", "FOOTER", "ASIDE", "MAIN"
   ]);
 
-  /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, companion: HTMLElement, layout: string}>} */
+  /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, wraps: HTMLElement[], companion: HTMLElement, layout: string}>} */
   const blockRecords = new Map();
   const pendingRoots = new Set();
   const pendingRefreshBlocks = new Set();
@@ -152,6 +152,7 @@
         setTimeout(() => {
           // Live print includes fixed overlays; HTML export already strips the host.
           hideSelectionPanel();
+          hideToast();
           window.print();
         }, 80);
       } catch (error) {
@@ -176,7 +177,12 @@
       chrome.storage.local.set({ displayMode });
     }
 
-    if (state.active && state.targetLanguage === targetLanguage && state.phase === "translating") {
+    if (
+      state.active &&
+      state.targetLanguage === targetLanguage &&
+      state.model === model &&
+      state.phase === "translating"
+    ) {
       return;
     }
 
@@ -320,20 +326,14 @@
       companion?.remove();
 
       // Fully unwrap even when the host is detached (virtualized lists / SPA reuse).
-      // Companion layout may create multiple owned-text wraps — unwrap all of them.
+      // Only unwrap wraps we created — never query by class (page may reuse the name).
       const wraps = [];
       if (wrap) {
         wraps.push(wrap);
       }
-      if (block) {
-        for (const extra of block.querySelectorAll(".kilocean-original-wrap")) {
-          // Skip wraps owned by a nested translated block.
-          if (extra.closest("[data-kilocean-block]") !== block) {
-            continue;
-          }
-          if (!wraps.includes(extra)) {
-            wraps.push(extra);
-          }
+      for (const extra of record.wraps || []) {
+        if (extra && !wraps.includes(extra)) {
+          wraps.push(extra);
         }
       }
       for (const owned of wraps) {
@@ -736,46 +736,129 @@
     }
   }
 
-  async function translateBatchWithFallback(batch, runId, runSettings = getRunSettings()) {
-    try {
-      const response = await chrome.runtime.sendMessage({
-        type: "TRANSLATE_BATCH",
-        texts: batch.map((segment) => segment.text),
-        targetLanguage: runSettings.targetLanguage,
-        model: runSettings.model
-      });
+  function findSegmentSplitIndex(text) {
+    const length = text.length;
+    if (length < 2) {
+      return -1;
+    }
+    const mid = Math.ceil(length / 2);
+    const window = Math.min(240, Math.floor(length / 4));
+    for (let distance = 0; distance <= window; distance += 1) {
+      for (const index of [mid - distance, mid + distance]) {
+        if (index <= 0 || index >= length) {
+          continue;
+        }
+        if (/\s/u.test(text[index - 1]) || /\s/u.test(text[index])) {
+          return index;
+        }
+      }
+    }
+    return mid;
+  }
 
-      if (!response?.ok) {
-        const error = new Error(response?.error || "翻译请求失败");
-        error.canSplit = Boolean(response?.canSplit);
+  async function requestSegmentTranslations(texts, runId, runSettings) {
+    const response = await chrome.runtime.sendMessage({
+      type: "TRANSLATE_BATCH",
+      texts,
+      targetLanguage: runSettings.targetLanguage,
+      model: runSettings.model
+    });
+
+    if (!response?.ok) {
+      const error = new Error(response?.error || "翻译请求失败");
+      error.canSplit = Boolean(response?.canSplit);
+      throw error;
+    }
+
+    if (runId !== generation) {
+      return null;
+    }
+
+    return response.translations;
+  }
+
+  async function translateSegmentTextWithSplit(text, runId, runSettings) {
+    try {
+      const translations = await requestSegmentTranslations([text], runId, runSettings);
+      if (!translations) {
+        return null;
+      }
+      return String(translations[0] || "");
+    } catch (error) {
+      if (!error.canSplit || runId !== generation) {
         throw error;
       }
+      const splitAt = findSegmentSplitIndex(text);
+      if (splitAt < 1) {
+        throw error;
+      }
+      const left = await translateSegmentTextWithSplit(text.slice(0, splitAt), runId, runSettings);
+      if (left == null || runId !== generation) {
+        return null;
+      }
+      const right = await translateSegmentTextWithSplit(text.slice(splitAt), runId, runSettings);
+      if (right == null || runId !== generation) {
+        return null;
+      }
+      // Preserve boundary whitespace from the original slice join.
+      return `${left}${right}`;
+    }
+  }
 
-      if (runId !== generation) {
+  function applyTranslatedSegment(segment, translation) {
+    if (!segment.block.isConnected || blockRecords.has(segment.block)) {
+      return false;
+    }
+
+    const currentText = extractBlockText(segment.block, segment.nested || []);
+    if (currentText !== segment.text) {
+      return false;
+    }
+
+    const rendered = String(translation || "").trim();
+    if (!rendered) {
+      return false;
+    }
+
+    applyBlockTranslation(segment.block, segment.text, rendered, {
+      companionOnly: Boolean(segment.companionOnly),
+      nested: segment.nested || []
+    });
+    state.translated += 1;
+    return true;
+  }
+
+  async function translateBatchWithFallback(batch, runId, runSettings = getRunSettings()) {
+    // Oversized single block: split before the first request (413 may never recover otherwise).
+    if (batch.length === 1 && batch[0].text.length > 5000 && runId === generation) {
+      const segment = batch[0];
+      try {
+        const joined = await translateSegmentTextWithSplit(segment.text, runId, runSettings);
+        if (joined == null || runId !== generation) {
+          return;
+        }
+        await applyTranslatedSegment(segment, joined);
+        return;
+      } catch (error) {
+        state.failed += 1;
+        state.error = error.message;
+        return;
+      }
+    }
+
+    try {
+      const translations = await requestSegmentTranslations(
+        batch.map((segment) => segment.text),
+        runId,
+        runSettings
+      );
+
+      if (!translations) {
         return;
       }
 
-      response.translations.forEach((translation, index) => {
-        const segment = batch[index];
-        if (!segment.block.isConnected || blockRecords.has(segment.block)) {
-          return;
-        }
-
-        const currentText = extractBlockText(segment.block, segment.nested || []);
-        if (currentText !== segment.text) {
-          return;
-        }
-
-        const rendered = String(translation || "").trim();
-        if (!rendered) {
-          return;
-        }
-
-        applyBlockTranslation(segment.block, segment.text, rendered, {
-          companionOnly: Boolean(segment.companionOnly),
-          nested: segment.nested || []
-        });
-        state.translated += 1;
+      translations.forEach((translation, index) => {
+        applyTranslatedSegment(batch[index], translation);
       });
     } catch (error) {
       if (error.canSplit && batch.length > 1 && runId === generation) {
@@ -783,6 +866,23 @@
         await translateBatchWithFallback(batch.slice(0, middle), runId, runSettings);
         await translateBatchWithFallback(batch.slice(middle), runId, runSettings);
         return;
+      }
+
+      // Single oversized segment: bisect text, translate halves, apply once.
+      if (error.canSplit && batch.length === 1 && runId === generation) {
+        const segment = batch[0];
+        try {
+          const joined = await translateSegmentTextWithSplit(segment.text, runId, runSettings);
+          if (joined == null || runId !== generation) {
+            return;
+          }
+          await applyTranslatedSegment(segment, joined);
+          return;
+        } catch (splitError) {
+          state.failed += 1;
+          state.error = splitError.message;
+          return;
+        }
       }
 
       state.failed += batch.length;
@@ -798,15 +898,14 @@
       !nested.some((other) => other !== block && other.contains(node))
     ));
     let firstWrap = null;
+    const wraps = [];
 
     for (const textNode of textNodes) {
       if (!textNode?.isConnected || textNode.parentElement == null) {
         continue;
       }
       if (textNode.parentElement.classList?.contains("kilocean-original-wrap")) {
-        if (!firstWrap) {
-          firstWrap = textNode.parentElement;
-        }
+        // Already wrapped (e.g. prior pass) — do not adopt page-owned same-class nodes.
         continue;
       }
       if (!/\S/u.test(textNode.data || "")) {
@@ -817,11 +916,12 @@
       // Not UI-marked: SPA edits to owned original text must still refresh.
       textNode.parentNode.insertBefore(wrap, textNode);
       wrap.appendChild(textNode);
+      wraps.push(wrap);
       if (!firstWrap) {
         firstWrap = wrap;
       }
     }
-    return firstWrap;
+    return { firstWrap, wraps };
   }
 
   function applyBlockTranslation(block, originalText, translation, options = {}) {
@@ -837,10 +937,13 @@
       ]);
       const wrapTag = inlineHosts.has(block.tagName) ? "span" : "div";
       let placement = getTranslationPlacement(block);
-      if (options.companionOnly && placement !== "after-host") {
+      // Nested translated descendants must stay visible in translation-only mode;
+      // after-host would hide the whole nowrap flex host including those nested blocks.
+      if (options.companionOnly) {
         placement = "companion";
       }
       let wrap = null;
+      let createdWraps = [];
       let layout = "wrap";
 
       const companion = document.createElement(wrapTag);
@@ -858,7 +961,7 @@
       } else if (placement === "companion") {
         // Nested ancestor with own text: wrap owned text nodes so translation-only
         // can hide them without reparenting nested block subtrees or interactive els.
-        wrap = wrapTextNodesForToggle(block, options.nested || [], wrapTag);
+        ({ firstWrap: wrap, wraps: createdWraps } = wrapTextNodesForToggle(block, options.nested || [], wrapTag));
         companion.classList.add("kilocean-translation--flow");
         block.appendChild(companion);
         block.setAttribute("data-kilocean-layout", "companion");
@@ -871,7 +974,7 @@
         layout = "flow";
       } else {
         // Wrap text nodes only — keep element children in place (p > a, buttons…).
-        wrap = wrapTextNodesForToggle(block, [], wrapTag);
+        ({ firstWrap: wrap, wraps: createdWraps } = wrapTextNodesForToggle(block, [], wrapTag));
         block.appendChild(companion);
         block.setAttribute("data-kilocean-layout", "wrap");
         layout = "wrap";
@@ -884,6 +987,7 @@
         originalText,
         translation,
         wrap,
+        wraps: createdWraps,
         companion,
         layout
       };
@@ -1035,7 +1139,9 @@
     }
     const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
     if (!el) {
-      return true;
+      // Detached text/comment after a page-owned removal has no parentElement.
+      // Do not treat as extension UI — caller refreshes via record.target.
+      return false;
     }
     const ui = el.closest?.("[data-deepseek-translator-ui]");
     if (!ui) {
@@ -1246,6 +1352,19 @@
     return filename;
   }
 
+  function hideToast() {
+    if (toastTimer) {
+      clearTimeout(toastTimer);
+      toastTimer = null;
+    }
+    const host = document.getElementById("deepseek-translator-toast-host");
+    if (!host?.shadowRoot) {
+      return;
+    }
+    const toast = host.shadowRoot.querySelector(".toast");
+    toast?.classList.remove("visible");
+  }
+
   function showToast(message, tone, duration = 2600) {
     let host = document.getElementById("deepseek-translator-toast-host");
     if (!host) {
@@ -1419,6 +1538,7 @@
       const model = stored.model || state.model;
 
       if (!Utils.isTranslatableText(text, targetLanguage)) {
+        hideSelectionPanel();
         return;
       }
 
@@ -1588,6 +1708,10 @@
   function hideSelectionPanel() {
     // Invalidate any in-flight TRANSLATE_BATCH so a late response cannot reopen the panel.
     selectionGeneration += 1;
+    if (selectionTimer) {
+      clearTimeout(selectionTimer);
+      selectionTimer = null;
+    }
     const host = document.getElementById("kilocean-selection-host");
     if (host) {
       host.hidden = true;
