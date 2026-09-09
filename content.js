@@ -390,16 +390,15 @@
     }
 
     // Prefer deepest blocks, but keep ancestors that still own direct text.
-    const deepest = blocks.filter(
-      (block) => !blocks.some((other) => other !== block && block.contains(other))
-    );
+    // Nesting via one DOM-order pass (not O(n^2) contains scans).
+    const { deepest, descendantsOf } = indexElementNesting(blocks);
     const deepestSet = new Set(deepest);
     const withOwnText = [];
     for (const block of blocks) {
       if (deepestSet.has(block)) {
         continue;
       }
-      const nested = deepest.filter((other) => block.contains(other));
+      const nested = (descendantsOf.get(block) || []).filter((other) => deepestSet.has(other));
       if (nested.length === 0) {
         continue;
       }
@@ -409,6 +408,52 @@
       }
     }
     return [...deepest, ...withOwnText];
+  }
+
+  /**
+   * Derive parent/descendant relationships for a set of elements in one
+   * document-order pass (stack + contains), avoiding quadratic scans.
+   * @param {Element[]} elements
+   * @returns {{ deepest: Element[], descendantsOf: Map<Element, Element[]> }}
+   */
+  function indexElementNesting(elements) {
+    const list = [...new Set(elements.filter(Boolean))];
+    const descendantsOf = new Map(list.map((el) => [el, []]));
+    if (list.length <= 1) {
+      return { deepest: list.slice(), descendantsOf };
+    }
+
+    list.sort((a, b) => {
+      if (a === b) {
+        return 0;
+      }
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) {
+        return -1;
+      }
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) {
+        return 1;
+      }
+      return 0;
+    });
+
+    const hasListedChild = new Set();
+    const stack = [];
+    for (const el of list) {
+      while (stack.length && !stack[stack.length - 1].contains(el)) {
+        stack.pop();
+      }
+      for (const ancestor of stack) {
+        descendantsOf.get(ancestor).push(el);
+      }
+      if (stack.length) {
+        hasListedChild.add(stack[stack.length - 1]);
+      }
+      stack.push(el);
+    }
+
+    const deepest = list.filter((el) => !hasListedChild.has(el));
+    return { deepest, descendantsOf };
   }
 
   function collectTextNodes(root) {
@@ -602,8 +647,10 @@
         }
       }
       const between = holder.textContent || "";
+      // Standalone whitespace between inlines (e.g. </span> <span>) must stay a
+      // space — returning "" collapses "Hello world" into "Helloworld".
       if (/\s/u.test(between)) {
-        return "";
+        return " ";
       }
     } catch {
       return " ";
@@ -627,9 +674,21 @@
     const runSettings = getRunSettings();
     const candidates = [...new Set(blocks)].filter((block) => block?.isConnected && !blockRecords.has(block));
 
+    // Include already-translated descendants so ancestor refresh does not
+    // re-send their original text (duplicate translation of nested <p> etc.).
+    const recordedConnected = [];
+    for (const recorded of blockRecords.keys()) {
+      if (recorded?.isConnected) {
+        recordedConnected.push(recorded);
+      }
+    }
+    const { descendantsOf } = indexElementNesting(
+      candidates.length === 0 ? [] : [...candidates, ...recordedConnected]
+    );
+
     const segments = [];
     for (const block of candidates) {
-      const nested = candidates.filter((other) => other !== block && block.contains(other));
+      const nested = descendantsOf.get(block) || [];
       const text = extractBlockText(block, nested);
       if (!text || !Utils.isTranslatableText(text, runSettings.targetLanguage)) {
         continue;
@@ -1355,10 +1414,9 @@
         return;
       }
 
+      // Keep selection target/model local — never clobber pinned page-run state.
       const targetLanguage = stored.targetLanguage || state.targetLanguage;
       const model = stored.model || state.model;
-      state.targetLanguage = targetLanguage;
-      state.model = model;
 
       if (!Utils.isTranslatableText(text, targetLanguage)) {
         return;

@@ -28,6 +28,8 @@ const elements = {
 let currentTab = null;
 let statusTimer = null;
 let currentDisplayMode = Utils.DISPLAY_MODES.bilingual;
+let initialized = false;
+let displayModeOp = 0;
 
 initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
 
@@ -79,16 +81,25 @@ elements.toggleKey.addEventListener("click", () => {
 // without requiring Test Connection / full-page Translate first.
 let persistTimer = null;
 function schedulePersistSettings() {
+  if (!initialized) {
+    return;
+  }
   if (persistTimer) {
     clearTimeout(persistTimer);
   }
   persistTimer = setTimeout(() => {
     persistTimer = null;
+    if (!initialized) {
+      return;
+    }
     void saveSettings();
   }, 200);
 }
 
 function persistSettingsNow() {
+  if (!initialized) {
+    return;
+  }
   if (persistTimer) {
     clearTimeout(persistTimer);
     persistTimer = null;
@@ -111,9 +122,13 @@ document.addEventListener("visibilitychange", () => {
 elements.modeButtons.forEach((button) => {
   button.addEventListener("click", async () => {
     const mode = Utils.normalizeDisplayMode(button.dataset.mode);
+    const op = ++displayModeOp;
     currentDisplayMode = mode;
     renderDisplayMode();
     await chrome.storage.local.set({ displayMode: mode });
+    if (op !== displayModeOp || mode !== currentDisplayMode) {
+      return;
+    }
 
     if (!currentTab?.id) {
       return;
@@ -121,10 +136,16 @@ elements.modeButtons.forEach((button) => {
 
     try {
       await ensureContentScript(currentTab.id);
+      if (op !== displayModeOp || mode !== currentDisplayMode) {
+        return;
+      }
       const response = await chrome.tabs.sendMessage(currentTab.id, {
         type: "SET_DISPLAY_MODE",
         displayMode: mode
       });
+      if (op !== displayModeOp || mode !== currentDisplayMode) {
+        return;
+      }
       if (response?.ok) {
         if (response.status?.displayMode) {
           currentDisplayMode = Utils.normalizeDisplayMode(response.status.displayMode);
@@ -250,6 +271,8 @@ async function initialize() {
   elements.model.value = settings.model;
   currentDisplayMode = Utils.normalizeDisplayMode(settings.displayMode);
   renderDisplayMode();
+  // Controls now mirror storage — safe to persist on hide/unload.
+  initialized = true;
 
   if (!currentTab?.id) {
     throw new Error("找不到当前标签页");
