@@ -886,7 +886,9 @@
         if (joined == null || runId !== generation) {
           return;
         }
-        await applyTranslatedSegment(segment, joined);
+        if (!applyTranslatedSegment(segment, joined)) {
+          state.failed += 1;
+        }
         return;
       } catch (error) {
         state.failed += 1;
@@ -907,7 +909,11 @@
       }
 
       translations.forEach((translation, index) => {
-        applyTranslatedSegment(batch[index], translation);
+        // Stale/empty/disconnected segments reject here — count them so the
+        // run summary does not silently under-report.
+        if (!applyTranslatedSegment(batch[index], translation)) {
+          state.failed += 1;
+        }
       });
     } catch (error) {
       if (error.canSplit && batch.length > 1 && runId === generation) {
@@ -925,7 +931,9 @@
           if (joined == null || runId !== generation) {
             return;
           }
-          await applyTranslatedSegment(segment, joined);
+          if (!applyTranslatedSegment(segment, joined)) {
+            state.failed += 1;
+          }
           return;
         } catch (splitError) {
           state.failed += 1;
@@ -992,6 +1000,10 @@
     if (blockRecords.has(block)) {
       return;
     }
+
+    // Publishing translation DOM without the stylesheet would flash unstyled;
+    // recreate first if the SPA dropped our <style>.
+    ensureTranslatorStyles();
 
     const gen = beginApplyingDom();
     try {
@@ -1144,6 +1156,9 @@
   }
 
   function applyDocumentDisplayMode(mode) {
+    // SPA head replacement can drop the style host — recreate before the
+    // display attribute depends on its rules.
+    ensureTranslatorStyles();
     document.documentElement.setAttribute("data-kilocean-display", Utils.normalizeDisplayMode(mode));
   }
 
@@ -1289,6 +1304,27 @@
     return host;
   }
 
+  function relocateAfterHostCompanion(record) {
+    // A reordered/reparented after-host block must carry its sibling companion
+    // along (local move only — no teardown, no rebill).
+    if (!record || record.layout !== "after" || !record.companion) {
+      return;
+    }
+    const host = record.block;
+    if (!host?.parentNode) {
+      return;
+    }
+    if (record.companion.parentNode === host.parentNode && record.companion.previousSibling === host) {
+      return;
+    }
+    const gen = beginApplyingDom();
+    try {
+      host.parentNode.insertBefore(record.companion, host.nextSibling);
+    } finally {
+      endApplyingDom(gen);
+    }
+  }
+
   function startObserving() {
     stopObserving();
     mutationObserver = new MutationObserver((records) => {
@@ -1305,6 +1341,17 @@
       for (const record of records) {
         if (record.type === "childList") {
           if (record.removedNodes.length > 0) {
+            // Head replacement / style pruning disconnects our <style> without
+            // any later apply pass — recreate it right here. The insertion is
+            // drained via begin/endApplyingDom so it cannot re-enter us.
+            if (styleHost && !styleHost.isConnected) {
+              const styleGen = beginApplyingDom();
+              try {
+                ensureTranslatorStyles();
+              } finally {
+                endApplyingDom(styleGen);
+              }
+            }
             pruneDetachedBlockRecords();
             // Removal-only SPA updates never appear in addedNodes — refresh via target.
             const removedOnlyUi = [...record.removedNodes].every((node) =>
@@ -1328,6 +1375,7 @@
               blockRecords.has(node) &&
               node.isConnected
             ) {
+              relocateAfterHostCompanion(blockRecords.get(node));
               return;
             }
             const refreshHost = findRefreshHostForMutation(node);
@@ -1565,6 +1613,12 @@
     document.addEventListener("mousedown", (event) => {
       const host = document.getElementById("kilocean-selection-host");
       if (host && event.target !== host && !host.contains(event.target)) {
+        // A trusted outside press starts a fresh pointer gesture — drop the
+        // dedupe key so re-selecting the same range reopens the panel.
+        // ×/Escape still go through hideSelectionPanel with the key retained.
+        if (event.isTrusted !== false) {
+          lastSelectionKey = "";
+        }
         hideSelectionPanel();
       }
     }, true);
@@ -1754,6 +1808,26 @@
       });
 
       if (requestId !== selectionGeneration) {
+        return;
+      }
+
+      // Revalidate the live Selection after the network await (same pattern as
+      // the storage await) — never publish a stale translation into a changed
+      // or collapsed selection. `text` / `liveRangeId` are what was sent.
+      const postNetworkSel = window.getSelection();
+      if (!postNetworkSel || postNetworkSel.isCollapsed || postNetworkSel.rangeCount === 0) {
+        lastSelectionKey = "";
+        hideSelectionPanel();
+        return;
+      }
+      const postNetworkText = postNetworkSel.toString().replace(/\s+/gu, " ").trim();
+      const postNetworkRangeId = getSelectionRangeIdentity(postNetworkSel);
+      if (postNetworkText !== text || postNetworkRangeId !== liveRangeId) {
+        return;
+      }
+      if (postNetworkText.length < 2 || postNetworkText.length > 5000) {
+        lastSelectionKey = "";
+        hideSelectionPanel();
         return;
       }
 
