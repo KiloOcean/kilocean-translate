@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -139,6 +140,228 @@ function extractContentFunction(name) {
   return match ? match[0] : null;
 }
 
+
+function checkParseTranslationPayload() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for parseTranslationPayload test: ${error.message}`);
+    return;
+  }
+  const { parseTranslationPayload, hasMultiParagraphSource, countSourceParagraphUnits } = utils;
+  if (typeof parseTranslationPayload !== "function") {
+    fail("shared.js: parseTranslationPayload export missing");
+    return;
+  }
+  if (typeof hasMultiParagraphSource !== "function") {
+    fail("shared.js: hasMultiParagraphSource export missing");
+    return;
+  }
+  if (typeof countSourceParagraphUnits !== "function") {
+    fail("shared.js: countSourceParagraphUnits export missing");
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertThrows = (fn, label) => {
+    let threw = false;
+    try {
+      fn();
+    } catch {
+      threw = true;
+    }
+    if (!threw) {
+      fail(`${label}: expected throw`);
+    }
+  };
+
+  assertEqual(hasMultiParagraphSource("a\n\nb"), true, "hasMultiParagraphSource: blank-line");
+  assertEqual(hasMultiParagraphSource("a\nb"), true, "hasMultiParagraphSource: single-newline lines");
+  assertEqual(hasMultiParagraphSource("单段原文"), false, "hasMultiParagraphSource: single line");
+  assertEqual(hasMultiParagraphSource(""), false, "hasMultiParagraphSource: empty");
+  assertEqual(hasMultiParagraphSource("第一段\n \n第二段"), true, "hasMultiParagraphSource: whitespace-only blank line");
+  assertEqual(hasMultiParagraphSource("第一段\r\n\r\n第二段"), true, "hasMultiParagraphSource: CRLF blank line");
+
+  assertEqual(countSourceParagraphUnits("第一段\n\n第二段\n\n第三段"), 3, "countSourceParagraphUnits: blank-line paras");
+  assertEqual(countSourceParagraphUnits("第一段\n第二段\n第三段"), 3, "countSourceParagraphUnits: single-newline lines");
+  assertEqual(countSourceParagraphUnits("单段原文"), 1, "countSourceParagraphUnits: single line");
+  assertEqual(countSourceParagraphUnits(""), 0, "countSourceParagraphUnits: empty");
+  assertEqual(countSourceParagraphUnits("第一段\n \n第二段"), 2, "countSourceParagraphUnits: whitespace-only blank line paras");
+  assertEqual(countSourceParagraphUnits("第一段\r\n\r\n第二段"), 2, "countSourceParagraphUnits: CRLF blank line paras");
+
+  // expectedCount 1 + N>1 all-string + multi-paragraph source → join with \n\n
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }),
+      1,
+      "第一段\n\n第二段\n\n第三段"
+    ),
+    ["甲段\n\n乙段\n\n丙段"],
+    "parseTranslationPayload: join N>1 when expectedCount===1 and source has \\n\\n"
+  );
+
+  // Normalized full-page path: paragraphs as single \n still recover (join with \n)
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }),
+      1,
+      "第一段\n第二段\n第三段"
+    ),
+    ["甲段\n乙段\n丙段"],
+    "parseTranslationPayload: join N>1 on single-\\n multi-line source"
+  );
+
+  // Recovered entries are trimmed before joining so edge whitespace cannot
+  // stack newlines/gaps around the separator.
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段\n", "\n乙段"] }),
+      1,
+      "第一段\n\n第二段"
+    ),
+    ["甲段\n\n乙段"],
+    "parseTranslationPayload: trim recovered entries before \\n\\n join"
+  );
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段  ", " 乙段"] }),
+      1,
+      "第一段\n第二段"
+    ),
+    ["甲段\n乙段"],
+    "parseTranslationPayload: trim recovered entries before \\n join"
+  );
+
+  // Whitespace-only / CRLF blank lines still count as paragraph breaks: the
+  // join must use \n\n, not collapse to a single \n.
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段"] }),
+      1,
+      "第一段\n \n第二段"
+    ),
+    ["甲段\n\n乙段"],
+    "parseTranslationPayload: whitespace-only blank line joins with \\n\\n"
+  );
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段"] }),
+      1,
+      "第一段\r\n\r\n第二段"
+    ),
+    ["甲段\n\n乙段"],
+    "parseTranslationPayload: CRLF blank line joins with \\n\\n"
+  );
+
+  // Normalized blank-line counting must still fail closed on count mismatch
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }),
+      1,
+      "第一段\n \n第二段"
+    ),
+    "parseTranslationPayload: must not join on whitespace-only blank line with extra translations"
+  );
+
+  // Join recovery must only run when returned entry count matches source units
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段"] }),
+      1,
+      "第一段\n\n第二段\n\n第三段"
+    ),
+    "parseTranslationPayload: must not join when fewer translations than source units"
+  );
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段", "丁段"] }),
+      1,
+      "第一段\n\n第二段\n\n第三段"
+    ),
+    "parseTranslationPayload: must not join when more translations than source units"
+  );
+
+  // Empty / whitespace-only entries must not join — fall through to length mismatch
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["第一段译文", ""] }),
+      1,
+      "第一段\n\n第二段"
+    ),
+    "parseTranslationPayload: must not join empty-string entries in N>1 recovery"
+  );
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["第一段译文", "   "] }),
+      1,
+      "第一段\n\n第二段"
+    ),
+    "parseTranslationPayload: must not join whitespace-only entries in N>1 recovery"
+  );
+
+  // expectedCount 1 + N>1 all-string but single-paragraph source → throws
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段"] }),
+      1,
+      "单段原文"
+    ),
+    "parseTranslationPayload: must not join without multi-paragraph source"
+  );
+
+  // Single-line source with N>1 extras must still reject (fail closed)
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }),
+      1,
+      "一整段没有换行的原文"
+    ),
+    "parseTranslationPayload: must not join single-line source with N>1 extras"
+  );
+
+  // expectedCount 1 + N>1 all-string with omitted sourceText → throws
+  assertThrows(
+    () => parseTranslationPayload(JSON.stringify({ translations: ["甲段", "乙段"] }), 1),
+    "parseTranslationPayload: must not join when sourceText omitted"
+  );
+
+  // expectedCount 1 + exact 1 string → unchanged
+  assertEqual(
+    parseTranslationPayload(JSON.stringify({ translations: ["单段译文"] }), 1, "单段原文"),
+    ["单段译文"],
+    "parseTranslationPayload: single string passthrough"
+  );
+
+  // expectedCount 2 + 2 strings → ok
+  assertEqual(
+    parseTranslationPayload(JSON.stringify({ translations: ["一", "二"] }), 2),
+    ["一", "二"],
+    "parseTranslationPayload: matching multi-count"
+  );
+
+  // expectedCount 2 + 3 strings → throws
+  assertThrows(
+    () => parseTranslationPayload(JSON.stringify({ translations: ["一", "二", "三"] }), 2),
+    "parseTranslationPayload: mismatch when expectedCount>1"
+  );
+
+  // expectedCount 1 + N>1 with a non-string item → throws
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲", 2, "丙"] }),
+      1,
+      "甲\n\n乙\n\n丙"
+    ),
+    "parseTranslationPayload: non-string items must not join"
+  );
+}
+
 function checkSegmentSplitLogic() {
   const splitFnSource = extractContentFunction("findSegmentSplitIndex");
   if (!splitFnSource) {
@@ -244,6 +467,124 @@ function checkSegmentSplitLogic() {
   }
 }
 
+
+function checkJoinSplitTranslations() {
+  const joinSrc = extractContentFunction("joinSplitTranslations");
+  const delimSrc = extractContentFunction("isWhitespaceDelimitedTarget");
+  if (!joinSrc || !delimSrc) {
+    fail("content.js: cannot extract joinSplitTranslations / isWhitespaceDelimitedTarget");
+    return;
+  }
+
+  let joinSplitTranslations;
+  try {
+    joinSplitTranslations = new Function(
+      `${delimSrc}\n${joinSrc}\nreturn joinSplitTranslations;`
+    )();
+  } catch (error) {
+    fail(`joinSplitTranslations extract failed: ${error.message}`);
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (actual !== expected) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // Blank-line boundary from left trail must rejoin with \\n\\n (not collapse to \\n).
+  assertEqual(
+    joinSplitTranslations("甲", "乙", "甲\n\n", "乙", "zh"),
+    "甲\n\n乙",
+    "joinSplitTranslations: preserve blank-line boundary"
+  );
+  assertEqual(
+    joinSplitTranslations("甲", "乙", "甲", "\n\n乙", "zh"),
+    "甲\n\n乙",
+    "joinSplitTranslations: preserve blank-line from right lead"
+  );
+
+  // Source blank-line must win over partial translated edge whitespace.
+  assertEqual(
+    joinSplitTranslations("甲\n", "乙", "甲\n\n", "乙", "zh"),
+    "甲\n\n乙",
+    "joinSplitTranslations: source blank-line wins over left translated trailing newline"
+  );
+  assertEqual(
+    joinSplitTranslations("甲", "\n乙", "甲", "\n\n乙", "zh"),
+    "甲\n\n乙",
+    "joinSplitTranslations: source blank-line wins over right translated leading newline"
+  );
+
+  // Single newline boundary.
+  assertEqual(
+    joinSplitTranslations("甲", "乙", "甲\n", "乙", "zh"),
+    "甲\n乙",
+    "joinSplitTranslations: preserve single newline boundary"
+  );
+
+  // Space boundary.
+  assertEqual(
+    joinSplitTranslations("Hello", "world", "Hello ", "world", "en"),
+    "Hello world",
+    "joinSplitTranslations: space boundary"
+  );
+
+  // forceSplit: canSplit single-item fallback must bisect without re-requesting.
+  const content = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
+  const splitFn = extractContentFunction("translateSegmentTextWithSplit");
+  if (!splitFn || !/options\s*=\s*\{\s*\}/.test(splitFn) || !/options\.forceSplit/.test(splitFn)) {
+    fail("content.js: translateSegmentTextWithSplit must accept options.forceSplit and bisect immediately");
+  }
+  // Single-item canSplit path must pass { forceSplit: true }.
+  if (!/error\.canSplit\s*&&\s*batch\.length\s*===\s*1[\s\S]*?forceSplit:\s*true/.test(content)) {
+    fail("content.js: canSplit single-item fallback must call translateSegmentTextWithSplit with forceSplit: true");
+  }
+  // >5000 proactive path must still call without forceSplit.
+  if (!/batch\[0\]\.text\.length\s*>\s*5000[\s\S]*?translateSegmentTextWithSplit\(segment\.text,\s*runId,\s*runSettings\)/.test(content)) {
+    fail("content.js: >5000 proactive path must call translateSegmentTextWithSplit without forceSplit");
+  }
+}
+
+function checkJoinRawTextNodesNormalize() {
+  const fnSource = extractContentFunction("joinRawTextNodes");
+  if (!fnSource) {
+    fail("content.js: cannot extract joinRawTextNodes for normalize test");
+    return;
+  }
+
+  let joinRawTextNodes;
+  try {
+    joinRawTextNodes = new Function(`${fnSource}\nreturn joinRawTextNodes;`)();
+  } catch (error) {
+    fail(`joinRawTextNodes extract failed: ${error.message}`);
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (actual !== expected) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // Single text node: normalize must keep blank-line paragraph breaks.
+  assertEqual(
+    joinRawTextNodes([{ data: "a\n\nb" }]),
+    "a\n\nb",
+    "joinRawTextNodes: preserve \\n\\n"
+  );
+  assertEqual(
+    joinRawTextNodes([{ data: "a \n\n b" }]),
+    "a\n\nb",
+    "joinRawTextNodes: trim horizontal space around \\n\\n"
+  );
+  assertEqual(
+    joinRawTextNodes([{ data: "hello   world" }]),
+    "hello world",
+    "joinRawTextNodes: collapse horizontal whitespace"
+  );
+}
+
 function main() {
   console.log("kilocean-translate ci-check");
   console.log(`root: ${ROOT}`);
@@ -256,6 +597,9 @@ function main() {
   }
 
   checkSegmentSplitLogic();
+  checkParseTranslationPayload();
+  checkJoinSplitTranslations();
+  checkJoinRawTextNodesNormalize();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -265,7 +609,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes");
   process.exit(0);
 }
 

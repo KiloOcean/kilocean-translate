@@ -754,7 +754,8 @@
 
     return result
       .replace(/[^\S\n]+/gu, " ")
-      .replace(/\s*\n\s*/gu, "\n")
+      // Trim horizontal space around newlines only — do not collapse \n\n to \n.
+      .replace(/[^\S\n]*\n[^\S\n]*/gu, "\n")
       .trim();
   }
 
@@ -965,14 +966,22 @@
   function joinSplitTranslations(left, right, leftSource, rightSource, targetLanguage) {
     const leftStr = String(left || "");
     const rightStr = String(right || "");
+    // Derive source boundary first so blank-line splits win over partial
+    // translated edge whitespace (DeepSeek may leave only a single \n).
+    const leftTrail = (String(leftSource || "").match(/\s+$/u) || [""])[0];
+    const rightLead = (String(rightSource || "").match(/^\s+/u) || [""])[0];
+    const boundary = leftTrail || rightLead;
+
+    // Source blank-line always rejoins with \n\n after trimming translated edges.
+    if (/\n\n/u.test(boundary)) {
+      return `${leftStr.replace(/\s+$/u, "")}\n\n${rightStr.replace(/^\s+/u, "")}`;
+    }
+
     // If either translated half already retains edge whitespace, keep direct concat.
     if (/\s$/u.test(leftStr) || /^\s/u.test(rightStr)) {
       return `${leftStr}${rightStr}`;
     }
-    // DeepSeek often trims each half; restore a boundary from the source split edge.
-    const leftTrail = (String(leftSource || "").match(/\s+$/u) || [""])[0];
-    const rightLead = (String(rightSource || "").match(/^\s+/u) || [""])[0];
-    const boundary = leftTrail || rightLead;
+
     if (!boundary) {
       // Midpoint char-split (e.g. CJK with no nearby whitespace) would otherwise
       // glue whitespace-delimited target halves: lastwordNextword.
@@ -998,7 +1007,7 @@
     return raw;
   }
 
-  async function translateSegmentTextWithSplit(text, runId, runSettings) {
+  async function translateSegmentTextWithSplit(text, runId, runSettings, options = {}) {
     // Proactively bisect oversized text before any request: a whole-body
     // TRANSLATE_BATCH can fail with a non-canSplit error (X long posts are a
     // single ~9k-char span), which would leave the body untranslated.
@@ -1011,6 +1020,27 @@
           return null;
         }
         return translationOrNull(translations[0]);
+      }
+      const leftSource = text.slice(0, splitAt);
+      const rightSource = text.slice(splitAt);
+      const left = await translateSegmentTextWithSplit(leftSource, runId, runSettings);
+      if (left == null || !String(left).trim() || runId !== generation) {
+        return null;
+      }
+      const right = await translateSegmentTextWithSplit(rightSource, runId, runSettings);
+      if (right == null || !String(right).trim() || runId !== generation) {
+        return null;
+      }
+      // Preserve boundary whitespace from the original slice join.
+      return joinSplitTranslations(left, right, leftSource, rightSource, runSettings.targetLanguage);
+    }
+
+    // forceSplit: caller already saw this exact text fail with canSplit —
+    // re-requesting the identical text would only fail again. Bisect at once.
+    if (options.forceSplit) {
+      const splitAt = findSegmentSplitIndex(text);
+      if (splitAt < 1 || splitAt >= text.length) {
+        throw new Error("无法继续拆分该文本段");
       }
       const leftSource = text.slice(0, splitAt);
       const rightSource = text.slice(splitAt);
@@ -1161,7 +1191,7 @@
       if (error.canSplit && batch.length === 1) {
         const segment = batch[0];
         try {
-          const joined = await translateSegmentTextWithSplit(segment.text, runId, runSettings);
+          const joined = await translateSegmentTextWithSplit(segment.text, runId, runSettings, { forceSplit: true });
           if (joined == null || runId !== generation) {
             return;
           }
