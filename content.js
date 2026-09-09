@@ -754,7 +754,8 @@
 
     return result
       .replace(/[^\S\n]+/gu, " ")
-      .replace(/\s*\n\s*/gu, "\n")
+      // Trim horizontal space around newlines only — do not collapse \n\n to \n.
+      .replace(/[^\S\n]*\n[^\S\n]*/gu, "\n")
       .trim();
   }
 

@@ -318,7 +318,7 @@ async function translateBatch(texts, targetLanguage, requestedModel) {
     // Also allow bisect when a single multi-paragraph segment got a bad
     // payload count (join path may already have recovered; this is belt-and-suspenders).
     parseError.canSplit = texts.length > 1 ||
-      (texts.length === 1 && String(texts[0]).includes("\n\n"));
+      (texts.length === 1 && DeepSeekTranslatorUtils.hasMultiParagraphSource(String(texts[0])));
     throw parseError;
   }
 }

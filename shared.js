@@ -98,6 +98,20 @@
     return chunks;
   }
 
+  // True when source has blank-line paragraph breaks (\n\n) or at least two
+  // non-empty lines separated by newlines (after joinRawTextNodes may collapse
+  // blank lines to a single \n).
+  function hasMultiParagraphSource(text) {
+    if (typeof text !== "string" || text.length === 0) {
+      return false;
+    }
+    if (text.includes("\n\n")) {
+      return true;
+    }
+    const nonEmptyLines = text.split("\n").filter((line) => line.trim() !== "");
+    return nonEmptyLines.length >= 2;
+  }
+
   function parseTranslationPayload(content, expectedCount, sourceText) {
     if (typeof content !== "string" || content.trim() === "") {
       throw new Error("DeepSeek 返回了空内容");
@@ -121,7 +135,8 @@
     }
 
     // A single multi-paragraph segment sometimes comes back as one entry per
-    // paragraph; rejoin with the original \n\n separator so counts match again.
+    // paragraph; rejoin so counts match again. Prefer \n\n when the source
+    // still has blank lines; otherwise join with \n (normalized single breaks).
     // Only recover when the source itself is multi-paragraph so selection /
     // TEST_CONNECTION malformed extras still fail closed.
     if (
@@ -129,9 +144,10 @@
       translations.length > 1 &&
       translations.every((item) => typeof item === "string") &&
       typeof sourceText === "string" &&
-      sourceText.includes("\n\n")
+      hasMultiParagraphSource(sourceText)
     ) {
-      return [translations.join("\n\n")];
+      const separator = sourceText.includes("\n\n") ? "\n\n" : "\n";
+      return [translations.join(separator)];
     }
 
     if (translations.length !== expectedCount) {
@@ -172,6 +188,7 @@
     isTranslatableText,
     preserveWhitespace,
     chunkSegments,
+    hasMultiParagraphSource,
     parseTranslationPayload,
     sanitizeExportFilename,
     buildExportFilename

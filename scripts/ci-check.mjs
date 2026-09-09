@@ -150,9 +150,13 @@ function checkParseTranslationPayload() {
     fail(`shared.js: cannot load for parseTranslationPayload test: ${error.message}`);
     return;
   }
-  const { parseTranslationPayload } = utils;
+  const { parseTranslationPayload, hasMultiParagraphSource } = utils;
   if (typeof parseTranslationPayload !== "function") {
     fail("shared.js: parseTranslationPayload export missing");
+    return;
+  }
+  if (typeof hasMultiParagraphSource !== "function") {
+    fail("shared.js: hasMultiParagraphSource export missing");
     return;
   }
 
@@ -173,6 +177,11 @@ function checkParseTranslationPayload() {
     }
   };
 
+  assertEqual(hasMultiParagraphSource("a\n\nb"), true, "hasMultiParagraphSource: blank-line");
+  assertEqual(hasMultiParagraphSource("a\nb"), true, "hasMultiParagraphSource: single-newline lines");
+  assertEqual(hasMultiParagraphSource("单段原文"), false, "hasMultiParagraphSource: single line");
+  assertEqual(hasMultiParagraphSource(""), false, "hasMultiParagraphSource: empty");
+
   // expectedCount 1 + N>1 all-string + multi-paragraph source → join with \n\n
   assertEqual(
     parseTranslationPayload(
@@ -184,6 +193,17 @@ function checkParseTranslationPayload() {
     "parseTranslationPayload: join N>1 when expectedCount===1 and source has \\n\\n"
   );
 
+  // Normalized full-page path: paragraphs as single \n still recover (join with \n)
+  assertEqual(
+    parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }),
+      1,
+      "第一段\n第二段\n第三段"
+    ),
+    ["甲段\n乙段\n丙段"],
+    "parseTranslationPayload: join N>1 on single-\\n multi-line source"
+  );
+
   // expectedCount 1 + N>1 all-string but single-paragraph source → throws
   assertThrows(
     () => parseTranslationPayload(
@@ -192,6 +212,16 @@ function checkParseTranslationPayload() {
       "单段原文"
     ),
     "parseTranslationPayload: must not join without multi-paragraph source"
+  );
+
+  // Single-line source with N>1 extras must still reject (fail closed)
+  assertThrows(
+    () => parseTranslationPayload(
+      JSON.stringify({ translations: ["甲段", "乙段", "丙段"] }),
+      1,
+      "一整段没有换行的原文"
+    ),
+    "parseTranslationPayload: must not join single-line source with N>1 extras"
   );
 
   // expectedCount 1 + N>1 all-string with omitted sourceText → throws
@@ -336,6 +366,45 @@ function checkSegmentSplitLogic() {
   }
 }
 
+function checkJoinRawTextNodesNormalize() {
+  const fnSource = extractContentFunction("joinRawTextNodes");
+  if (!fnSource) {
+    fail("content.js: cannot extract joinRawTextNodes for normalize test");
+    return;
+  }
+
+  let joinRawTextNodes;
+  try {
+    joinRawTextNodes = new Function(`${fnSource}\nreturn joinRawTextNodes;`)();
+  } catch (error) {
+    fail(`joinRawTextNodes extract failed: ${error.message}`);
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (actual !== expected) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // Single text node: normalize must keep blank-line paragraph breaks.
+  assertEqual(
+    joinRawTextNodes([{ data: "a\n\nb" }]),
+    "a\n\nb",
+    "joinRawTextNodes: preserve \\n\\n"
+  );
+  assertEqual(
+    joinRawTextNodes([{ data: "a \n\n b" }]),
+    "a\n\nb",
+    "joinRawTextNodes: trim horizontal space around \\n\\n"
+  );
+  assertEqual(
+    joinRawTextNodes([{ data: "hello   world" }]),
+    "hello world",
+    "joinRawTextNodes: collapse horizontal whitespace"
+  );
+}
+
 function main() {
   console.log("kilocean-translate ci-check");
   console.log(`root: ${ROOT}`);
@@ -349,6 +418,7 @@ function main() {
 
   checkSegmentSplitLogic();
   checkParseTranslationPayload();
+  checkJoinRawTextNodesNormalize();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -358,7 +428,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinRawTextNodes");
   process.exit(0);
 }
 
