@@ -20,6 +20,12 @@
   const INTERACTIVE_TAGS = new Set([
     "A", "BUTTON", "SUMMARY", "LABEL", "SELECT", "OPTION", "TEXTAREA", "INPUT"
   ]);
+  // Selection-path-only rate limit (full-page runs are unaffected): every
+  // TRANSLATE_BATCH send spends the user's API key, so a page that turns each
+  // real gesture into a request must not drain it in a tight loop.
+  const SELECTION_SEND_MIN_INTERVAL_MS = 1000;
+  const SELECTION_SEND_WINDOW_MS = 10000;
+  const SELECTION_SEND_WINDOW_LIMIT = 8;
 
   /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, wraps: HTMLElement[], companion: HTMLElement, layout: string}>} */
   const blockRecords = new Map();
@@ -37,6 +43,8 @@
   let lastSelectionKey = "";
   /** @type {string} text\0rangeIdentity of the selection last scheduled for translate. */
   let lastScheduledSelectionSnapshot = "";
+  /** Send times of recent selection-path TRANSLATE_BATCHs (rate limiting). */
+  const selectionSendTimes = [];
   let nextSelectionNodeId = 1;
   const selectionNodeIds = new WeakMap();
   let styleHost = null;
@@ -1709,26 +1717,72 @@
   }
 
   function onSelectionMaybeTranslate(event) {
+    // Ignore synthetic page-script events that could burn the user's API key.
+    if (event && event.isTrusted === false) {
+      return;
+    }
+
+    // Snapshot the selection synchronously at the trusted gesture: page script
+    // can replace window.getSelection() while the debounce is pending, so only
+    // this snapshot — never a post-delay read — may become the billable text.
+    const gesture = captureSelectionGesture();
+
     // Invalidate in-flight storage awaits when the live selection actually
     // changed (keyboard mid-await). Unchanged Shift must not bump or an
     // in-flight TRANSLATE_BATCH response would be discarded.
-    const live = window.getSelection();
-    let snapshot = "";
-    if (live && !live.isCollapsed && live.rangeCount > 0) {
-      const liveText = live.toString().replace(/\s+/gu, " ").trim();
-      snapshot = `${liveText}\0${getSelectionRangeIdentity(live)}`;
-    }
+    const snapshot = gesture ? `${gesture.text}\0${gesture.rangeId}` : "";
     if (snapshot !== lastScheduledSelectionSnapshot) {
       lastScheduledSelectionSnapshot = snapshot;
       selectionGeneration += 1;
     }
     if (selectionTimer) {
       clearTimeout(selectionTimer);
+      selectionTimer = null;
+    }
+    if (!gesture) {
+      // Collapsed / empty / oversized at gesture time — clean up synchronously
+      // and never schedule a handler that could bill a selection a page
+      // injects after the delay.
+      lastSelectionKey = "";
+      hideSelectionPanel();
+      return;
     }
     selectionTimer = setTimeout(() => {
       selectionTimer = null;
-      handleSelectionTranslate(event);
+      handleSelectionTranslate(event, gesture);
     }, 180);
+  }
+
+  /**
+   * Capture the current Selection synchronously at a trusted gesture.
+   * @returns {{ text: string, rangeId: string } | null} null unless the user
+   *   genuinely holds a non-collapsed selection of billable length.
+   */
+  function captureSelectionGesture() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+      return null;
+    }
+    const text = selection.toString().replace(/\s+/gu, " ").trim();
+    if (text.length < 2 || text.length > 5000) {
+      return null;
+    }
+    const rangeId = getSelectionRangeIdentity(selection);
+    return rangeId ? { text, rangeId } : null;
+  }
+
+  function isSelectionSendRateLimited(now = Date.now()) {
+    while (
+      selectionSendTimes.length > 0 &&
+      now - selectionSendTimes[0] >= SELECTION_SEND_WINDOW_MS
+    ) {
+      selectionSendTimes.shift();
+    }
+    const last = selectionSendTimes[selectionSendTimes.length - 1];
+    if (last !== undefined && now - last < SELECTION_SEND_MIN_INTERVAL_MS) {
+      return true;
+    }
+    return selectionSendTimes.length >= SELECTION_SEND_WINDOW_LIMIT;
   }
 
   function isSelectionInsideTranslatorUi(selection, event) {
@@ -1762,9 +1816,17 @@
     return false;
   }
 
-  async function handleSelectionTranslate(event) {
+  async function handleSelectionTranslate(event, gesture) {
     // Ignore synthetic page-script events that could burn the user's API key.
     if (event && event.isTrusted === false) {
+      return;
+    }
+
+    // The gesture snapshot taken synchronously at the trusted event is the
+    // only billable payload (defensive — scheduling always passes one).
+    if (!gesture?.text || !gesture.rangeId) {
+      lastSelectionKey = "";
+      hideSelectionPanel();
       return;
     }
 
@@ -1776,17 +1838,21 @@
       return;
     }
 
-    let text = selection.toString().replace(/\s+/gu, " ").trim();
-    if (text.length < 2 || text.length > 5000) {
-      // Rejected non-collapsed selection — clear prior key so reselecting a
-      // previously translated range A is not silently no-op'd by stale dedupe.
-      // hideSelectionPanel keeps the key for ×/Escape on an unchanged range.
-      lastSelectionKey = "";
-      hideSelectionPanel();
+    if (isSelectionInsideTranslatorUi(selection, event)) {
       return;
     }
 
-    if (isSelectionInsideTranslatorUi(selection, event)) {
+    // Require the live Selection to still be exactly what the user held at the
+    // trusted gesture: text swapped in by page script during the debounce must
+    // never reach TRANSLATE_BATCH even though the retained event is trusted.
+    // Any rejection clears the prior key so reselecting a previously
+    // translated range is not silently no-op'd by stale dedupe.
+    if (
+      selection.toString().replace(/\s+/gu, " ").trim() !== gesture.text ||
+      getSelectionRangeIdentity(selection) !== gesture.rangeId
+    ) {
+      lastSelectionKey = "";
+      hideSelectionPanel();
       return;
     }
 
@@ -1800,9 +1866,6 @@
     if (!rect || (rect.width === 0 && rect.height === 0)) {
       return;
     }
-
-    const preAwaitRangeId = getSelectionRangeIdentity(selection);
-    const preAwaitText = text;
 
     // Snapshot only — do not bump yet so an unchanged Shift release cannot
     // cancel an in-flight translation for the same selection.
@@ -1830,15 +1893,11 @@
       }
       const liveText = liveSel.toString().replace(/\s+/gu, " ").trim();
       const liveRangeId = getSelectionRangeIdentity(liveSel);
-      if (liveText !== preAwaitText || liveRangeId !== preAwaitRangeId) {
+      // Compare against the gesture snapshot (the payload that would be sent);
+      // its 2..5000 bounds are already guaranteed by captureSelectionGesture.
+      if (liveText !== gesture.text || liveRangeId !== gesture.rangeId) {
         return;
       }
-      if (liveText.length < 2 || liveText.length > 5000) {
-        lastSelectionKey = "";
-        hideSelectionPanel();
-        return;
-      }
-      text = liveText;
       try {
         rect = liveSel.getRangeAt(0).getBoundingClientRect();
       } catch {
@@ -1852,7 +1911,7 @@
       const targetLanguage = stored.targetLanguage || state.targetLanguage;
       const model = stored.model || state.model;
 
-      if (!Utils.isTranslatableText(text, targetLanguage)) {
+      if (!Utils.isTranslatableText(gesture.text, targetLanguage)) {
         // Range changed to non-translatable text — drop stale dedupe key.
         lastSelectionKey = "";
         hideSelectionPanel();
@@ -1863,7 +1922,7 @@
       // bumping generation or issuing another billable TRANSLATE_BATCH.
       // Include range identity so the same words elsewhere (or a fresh re-select
       // after collapse) still reopen/reposition the panel.
-      const selectionKey = `${targetLanguage}\0${model}\0${text}\0${liveRangeId}`;
+      const selectionKey = `${targetLanguage}\0${model}\0${gesture.text}\0${liveRangeId}`;
       if (selectionKey === lastSelectionKey) {
         return;
       }
@@ -1884,9 +1943,19 @@
         return;
       }
 
+      // Selection-path rate limit: show a brief non-billing notice instead of
+      // sending, and clear the claimed key so a retry works once the window
+      // frees up. Full-page TRANSLATE_BATCH runs are never limited here.
+      if (isSelectionSendRateLimited()) {
+        lastSelectionKey = "";
+        setSelectionPanelState(panel, "error", "操作过于频繁，请稍后再试");
+        return;
+      }
+      selectionSendTimes.push(Date.now());
+
       const response = await chrome.runtime.sendMessage({
         type: "TRANSLATE_BATCH",
-        texts: [text],
+        texts: [gesture.text],
         targetLanguage,
         model
       });
@@ -1897,7 +1966,8 @@
 
       // Revalidate the live Selection after the network await (same pattern as
       // the storage await) — never publish a stale translation into a changed
-      // or collapsed selection. `text` / `liveRangeId` are what was sent.
+      // or collapsed selection. `gesture.text` / `gesture.rangeId` are what
+      // was sent.
       const postNetworkSel = window.getSelection();
       if (!postNetworkSel || postNetworkSel.isCollapsed || postNetworkSel.rangeCount === 0) {
         lastSelectionKey = "";
@@ -1906,14 +1976,9 @@
       }
       const postNetworkText = postNetworkSel.toString().replace(/\s+/gu, " ").trim();
       const postNetworkRangeId = getSelectionRangeIdentity(postNetworkSel);
-      if (postNetworkText !== text || postNetworkRangeId !== liveRangeId) {
+      if (postNetworkText !== gesture.text || postNetworkRangeId !== gesture.rangeId) {
         // Page script changed the range without a handled input event — clear
         // the claimed key and hide the stuck loading panel (same as collapse).
-        lastSelectionKey = "";
-        hideSelectionPanel();
-        return;
-      }
-      if (postNetworkText.length < 2 || postNetworkText.length > 5000) {
         lastSelectionKey = "";
         hideSelectionPanel();
         return;
@@ -1928,7 +1993,7 @@
         throw new Error("未返回译文");
       }
 
-      setSelectionPanelState(panel, "success", translation, text);
+      setSelectionPanelState(panel, "success", translation, gesture.text);
     } catch (error) {
       if (requestId && requestId !== selectionGeneration) {
         return;
