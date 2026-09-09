@@ -189,7 +189,10 @@ async function initialize() {
     await ensureContentScript(currentTab.id);
     const response = await chrome.tabs.sendMessage(currentTab.id, { type: "GET_STATUS" });
     if (response?.ok) {
-      if (response.status.displayMode) {
+      // Prefer chrome.storage (already loaded above). Fresh injects answer GET_STATUS
+      // before their storage callback, so adopting content's default would clobber
+      // the user's saved displayMode. Only sync from content when translation is active.
+      if (response.status.active && response.status.displayMode) {
         currentDisplayMode = Utils.normalizeDisplayMode(response.status.displayMode);
         renderDisplayMode();
       }

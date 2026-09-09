@@ -6,7 +6,7 @@
 # the unresolved-thread gate, not by rejecting COMMENTED itself.
 #
 # Gate (all required):
-#   - PR is open, not draft, base is main, no "no-auto-merge" label
+#   - PR is open, not draft, base is main, no "no-auto-merge" or "skip-codex-gate" label
 #   - Successful Build & Test (or CI) *check run* on the head SHA
 #     (fail closed if that check run is missing; no combined-status fallback)
 #   - Relevant checks are completed and not failed (ignore Custom LLM Review
@@ -22,7 +22,7 @@
 #   - GraphQL reviewThreads: every thread isResolved (REST fallback:
 #     fail closed if any review comments exist and resolution is unknown)
 #
-# Blocks: draft, non-main base, no-auto-merge, failed/pending relevant
+# Blocks: draft, non-main base, no-auto-merge, skip-codex-gate, failed/pending relevant
 # checks, missing Copilot review, CHANGES_REQUESTED, unresolved threads.
 #
 # Re-evaluates when CI succeeds, when Copilot submits a review, when
@@ -227,6 +227,12 @@ jobs:
             }
             if (pr.labels.some((l) => l.name === 'no-auto-merge')) {
               core.info(`PR #${prNumber} has no-auto-merge — skip`);
+              return;
+            }
+            if (pr.labels.some((l) => l.name === 'skip-codex-gate')) {
+              // Belt-and-suspenders: Gate must not report success for this label,
+              // but refuse here too so a stale successful Gate cannot auto-merge.
+              core.info(`PR #${prNumber} has skip-codex-gate — skip auto-merge`);
               return;
             }
 

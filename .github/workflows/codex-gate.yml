@@ -6,11 +6,14 @@
 # so classic branch protection can require the job name "Codex Review Gate".
 #
 # Heuristic (fail-closed):
-#   - Label skip-codex-gate → success (escape hatch)
-#   - Draft PR → success (re-runs on ready_for_review)
+#   - Label skip-codex-gate → FAIL the Gate job, NO Auto Merge dispatch
+#     (label documents a manual/admin escape hatch only; never reports
+#     success that would satisfy Auto Merge's required Codex Gate check.
+#     pull_request jobs cannot emit a true "neutral" job conclusion.)
+#   - Draft PR → success without dispatch (re-runs on ready_for_review)
 #   - No Codex Review Summary comment yet:
 #       * head commit younger than ~20 minutes → fail (still waiting)
-#       * otherwise → fail (timeout; add skip-codex-gate or comment @codex review)
+#       * otherwise → fail (timeout; comment @codex review)
 #   - Summary still Running / in progress / queued → fail
 #   - Summary Failed / cancelled / error (and not Completed) → fail
 #   - Summary does not positively show Completed or 👍 no-findings → fail
@@ -248,8 +251,13 @@ jobs:
             const sha = pr.head.sha;
 
             if (pr.labels.some((l) => l.name === 'skip-codex-gate')) {
-              core.info(`PR #${prNumber}: skip-codex-gate — passing`);
-              await reportSuccessAndDispatch(sha, 'Skipped', 'skip-codex-gate label present', prNumber);
+              // Escape hatch for humans/admin only: never report success + dispatch.
+              // pull_request-attached Gate checks become the job conclusion, so we
+              // must setFailed — a bare return would mark Gate success and Auto Merge.
+              const msg = 'skip-codex-gate present — Gate fails closed (no Auto Merge). Remove the label and clear Codex threads for auto-merge, or admin-merge manually if policy allows.';
+              core.info(`PR #${prNumber}: ${msg}`);
+              await reportOnHeadSha(sha, 'failure', 'Skipped (no auto-merge)', msg);
+              core.setFailed(msg);
               return;
             }
 
@@ -282,7 +290,7 @@ jobs:
               const msg =
                 elapsed < WAIT_MS
                   ? `Codex Review Summary not posted yet (${waitedMin}m < 20m). Gate fails until chatgpt-codex-connector comments; job re-runs on that comment.`
-                  : `Codex never posted a Review Summary within 20 minutes of head ${sha.slice(0, 7)}. Comment "@codex review" or add label skip-codex-gate.`;
+                  : `Codex never posted a Review Summary within 20 minutes of head ${sha.slice(0, 7)}. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).`;
               await reportOnHeadSha(sha, 'failure', 'Waiting for Codex', msg);
               core.setFailed(msg);
               return;
@@ -321,7 +329,7 @@ jobs:
               const msg =
                 elapsed < WAIT_MS
                   ? `Codex Review Summary does not mention head ${sha.slice(0, 7)} (${waitedMin}m < 20m). Gate fails until Codex re-reviews this SHA.`
-                  : `Codex Review Summary still does not mention head ${sha.slice(0, 7)} after 20 minutes. Comment "@codex review" or add label skip-codex-gate.`;
+                  : `Codex Review Summary still does not mention head ${sha.slice(0, 7)} after 20 minutes. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).`;
               await reportOnHeadSha(sha, 'failure', 'Stale Codex summary', msg);
               core.setFailed(msg);
               return;

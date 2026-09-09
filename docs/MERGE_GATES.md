@@ -58,10 +58,10 @@ Codex 只发 issue comment（`<!-- codex-pull-request-review-summary -->`）和�
 
 | 情况 | 结果 |
 |------|------|
-| Label `skip-codex-gate` | 通过（逃生舱） |
+| Label `skip-codex-gate` | **失败**，不 dispatch Auto Merge（仅人工/admin 逃生舱文档；绝不能让 Gate 变 success） |
 | Draft | 通过（ready 后重跑） |
 | 尚无 Summary，head 未满约 20 分钟 | 失败（等待） |
-| 20 分钟内从未发 Summary | 失败（`@codex review` 或 `skip-codex-gate`） |
+| 20 分钟内从未发 Summary | 失败（`@codex review`；`skip-codex-gate` 会失败 Gate 并挡住自动合入） |
 | Summary Running / Failed / 无 Completed 或 👍 | 失败 |
 | Summary 已完成但未提及当前 head SHA | 失败（旧审查不算） |
 | 仍有未解决 Codex 行内线程 | 失败 |
@@ -77,7 +77,7 @@ Codex 只发 issue comment（`<!-- codex-pull-request-review-summary -->`）和�
 
 `.github/workflows/auto-merge.yml` 只在**同时**满足时 squash 进 `main`：
 
-1. PR 打开、非 draft、base 为 `main`
+1. PR 打开、非 draft、base 为 `main`、无 `no-auto-merge` / `skip-codex-gate`
 2. 没有 `no-auto-merge` label
 3. head SHA 上有成功的 **`Build & Test` check run**（fail closed；不用 legacy combined status）
 4. 相关 check 已完成且未失败（忽略 Custom LLM Review、Auto Merge 自己）。同名 check 只看最新 `created_at`

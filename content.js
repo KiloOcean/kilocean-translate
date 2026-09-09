@@ -17,9 +17,10 @@
     "ARTICLE", "SECTION", "HEADER", "FOOTER", "ASIDE", "MAIN"
   ]);
 
-  /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement, companion: HTMLElement}>} */
+  /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, companion: HTMLElement, layout: string}>} */
   const blockRecords = new Map();
   const pendingRoots = new Set();
+  const pendingRefreshBlocks = new Set();
 
   let mutationObserver = null;
   let dynamicTimer = null;
@@ -29,6 +30,7 @@
   let selectionTimer = null;
   let selectionGeneration = 0;
   let styleHost = null;
+  let applyingDom = false;
 
   const state = {
     active: false,
@@ -46,19 +48,37 @@
   applyDocumentDisplayMode(state.displayMode);
   setupSelectionTranslate();
 
-  chrome.storage.local.get({ displayMode: Utils.DISPLAY_MODES.bilingual }, (stored) => {
+  chrome.storage.local.get({
+    displayMode: Utils.DISPLAY_MODES.bilingual,
+    targetLanguage: state.targetLanguage,
+    model: state.model
+  }, (stored) => {
     state.displayMode = Utils.normalizeDisplayMode(stored.displayMode);
+    if (stored.targetLanguage) {
+      state.targetLanguage = stored.targetLanguage;
+    }
+    if (stored.model) {
+      state.model = stored.model;
+    }
     applyDocumentDisplayMode(state.displayMode);
     refreshAllBlockDisplays();
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "local" || !changes.displayMode) {
+    if (area !== "local") {
       return;
     }
-    state.displayMode = Utils.normalizeDisplayMode(changes.displayMode.newValue);
-    applyDocumentDisplayMode(state.displayMode);
-    refreshAllBlockDisplays();
+    if (changes.displayMode) {
+      state.displayMode = Utils.normalizeDisplayMode(changes.displayMode.newValue);
+      applyDocumentDisplayMode(state.displayMode);
+      refreshAllBlockDisplays();
+    }
+    if (changes.targetLanguage?.newValue) {
+      state.targetLanguage = changes.targetLanguage.newValue;
+    }
+    if (changes.model?.newValue) {
+      state.model = changes.model.newValue;
+    }
   });
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -204,23 +224,47 @@
   }
 
   function teardownBlockRecord(record) {
-    if (!record?.block?.isConnected) {
-      record?.companion?.remove();
+    if (!record) {
       return;
     }
 
-    const { block, wrap, companion } = record;
-    companion?.remove();
-
-    if (wrap?.isConnected && wrap.parentNode === block) {
-      while (wrap.firstChild) {
-        block.insertBefore(wrap.firstChild, wrap);
+    const prev = applyingDom;
+    applyingDom = true;
+    try {
+      if (!record.block?.isConnected) {
+        record.companion?.remove();
+        return;
       }
-      wrap.remove();
-    }
 
-    block.removeAttribute("data-kilocean-block");
-    block.removeAttribute("data-kilocean-display");
+      const { block, wrap, companion } = record;
+      companion?.remove();
+
+      if (wrap?.isConnected && wrap.parentNode === block) {
+        while (wrap.firstChild) {
+          block.insertBefore(wrap.firstChild, wrap);
+        }
+        wrap.remove();
+      }
+
+      block.removeAttribute("data-kilocean-block");
+      block.removeAttribute("data-kilocean-display");
+      block.removeAttribute("data-kilocean-layout");
+    } finally {
+      applyingDom = prev;
+    }
+  }
+
+  function pruneDetachedBlockRecords() {
+    for (const [block, record] of [...blockRecords.entries()]) {
+      if (block.isConnected) {
+        continue;
+      }
+      teardownBlockRecord(record);
+      blockRecords.delete(block);
+      if (state.translated > 0) {
+        state.translated -= 1;
+      }
+    }
   }
 
   function collectBlocks(root) {
@@ -233,14 +277,18 @@
       if (!block || seen.has(block) || blockRecords.has(block)) {
         continue;
       }
-      if (!extractBlockText(block)) {
+      const fullText = extractBlockText(block);
+      if (!fullText || !Utils.isTranslatableText(fullText, state.targetLanguage)) {
         continue;
       }
       seen.add(block);
       blocks.push(block);
     }
 
-    return blocks;
+    // Prefer deepest blocks so ancestor+descendant pairs are not both translated.
+    return blocks.filter(
+      (block) => !blocks.some((other) => other !== block && block.contains(other))
+    );
   }
 
   function collectTextNodes(root) {
@@ -272,26 +320,87 @@
     return nodes;
   }
 
+  function isHiddenElement(el) {
+    if (!el) {
+      return true;
+    }
+    const style = getComputedStyle(el);
+    return style.display === "none" || style.visibility === "hidden";
+  }
+
+  function isFlexOrGridDisplay(display) {
+    return display === "flex" || display === "grid" || display === "inline-flex" || display === "inline-grid";
+  }
+
+  function isFlexOrGridElement(el) {
+    return Boolean(el) && isFlexOrGridDisplay(getComputedStyle(el).display);
+  }
+
+  function isTranslatorUiElement(el) {
+    return Boolean(el?.closest?.("[data-deepseek-translator-ui]"));
+  }
+
+  function isEligibleTextHost(parent, { skipRecordedBlock = true } = {}) {
+    if (!parent) {
+      return false;
+    }
+    if (BLOCKED_TAGS.has(parent.tagName)) {
+      return false;
+    }
+    if (parent.closest('[translate="no"], [contenteditable="true"], [data-deepseek-translator-ui]')) {
+      return false;
+    }
+    if (skipRecordedBlock && parent.closest("[data-kilocean-block]")) {
+      return false;
+    }
+    return !isHiddenElement(parent);
+  }
+
   function shouldTranslateTextNode(node) {
     if (!node?.parentElement) {
       return false;
     }
-
-    const parent = node.parentElement;
-    if (BLOCKED_TAGS.has(parent.tagName)) {
+    if (!isEligibleTextHost(node.parentElement, { skipRecordedBlock: true })) {
       return false;
     }
+    return Utils.isTranslatableText(node.data, state.targetLanguage);
+  }
 
-    if (parent.closest('[translate="no"], [contenteditable="true"], [data-deepseek-translator-ui], [data-kilocean-block]')) {
-      return false;
+  function collectRawTextNodes(root) {
+    if (!root || !root.isConnected) {
+      return [];
     }
 
-    if (!Utils.isTranslatableText(node.data, state.targetLanguage)) {
-      return false;
+    if (root.nodeType === Node.TEXT_NODE) {
+      const parent = root.parentElement;
+      if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || isHiddenElement(parent)) {
+        return [];
+      }
+      if (parent.closest('[translate="no"], [contenteditable="true"]')) {
+        return [];
+      }
+      return root.data?.trim() ? [root] : [];
     }
 
-    const style = getComputedStyle(parent);
-    return style.display !== "none" && style.visibility !== "hidden";
+    const nodes = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const parent = node.parentElement;
+        if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || isHiddenElement(parent)) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        if (parent.closest('[translate="no"], [contenteditable="true"]')) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return node.data?.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      }
+    });
+
+    let node;
+    while ((node = walker.nextNode())) {
+      nodes.push(node);
+    }
+    return nodes;
   }
 
   function getBlockAncestor(node) {
@@ -304,16 +413,25 @@
         return el;
       }
       const display = getComputedStyle(el).display;
-      if (display === "block" || display === "list-item" || display === "table-cell" || display === "flex" || display === "grid") {
+      // Never promote flex/grid containers to wrap hosts — that collapses items.
+      if (isFlexOrGridDisplay(display)) {
+        el = el.parentElement;
+        continue;
+      }
+      if (display === "block" || display === "list-item" || display === "table-cell") {
         return el;
       }
       el = el.parentElement;
     }
-    return node.parentElement;
+    const fallback = node.parentElement;
+    if (fallback && isFlexOrGridElement(fallback)) {
+      return fallback;
+    }
+    return fallback;
   }
 
   function extractBlockText(block) {
-    const nodes = collectTextNodes(block);
+    const nodes = collectRawTextNodes(block);
     if (nodes.length === 0) {
       return "";
     }
@@ -322,7 +440,11 @@
 
   async function translateBlocks(blocks, runId, isDynamic) {
     const uniqueBlocks = [...new Set(blocks)].filter((block) => {
-      return block?.isConnected && !blockRecords.has(block) && Boolean(extractBlockText(block));
+      if (!block?.isConnected || blockRecords.has(block)) {
+        return false;
+      }
+      const fullText = extractBlockText(block);
+      return Boolean(fullText) && Utils.isTranslatableText(fullText, state.targetLanguage);
     });
 
     if (uniqueBlocks.length === 0 || runId !== generation) {
@@ -411,37 +533,55 @@
       return;
     }
 
-    const inlineHosts = new Set([
-      "P", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "DT", "DD",
-      "FIGCAPTION", "TD", "TH", "CAPTION", "SUMMARY", "A", "SPAN", "LABEL"
-    ]);
-    const wrapTag = inlineHosts.has(block.tagName) ? "span" : "div";
-    const wrap = document.createElement(wrapTag);
-    wrap.className = "kilocean-original-wrap";
-    wrap.setAttribute("data-deepseek-translator-ui", "true");
-    while (block.firstChild) {
-      wrap.appendChild(block.firstChild);
+    const prev = applyingDom;
+    applyingDom = true;
+    try {
+      const inlineHosts = new Set([
+        "P", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "DT", "DD",
+        "FIGCAPTION", "TD", "TH", "CAPTION", "SUMMARY", "A", "SPAN", "LABEL"
+      ]);
+      const wrapTag = inlineHosts.has(block.tagName) ? "span" : "div";
+      const flowLayout = isFlexOrGridElement(block);
+      let wrap = null;
+
+      const companion = document.createElement(wrapTag);
+      companion.className = "kilocean-translation";
+      companion.setAttribute("data-deepseek-translator-ui", "true");
+      companion.setAttribute("lang", state.targetLanguage);
+      companion.textContent = translation;
+
+      if (flowLayout) {
+        // Preserve flex/grid item structure: do not wrap existing children.
+        companion.classList.add("kilocean-translation--flow");
+        block.appendChild(companion);
+        block.setAttribute("data-kilocean-layout", "flow");
+      } else {
+        wrap = document.createElement(wrapTag);
+        wrap.className = "kilocean-original-wrap";
+        wrap.setAttribute("data-deepseek-translator-ui", "true");
+        while (block.firstChild) {
+          wrap.appendChild(block.firstChild);
+        }
+        block.appendChild(wrap);
+        block.appendChild(companion);
+        block.setAttribute("data-kilocean-layout", "wrap");
+      }
+
+      block.setAttribute("data-kilocean-block", "true");
+
+      const record = {
+        block,
+        originalText,
+        translation,
+        wrap,
+        companion,
+        layout: flowLayout ? "flow" : "wrap"
+      };
+      blockRecords.set(block, record);
+      applyBlockDisplay(record);
+    } finally {
+      applyingDom = prev;
     }
-    block.appendChild(wrap);
-
-    const companion = document.createElement(wrapTag);
-    companion.className = "kilocean-translation";
-    companion.setAttribute("data-deepseek-translator-ui", "true");
-    companion.setAttribute("lang", state.targetLanguage);
-    companion.textContent = translation;
-    block.appendChild(companion);
-
-    block.setAttribute("data-kilocean-block", "true");
-
-    const record = {
-      block,
-      originalText,
-      translation,
-      wrap,
-      companion
-    };
-    blockRecords.set(block, record);
-    applyBlockDisplay(record);
   }
 
   function applyBlockDisplay(record) {
@@ -478,6 +618,13 @@
         line-height: inherit;
         white-space: pre-wrap;
       }
+      [data-kilocean-block][data-kilocean-layout="flow"] > .kilocean-translation--flow {
+        flex: 0 0 100%;
+        width: 100%;
+        max-width: 100%;
+        grid-column: 1 / -1;
+        box-sizing: border-box;
+      }
       html[data-kilocean-display="bilingual"] [data-kilocean-block] > .kilocean-original-wrap {
         display: contents;
       }
@@ -486,6 +633,9 @@
         opacity: 0.96;
       }
       html[data-kilocean-display="translation-only"] [data-kilocean-block] > .kilocean-original-wrap {
+        display: none !important;
+      }
+      html[data-kilocean-display="translation-only"] [data-kilocean-block][data-kilocean-layout="flow"] > :not(.kilocean-translation) {
         display: none !important;
       }
       html[data-kilocean-display="translation-only"] [data-kilocean-block] > .kilocean-translation {
@@ -507,17 +657,26 @@
   function startObserving() {
     stopObserving();
     mutationObserver = new MutationObserver((records) => {
-      if (!state.active) {
+      if (!state.active || applyingDom) {
         return;
       }
 
       for (const record of records) {
         if (record.type === "childList") {
+          if (record.removedNodes.length > 0) {
+            pruneDetachedBlockRecords();
+          }
           record.addedNodes.forEach((node) => {
             if (node.nodeType === Node.ELEMENT_NODE && node.closest?.("[data-deepseek-translator-ui]")) {
               return;
             }
-            if (node.parentElement?.closest?.("[data-kilocean-block]")) {
+            if (node.parentElement?.closest?.("[data-deepseek-translator-ui]")) {
+              return;
+            }
+            const host = (node.nodeType === Node.ELEMENT_NODE ? node.parentElement : node.parentElement)
+              ?.closest?.("[data-kilocean-block]");
+            if (host && blockRecords.has(host)) {
+              pendingRefreshBlocks.add(host);
               return;
             }
             pendingRoots.add(node);
@@ -527,8 +686,12 @@
 
         if (record.type === "characterData") {
           const node = record.target;
-          const block = getBlockAncestor(node);
-          if (block && blockRecords.has(block)) {
+          if (node.parentElement?.closest?.("[data-deepseek-translator-ui]")) {
+            continue;
+          }
+          const host = node.parentElement?.closest?.("[data-kilocean-block]");
+          if (host && blockRecords.has(host)) {
+            pendingRefreshBlocks.add(host);
             continue;
           }
           pendingRoots.add(node);
@@ -560,6 +723,23 @@
     }
     dynamicTimer = setTimeout(() => {
       dynamicTimer = null;
+      pruneDetachedBlockRecords();
+
+      for (const block of pendingRefreshBlocks) {
+        const record = blockRecords.get(block);
+        if (record) {
+          teardownBlockRecord(record);
+          blockRecords.delete(block);
+          if (state.translated > 0) {
+            state.translated -= 1;
+          }
+        }
+        if (block?.isConnected) {
+          pendingRoots.add(block);
+        }
+      }
+      pendingRefreshBlocks.clear();
+
       const roots = [...pendingRoots];
       pendingRoots.clear();
       const blocks = roots.flatMap((root) => collectBlocks(root));
@@ -595,8 +775,9 @@
 
     const clone = document.documentElement.cloneNode(true);
     clone.querySelectorAll(
-      "script, iframe, object, embed, #deepseek-translator-toast-host, #kilocean-selection-host, #kilocean-translator-style"
+      "script, iframe, object, embed, #deepseek-translator-toast-host, #kilocean-selection-host"
     ).forEach((element) => element.remove());
+    // Keep #kilocean-translator-style so exported HTML honors data-kilocean-display.
     clone.querySelectorAll('meta[http-equiv="Content-Security-Policy" i], base').forEach((element) => element.remove());
 
     for (const element of clone.querySelectorAll("*")) {
@@ -764,6 +945,7 @@
   async function handleSelectionTranslate(event) {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+      hideSelectionPanel();
       return;
     }
 
@@ -773,10 +955,6 @@
     }
 
     if (isSelectionInsideTranslatorUi(selection, event)) {
-      return;
-    }
-
-    if (!Utils.isTranslatableText(text, state.targetLanguage)) {
       return;
     }
 
@@ -795,10 +973,6 @@
     selectionGeneration += 1;
     const requestId = selectionGeneration;
 
-    const panel = ensureSelectionPanel();
-    positionSelectionPanel(panel, rect);
-    setSelectionPanelState(panel, "loading", "正在翻译选中文本…");
-
     try {
       const stored = await chrome.storage.local.get({
         targetLanguage: state.targetLanguage,
@@ -810,13 +984,24 @@
         return;
       }
 
+      const targetLanguage = stored.targetLanguage || state.targetLanguage;
+      const model = stored.model || state.model;
+      state.targetLanguage = targetLanguage;
+      state.model = model;
+
+      if (!Utils.isTranslatableText(text, targetLanguage)) {
+        return;
+      }
+
+      const panel = ensureSelectionPanel();
+      positionSelectionPanel(panel, rect);
+      setSelectionPanelState(panel, "loading", "正在翻译选中文本…");
+
       if (!String(stored.apiKey || "").trim()) {
         setSelectionPanelState(panel, "error", "请先在扩展弹窗中填写 API Key");
         return;
       }
 
-      const targetLanguage = stored.targetLanguage || state.targetLanguage;
-      const model = stored.model || state.model;
       const response = await chrome.runtime.sendMessage({
         type: "TRANSLATE_BATCH",
         texts: [text],
@@ -842,6 +1027,7 @@
       if (requestId !== selectionGeneration) {
         return;
       }
+      const panel = ensureSelectionPanel();
       setSelectionPanelState(panel, "error", error.message || "翻译失败");
     }
   }

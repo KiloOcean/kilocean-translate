@@ -216,21 +216,27 @@ jobs:
           - [ ] Medium | 中  
           - [x] Low | 低"
 
+          # Build the request with jq so PR titles/diffs with quotes/newlines stay valid JSON.
+          PAYLOAD=$(jq -n \
+            --arg model "$MODEL" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg title "$PR_TITLE" \
+            --rawfile files changed_files.txt \
+            --rawfile diff pr_diff.txt \
+            '{
+              model: $model,
+              messages: [
+                {role: "system", content: $system},
+                {role: "user", content: ("Review PR: " + $title + "\n\nFiles:\n" + $files + "\n\nDiff:\n```\n" + $diff + "\n```")}
+              ],
+              max_tokens: 1500,
+              temperature: 0.3
+            }')
+
           RESPONSE=$(curl -s -X POST "$API_URL" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $API_KEY" \
-            -d @- <<EOF
-          {
-            "model": "$MODEL",
-            "messages": [
-              {"role": "system", "content": $(echo "$SYSTEM_PROMPT" | jq -Rs .)},
-              {"role": "user", "content": "Review PR: ${PR_TITLE}\n\nFiles:\n$(cat changed_files.txt)\n\nDiff:\n\`\`\`\n$(cat pr_diff.txt)\n\`\`\`"}
-            ],
-            "max_tokens": 1500,
-            "temperature": 0.3
-          }
-          EOF
-          )
+            -d "$PAYLOAD")
           
           CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
           
