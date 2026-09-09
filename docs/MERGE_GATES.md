@@ -58,7 +58,7 @@ Codex 只发 issue comment（`<!-- codex-pull-request-review-summary -->`）和�
 
 | 情况 | 结果 |
 |------|------|
-| Label `skip-codex-gate` | **失败**，不 dispatch Auto Merge（仅人工/admin 逃生舱文档；绝不能让 Gate 变 success） |
+| Label `skip-codex-gate` | **失败**，不触发 Auto Merge（仅人工/admin 逃生舱文档；绝不能让 Gate 变 success） |
 | Draft | 通过（ready 后重跑） |
 | 尚无 Summary，head 未满约 20 分钟 | 失败（等待） |
 | 20 分钟内从未发 Summary | 失败（`@codex review`；`skip-codex-gate` 会失败 Gate 并挡住自动合入） |
@@ -67,7 +67,17 @@ Codex 只发 issue comment（`<!-- codex-pull-request-review-summary -->`）和�
 | 仍有未解决 Codex 行内线程 | 失败 |
 | 完成且 0 未解决 Codex 线程 | 通过 |
 
-点 Resolve 不会自动重跑。清完线程后：Actions 里 **Re-run** `Codex Review Gate`，或 `workflow_dispatch` 填 PR 号。
+### 权限 / 安全 | Permissions / security
+
+Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有** `checks: write` 或 `actions: write`。
+
+- **不要**把 Gate 改成 `pull_request_target` 并 checkout PR 代码（经典 RCE）。
+- 同仓分支上的 `pull_request` 仍会跑 PR 版 workflow YAML，但无写权限时无法伪造 Checks API 绿勾，也无法 `workflow_dispatch` Auto Merge。
+- **`pull_request` 事件**：job conclusion 会把 check 名 `Codex Review Gate` 挂到 head SHA（branch protection / Auto Merge 认这个）。
+- **`issue_comment` / `pull_request_review` / `pull_request_review_comment` / `workflow_dispatch`**：仍会跑评估并在 Actions UI 显示 run，但**不会**再往 head SHA 单独 `checks.create`。要刷新 required check：对上一次 **`pull_request` 来源**的 Gate job 点 **Re-run**（或再 push / synchronize）。
+- Auto Merge 已监听 `workflow_run`（workflow 名 `Codex Review Gate`）；Gate **不必**自己 dispatch Auto Merge。
+
+点 Resolve 不会自动重跑。清完线程后：Actions 里对 **pull_request 来源**的 `Codex Review Gate` 点 **Re-run**（重新挂 check 到 head SHA）。Gate 已绿时也可对 Auto Merge 做 `workflow_dispatch`。
 
 **前置：** org/repo 需安装 ChatGPT Codex connector（或等价 Codex GitHub App）。
 
@@ -93,7 +103,7 @@ Codex 只发 issue comment（`<!-- codex-pull-request-review-summary -->`）和�
 
 `workflow_run` 只从 **default branch** 上的工作流定义运行。本文件合入 `main` 之后，后续 PR 才吃到新门槛。
 
-线程 Resolve 后 GitHub **不会**再触发 auto-merge → Actions 对 **Auto Merge** 跑 `workflow_dispatch`。
+线程 Resolve 后 GitHub **不会**再触发 auto-merge：先 **Re-run** 一次 `pull_request` 来源的 `Codex Review Gate`（刷新 head 上的 required check），或在 Gate 已绿时对 **Auto Merge** 跑 `workflow_dispatch`。
 
 ---
 

@@ -26,10 +26,11 @@
 # checks, missing Copilot review, CHANGES_REQUESTED, unresolved threads.
 #
 # Re-evaluates when CI succeeds, when Copilot submits a review, when
-# Codex Review Gate succeeds (workflow_run, or workflow_dispatch from
-# that workflow), or manual dispatch.
+# Codex Review Gate succeeds (workflow_run), or manual dispatch.
+# Codex Gate does not dispatch this workflow (Gate is read-only).
 # Note: workflow_run only runs from the default branch once this file is merged.
-# After resolving threads, re-run this workflow (workflow_dispatch) —
+# After resolving threads, re-run a pull_request-originated Codex Review Gate
+# job (to refresh the head check), and/or workflow_dispatch this workflow —
 # thread resolution does not emit a workflow event.
 
 name: Auto Merge
