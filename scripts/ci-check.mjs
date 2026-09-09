@@ -131,6 +131,119 @@ function checkStaticBans(rel) {
   }
 }
 
+function extractContentFunction(name) {
+  // Pull a top-level (2-space indented) function body out of the content.js
+  // IIFE so unit tests run the shipping implementation without exports.
+  const source = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
+  const match = source.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n  \\}`));
+  return match ? match[0] : null;
+}
+
+function checkSegmentSplitLogic() {
+  const splitFnSource = extractContentFunction("findSegmentSplitIndex");
+  if (!splitFnSource) {
+    fail("content.js: cannot extract findSegmentSplitIndex for split-logic test");
+    return;
+  }
+
+  let findSegmentSplitIndex;
+  try {
+    findSegmentSplitIndex = new Function(`${splitFnSource}\nreturn findSegmentSplitIndex;`)();
+  } catch (error) {
+    fail(`content.js: findSegmentSplitIndex is not runnable standalone: ${error.message}`);
+    return;
+  }
+
+  // Length < 2 cannot be split.
+  if (findSegmentSplitIndex("") !== -1 || findSegmentSplitIndex("a") !== -1) {
+    fail("findSegmentSplitIndex: length < 2 must return -1");
+  }
+
+  // \n\n paragraph break near mid wins: split right after the blank line.
+  const paraText = `${"甲".repeat(2400)}\n\n${"乙".repeat(2400)}`;
+  const paraAt = findSegmentSplitIndex(paraText);
+  if (paraAt !== 2402 || !paraText.slice(0, paraAt).endsWith("\n\n")) {
+    fail(`findSegmentSplitIndex: expected paragraph split at 2402, got ${paraAt}`);
+  }
+
+  // A single \n is preferred over a space.
+  const lineText = `${"A".repeat(100)}\n${"B".repeat(50)} ${"C".repeat(50)}`;
+  const lineAt = findSegmentSplitIndex(lineText);
+  if (lineAt !== 101) {
+    fail(`findSegmentSplitIndex: expected newline split at 101, got ${lineAt}`);
+  }
+
+  // Whitespace fallback still applies when no newline exists.
+  const spaceText = `${"A".repeat(50)} ${"B".repeat(51)}`;
+  const spaceAt = findSegmentSplitIndex(spaceText);
+  if (spaceAt !== 51) {
+    fail(`findSegmentSplitIndex: expected whitespace split at 51, got ${spaceAt}`);
+  }
+
+  // No whitespace at all: fall back to the midpoint.
+  const denseAt = findSegmentSplitIndex("字".repeat(101));
+  if (denseAt !== 51) {
+    fail(`findSegmentSplitIndex: expected midpoint split at 51, got ${denseAt}`);
+  }
+
+  // Midpoint must never land between a UTF-16 surrogate pair (emoji).
+  const emoji = "😀"; // one astral char = high+low surrogates
+  const emojiText = `${"字".repeat(50)}${emoji}${"字".repeat(50)}`;
+  const emojiAt = findSegmentSplitIndex(emojiText);
+  const prevCode = emojiText.charCodeAt(emojiAt - 1);
+  const currCode = emojiText.charCodeAt(emojiAt);
+  const betweenPair =
+    prevCode >= 0xD800 && prevCode <= 0xDBFF && currCode >= 0xDC00 && currCode <= 0xDFFF;
+  if (betweenPair) {
+    fail(`findSegmentSplitIndex: split ${emojiAt} lands between surrogate pair`);
+  }
+  if (emojiAt !== 50 && emojiAt !== 52) {
+    fail(`findSegmentSplitIndex: expected emoji-safe split at 50 or 52, got ${emojiAt}`);
+  }
+
+  // Oversized X-style post (single ~9k span, \n\n paragraphs): recursive
+  // pre-split must bisect BEFORE any request, keep every piece <= 5000, and
+  // cut only on paragraph boundaries.
+  const splitFn = extractContentFunction("translateSegmentTextWithSplit");
+  if (!splitFn) {
+    fail("content.js: cannot extract translateSegmentTextWithSplit for split-logic test");
+    return;
+  }
+  const firstSplit = splitFn.indexOf("findSegmentSplitIndex");
+  const firstRequest = splitFn.indexOf("requestSegmentTranslations");
+  if (firstSplit < 0 || firstRequest < 0 || firstSplit > firstRequest) {
+    fail("content.js: translateSegmentTextWithSplit must split oversized text before the first TRANSLATE_BATCH request");
+  }
+
+  const longPost = Array.from({ length: 60 }, (_, i) => `第${i}段${"内容".repeat(73)}`).join("\n\n");
+  const splitIntoPieces = (text) => {
+    if (text.length <= 5000) {
+      return [text];
+    }
+    const at = findSegmentSplitIndex(text);
+    if (at < 1 || at >= text.length) {
+      return [text];
+    }
+    return [...splitIntoPieces(text.slice(0, at)), ...splitIntoPieces(text.slice(at))];
+  };
+  const pieces = splitIntoPieces(longPost);
+  if (longPost.length <= 5000) {
+    fail("split-logic fixture must be oversized");
+  }
+  if (pieces.length < 2) {
+    fail("oversized text must be split into at least two pieces");
+  }
+  if (pieces.some((piece) => piece.length > 5000)) {
+    fail(`oversized split produced a piece > 5000 chars (lengths: ${pieces.map((p) => p.length).join(",")})`);
+  }
+  if (pieces.join("") !== longPost) {
+    fail("oversized split lost or duplicated characters");
+  }
+  if (pieces.slice(0, -1).some((piece) => !piece.endsWith("\n\n"))) {
+    fail("oversized split did not respect \\n\\n paragraph boundaries");
+  }
+}
+
 function main() {
   console.log("kilocean-translate ci-check");
   console.log(`root: ${ROOT}`);
@@ -142,6 +255,8 @@ function main() {
     checkStaticBans(file);
   }
 
+  checkSegmentSplitLogic();
+
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
     for (const err of errors) {
@@ -150,7 +265,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic");
   process.exit(0);
 }
 

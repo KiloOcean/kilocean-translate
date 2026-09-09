@@ -756,18 +756,59 @@
       return -1;
     }
     const mid = Math.ceil(length / 2);
-    const window = Math.min(240, Math.floor(length / 4));
-    for (let distance = 0; distance <= window; distance += 1) {
-      for (const index of [mid - distance, mid + distance]) {
-        if (index <= 0 || index >= length) {
-          continue;
+    const window = Math.min(Math.max(240, Math.floor(length / 4)), Math.floor(length / 2));
+
+    // Never land between a UTF-16 high/low surrogate (emoji / astral chars).
+    function adjustSplitAwayFromSurrogatePair(index) {
+      if (index <= 0 || index >= length) {
+        return index;
+      }
+      const prev = text.charCodeAt(index - 1);
+      const curr = text.charCodeAt(index);
+      if (prev >= 0xD800 && prev <= 0xDBFF && curr >= 0xDC00 && curr <= 0xDFFF) {
+        if (index + 1 < length) {
+          return index + 1;
         }
-        if (/\s/u.test(text[index - 1]) || /\s/u.test(text[index])) {
-          return index;
+        return index - 1;
+      }
+      return index;
+    }
+
+    // Scan outward from the midpoint, alternating sides, so the first index
+    // matching a predicate is also the most balanced split that satisfies it.
+    function findNearMid(predicate) {
+      for (let distance = 0; distance <= window; distance += 1) {
+        for (const index of [mid - distance, mid + distance]) {
+          if (index <= 0 || index >= length) {
+            continue;
+          }
+          if (predicate(index)) {
+            return index;
+          }
         }
       }
+      return -1;
     }
-    return mid;
+
+    // X-style long posts are one span with \n\n paragraph breaks: prefer
+    // splitting right after a blank line so halves keep whole paragraphs.
+    let splitAt = findNearMid((index) => index >= 2 && text.slice(index - 2, index) === "\n\n");
+    if (splitAt > 0) {
+      return adjustSplitAwayFromSurrogatePair(splitAt);
+    }
+
+    // Then a single line break, then any whitespace, then a raw midpoint cut.
+    splitAt = findNearMid((index) => text[index - 1] === "\n");
+    if (splitAt > 0) {
+      return adjustSplitAwayFromSurrogatePair(splitAt);
+    }
+
+    splitAt = findNearMid((index) => /\s/u.test(text[index - 1]) || /\s/u.test(text[index]));
+    if (splitAt > 0) {
+      return adjustSplitAwayFromSurrogatePair(splitAt);
+    }
+
+    return adjustSplitAwayFromSurrogatePair(mid);
   }
 
   async function requestSegmentTranslations(texts, runId, runSettings) {
@@ -825,6 +866,33 @@
   }
 
   async function translateSegmentTextWithSplit(text, runId, runSettings) {
+    // Proactively bisect oversized text before any request: a whole-body
+    // TRANSLATE_BATCH can fail with a non-canSplit error (X long posts are a
+    // single ~9k-char span), which would leave the body untranslated.
+    if (text.length > 5000) {
+      const splitAt = findSegmentSplitIndex(text);
+      if (splitAt < 1 || splitAt >= text.length) {
+        // Cannot split further — attempt once (may still fail).
+        const translations = await requestSegmentTranslations([text], runId, runSettings);
+        if (!translations) {
+          return null;
+        }
+        return String(translations[0] || "");
+      }
+      const leftSource = text.slice(0, splitAt);
+      const rightSource = text.slice(splitAt);
+      const left = await translateSegmentTextWithSplit(leftSource, runId, runSettings);
+      if (left == null || runId !== generation) {
+        return null;
+      }
+      const right = await translateSegmentTextWithSplit(rightSource, runId, runSettings);
+      if (right == null || runId !== generation) {
+        return null;
+      }
+      // Preserve boundary whitespace from the original slice join.
+      return joinSplitTranslations(left, right, leftSource, rightSource, runSettings.targetLanguage);
+    }
+
     try {
       const translations = await requestSegmentTranslations([text], runId, runSettings);
       if (!translations) {
@@ -1354,8 +1422,13 @@
             }
             pruneDetachedBlockRecords();
             // Removal-only SPA updates never appear in addedNodes — refresh via target.
+            // Connected recorded blocks in removedNodes are moves/reparents
+            // (same spirit as the addedNodes move guard) — do not queue the
+            // ancestor for teardown/rebill when source is unchanged.
             const removedOnlyUi = [...record.removedNodes].every((node) =>
-              isIgnoredTranslatorMutation(node) || isReparentIntoOriginalWrap(node)
+              isIgnoredTranslatorMutation(node) ||
+              isReparentIntoOriginalWrap(node) ||
+              (node.nodeType === Node.ELEMENT_NODE && blockRecords.has(node) && node.isConnected)
             );
             if (!removedOnlyUi) {
               const refreshHost = findRefreshHostForMutation(record.target);
@@ -1823,6 +1896,10 @@
       const postNetworkText = postNetworkSel.toString().replace(/\s+/gu, " ").trim();
       const postNetworkRangeId = getSelectionRangeIdentity(postNetworkSel);
       if (postNetworkText !== text || postNetworkRangeId !== liveRangeId) {
+        // Page script changed the range without a handled input event — clear
+        // the claimed key and hide the stuck loading panel (same as collapse).
+        lastSelectionKey = "";
+        hideSelectionPanel();
         return;
       }
       if (postNetworkText.length < 2 || postNetworkText.length > 5000) {
