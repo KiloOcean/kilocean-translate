@@ -16,6 +16,10 @@
     "FIGCAPTION", "DT", "DD", "SUMMARY", "CAPTION", "TD", "TH",
     "ARTICLE", "SECTION", "HEADER", "FOOTER", "ASIDE", "MAIN"
   ]);
+  // Nested interactive labels must stay visible/usable in translation-only mode.
+  const INTERACTIVE_TAGS = new Set([
+    "A", "BUTTON", "SUMMARY", "LABEL", "SELECT", "OPTION", "TEXTAREA", "INPUT"
+  ]);
 
   /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, wraps: HTMLElement[], companion: HTMLElement, layout: string}>} */
   const blockRecords = new Map();
@@ -29,8 +33,10 @@
   let toastTimer = null;
   let selectionTimer = null;
   let selectionGeneration = 0;
-  /** Last selection translate key (target\0model\0text) to avoid rebill on Shift release. */
+  /** Last selection translate key (target\0model\0text\0range) to avoid rebill on Shift release. */
   let lastSelectionKey = "";
+  let nextSelectionNodeId = 1;
+  const selectionNodeIds = new WeakMap();
   let styleHost = null;
   let applyingDom = false;
   let applyingDomGeneration = 0;
@@ -227,7 +233,11 @@
       return;
     }
 
-    await translateBlocks(blocks, runId, false);
+    // Serialize on workQueue so a mid-run dynamic job cannot publish a terminal
+    // phase (and enable export) while initial batches are still in flight.
+    const initialJob = workQueue.then(() => translateBlocks(blocks, runId, false));
+    workQueue = initialJob.catch(() => {});
+    await initialJob;
     if (runId !== generation) {
       return;
     }
@@ -507,7 +517,7 @@
     return Boolean(el?.closest?.("[data-deepseek-translator-ui]"));
   }
 
-  function isEligibleTextHost(parent, { skipRecordedBlock = true } = {}) {
+  function isEligibleTextHost(parent) {
     if (!parent) {
       return false;
     }
@@ -517,9 +527,6 @@
     if (parent.closest('[translate="no"], [contenteditable="true"], [data-deepseek-translator-ui]')) {
       return false;
     }
-    if (skipRecordedBlock && parent.closest("[data-kilocean-block]")) {
-      return false;
-    }
     return !isHiddenElement(parent);
   }
 
@@ -527,7 +534,14 @@
     if (!node?.parentElement) {
       return false;
     }
-    if (!isEligibleTextHost(node.parentElement, { skipRecordedBlock: true })) {
+    if (!isEligibleTextHost(node.parentElement)) {
+      return false;
+    }
+    // Skip only when the nearest block ancestor still has a live record.
+    // A torn-down nested block under a recorded ancestor must stay collectible
+    // (closest("[data-kilocean-block]") alone would permanently exclude it).
+    const block = getBlockAncestor(node);
+    if (block && blockRecords.has(block)) {
       return false;
     }
     // Discover any non-empty visible fragment here; isTranslatableText applies
@@ -921,12 +935,26 @@
     }
   }
 
+  function isInsideInteractiveDescendant(node, block) {
+    let el = node?.parentElement;
+    while (el && el !== block) {
+      if (INTERACTIVE_TAGS.has(el.tagName)) {
+        return true;
+      }
+      el = el.parentElement;
+    }
+    return false;
+  }
+
   function wrapTextNodesForToggle(block, nestedBlocks, wrapTag) {
     // Wrap text nodes only — never reparent element children — so selectors
     // like `p > a` and interactive descendants stay intact.
+    // Also skip text inside nested interactive elements: translation-only hides
+    // wraps, and the companion sits outside the control, which would blank labels.
     const nested = (nestedBlocks || []).filter(Boolean);
     const textNodes = collectRawTextNodes(block).filter((node) => (
-      !nested.some((other) => other !== block && other.contains(node))
+      !nested.some((other) => other !== block && other.contains(node)) &&
+      !(block && !INTERACTIVE_TAGS.has(block.tagName) && isInsideInteractiveDescendant(node, block))
     ));
     let firstWrap = null;
     const wraps = [];
@@ -982,7 +1010,7 @@
       let createdWraps = [];
       let layout = "wrap";
 
-      const companion = document.createElement(wrapTag);
+      let companion = document.createElement(wrapTag);
       companion.className = "kilocean-translation";
       companion.setAttribute("data-deepseek-translator-ui", "true");
       companion.setAttribute("lang", getRunSettings().targetLanguage);
@@ -990,13 +1018,29 @@
 
       if (placement === "after-host" && block.parentNode && block !== document.body && block !== document.documentElement) {
         // nowrap flex: full-width flex item would squeeze siblings — place as block sibling.
-        // Still wrap owned text so translation-only can hide it without hiding
-        // page-owned images/inputs inside the host.
+        // Restricted parents (ul/ol/tr/…) need a valid sibling tag, or fall back in-host.
+        const afterTag = resolveAfterHostCompanionTag(block, wrapTag);
         ({ firstWrap: wrap, wraps: createdWraps } = wrapTextNodesForToggle(block, options.nested || [], wrapTag));
-        companion.classList.add("kilocean-translation--after");
-        block.parentNode.insertBefore(companion, block.nextSibling);
-        block.setAttribute("data-kilocean-layout", "after");
-        layout = "after";
+        if (!afterTag) {
+          companion.classList.add("kilocean-translation--flow");
+          block.appendChild(companion);
+          block.setAttribute("data-kilocean-layout", "flow");
+          layout = "flow";
+        } else {
+          if (afterTag !== companion.tagName) {
+            const replacement = document.createElement(afterTag);
+            replacement.className = companion.className;
+            for (const attr of companion.attributes) {
+              replacement.setAttribute(attr.name, attr.value);
+            }
+            replacement.textContent = companion.textContent;
+            companion = replacement;
+          }
+          companion.classList.add("kilocean-translation--after");
+          block.parentNode.insertBefore(companion, block.nextSibling);
+          block.setAttribute("data-kilocean-layout", "after");
+          layout = "after";
+        }
       } else if (placement === "companion") {
         // Nested ancestor with own text: wrap owned text nodes so translation-only
         // can hide them without reparenting nested block subtrees or interactive els.
@@ -1036,6 +1080,33 @@
       applyBlockDisplay(record);
     } finally {
       endApplyingDom(gen);
+    }
+  }
+
+  function resolveAfterHostCompanionTag(block, fallbackTag) {
+    const parent = block?.parentElement;
+    if (!parent) {
+      return null;
+    }
+    switch (parent.tagName) {
+      case "UL":
+      case "OL":
+      case "MENU":
+        return "LI";
+      case "TR":
+        return block.tagName === "TH" ? "TH" : "TD";
+      case "DL":
+        return block.tagName === "DT" ? "DD" : "DD";
+      case "TABLE":
+      case "THEAD":
+      case "TBODY":
+      case "TFOOT":
+      case "SELECT":
+      case "COLGROUP":
+        // No valid after-host sibling — caller keeps companion inside the host.
+        return null;
+      default:
+        return fallbackTag;
     }
   }
 
@@ -1106,6 +1177,9 @@
         border-top: 1px dashed rgba(112, 135, 255, 0.38);
         line-height: inherit;
         white-space: pre-wrap;
+      }
+      li.kilocean-translation--after {
+        list-style: none;
       }
       html[data-kilocean-display="bilingual"] [data-kilocean-block] [data-kilocean-original-wrap] {
         display: contents;
@@ -1532,6 +1606,8 @@
 
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+      // Real selection change (collapse / clear) — allow the same words again later.
+      lastSelectionKey = "";
       hideSelectionPanel();
       return;
     }
@@ -1586,7 +1662,9 @@
 
       // Deduplicate unchanged selections (e.g. standalone Shift release) before
       // bumping generation or issuing another billable TRANSLATE_BATCH.
-      const selectionKey = `${targetLanguage}\0${model}\0${text}`;
+      // Include range identity so the same words elsewhere (or a fresh re-select
+      // after collapse) still reopen/reposition the panel.
+      const selectionKey = `${targetLanguage}\0${model}\0${text}\0${getSelectionRangeIdentity(selection)}`;
       if (selectionKey === lastSelectionKey) {
         return;
       }
@@ -1761,6 +1839,33 @@
       source.textContent = "";
     }
     host.hidden = false;
+  }
+
+  function getSelectionNodeId(node) {
+    if (!node) {
+      return "0";
+    }
+    let id = selectionNodeIds.get(node);
+    if (!id) {
+      id = String(nextSelectionNodeId);
+      nextSelectionNodeId += 1;
+      selectionNodeIds.set(node, id);
+    }
+    return id;
+  }
+
+  function getSelectionRangeIdentity(selection) {
+    try {
+      const range = selection.getRangeAt(0);
+      return [
+        getSelectionNodeId(range.startContainer),
+        String(range.startOffset),
+        getSelectionNodeId(range.endContainer),
+        String(range.endOffset)
+      ].join(":");
+    } catch {
+      return "";
+    }
   }
 
   function hideSelectionPanel() {
