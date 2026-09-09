@@ -366,6 +366,73 @@ function checkSegmentSplitLogic() {
   }
 }
 
+
+function checkJoinSplitTranslations() {
+  const joinSrc = extractContentFunction("joinSplitTranslations");
+  const delimSrc = extractContentFunction("isWhitespaceDelimitedTarget");
+  if (!joinSrc || !delimSrc) {
+    fail("content.js: cannot extract joinSplitTranslations / isWhitespaceDelimitedTarget");
+    return;
+  }
+
+  let joinSplitTranslations;
+  try {
+    joinSplitTranslations = new Function(
+      `${delimSrc}\n${joinSrc}\nreturn joinSplitTranslations;`
+    )();
+  } catch (error) {
+    fail(`joinSplitTranslations extract failed: ${error.message}`);
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (actual !== expected) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // Blank-line boundary from left trail must rejoin with \\n\\n (not collapse to \\n).
+  assertEqual(
+    joinSplitTranslations("甲", "乙", "甲\n\n", "乙", "zh"),
+    "甲\n\n乙",
+    "joinSplitTranslations: preserve blank-line boundary"
+  );
+  assertEqual(
+    joinSplitTranslations("甲", "乙", "甲", "\n\n乙", "zh"),
+    "甲\n\n乙",
+    "joinSplitTranslations: preserve blank-line from right lead"
+  );
+
+  // Single newline boundary.
+  assertEqual(
+    joinSplitTranslations("甲", "乙", "甲\n", "乙", "zh"),
+    "甲\n乙",
+    "joinSplitTranslations: preserve single newline boundary"
+  );
+
+  // Space boundary.
+  assertEqual(
+    joinSplitTranslations("Hello", "world", "Hello ", "world", "en"),
+    "Hello world",
+    "joinSplitTranslations: space boundary"
+  );
+
+  // forceSplit: canSplit single-item fallback must bisect without re-requesting.
+  const content = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
+  const splitFn = extractContentFunction("translateSegmentTextWithSplit");
+  if (!splitFn || !/options\s*=\s*\{\s*\}/.test(splitFn) || !/options\.forceSplit/.test(splitFn)) {
+    fail("content.js: translateSegmentTextWithSplit must accept options.forceSplit and bisect immediately");
+  }
+  // Single-item canSplit path must pass { forceSplit: true }.
+  if (!/error\.canSplit\s*&&\s*batch\.length\s*===\s*1[\s\S]*?forceSplit:\s*true/.test(content)) {
+    fail("content.js: canSplit single-item fallback must call translateSegmentTextWithSplit with forceSplit: true");
+  }
+  // >5000 proactive path must still call without forceSplit.
+  if (!/batch\[0\]\.text\.length\s*>\s*5000[\s\S]*?translateSegmentTextWithSplit\(segment\.text,\s*runId,\s*runSettings\)/.test(content)) {
+    fail("content.js: >5000 proactive path must call translateSegmentTextWithSplit without forceSplit");
+  }
+}
+
 function checkJoinRawTextNodesNormalize() {
   const fnSource = extractContentFunction("joinRawTextNodes");
   if (!fnSource) {
@@ -418,6 +485,7 @@ function main() {
 
   checkSegmentSplitLogic();
   checkParseTranslationPayload();
+  checkJoinSplitTranslations();
   checkJoinRawTextNodesNormalize();
 
   if (errors.length > 0) {
@@ -428,7 +496,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinRawTextNodes");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes");
   process.exit(0);
 }
 

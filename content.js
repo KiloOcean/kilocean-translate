@@ -986,7 +986,7 @@
       }
       return `${leftStr}${rightStr}`;
     }
-    const sep = /\n/u.test(boundary) ? "\n" : " ";
+    const sep = /\n\n/u.test(boundary) ? "\n\n" : /\n/u.test(boundary) ? "\n" : " ";
     return `${leftStr}${sep}${rightStr}`;
   }
 
@@ -999,7 +999,7 @@
     return raw;
   }
 
-  async function translateSegmentTextWithSplit(text, runId, runSettings) {
+  async function translateSegmentTextWithSplit(text, runId, runSettings, options = {}) {
     // Proactively bisect oversized text before any request: a whole-body
     // TRANSLATE_BATCH can fail with a non-canSplit error (X long posts are a
     // single ~9k-char span), which would leave the body untranslated.
@@ -1012,6 +1012,27 @@
           return null;
         }
         return translationOrNull(translations[0]);
+      }
+      const leftSource = text.slice(0, splitAt);
+      const rightSource = text.slice(splitAt);
+      const left = await translateSegmentTextWithSplit(leftSource, runId, runSettings);
+      if (left == null || !String(left).trim() || runId !== generation) {
+        return null;
+      }
+      const right = await translateSegmentTextWithSplit(rightSource, runId, runSettings);
+      if (right == null || !String(right).trim() || runId !== generation) {
+        return null;
+      }
+      // Preserve boundary whitespace from the original slice join.
+      return joinSplitTranslations(left, right, leftSource, rightSource, runSettings.targetLanguage);
+    }
+
+    // forceSplit: caller already saw this exact text fail with canSplit —
+    // re-requesting the identical text would only fail again. Bisect at once.
+    if (options.forceSplit) {
+      const splitAt = findSegmentSplitIndex(text);
+      if (splitAt < 1 || splitAt >= text.length) {
+        throw new Error("无法继续拆分该文本段");
       }
       const leftSource = text.slice(0, splitAt);
       const rightSource = text.slice(splitAt);
@@ -1162,7 +1183,7 @@
       if (error.canSplit && batch.length === 1) {
         const segment = batch[0];
         try {
-          const joined = await translateSegmentTextWithSplit(segment.text, runId, runSettings);
+          const joined = await translateSegmentTextWithSplit(segment.text, runId, runSettings, { forceSplit: true });
           if (joined == null || runId !== generation) {
             return;
           }
