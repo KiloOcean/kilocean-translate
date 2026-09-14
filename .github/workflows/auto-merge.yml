@@ -171,18 +171,36 @@ jobs:
               return CODEX_LOGINS.has(login || '');
             }
 
-            // Severity from explicit badge / [P#] / leading "P#:" only — not prose \bP2\b.
-            function isBlockingSeverity(bodyText) {
+            function severityMarker(bodyText) {
               const text = bodyText || '';
               const markers = [];
-              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1]);
-              for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1]);
+              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1].toUpperCase());
+              for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1].toUpperCase());
               for (const m of text.matchAll(/(?:^|\n)\s*(?:\*\*)?P([012])\b\s*:/gi)) {
                 markers.push(`P${m[1]}`);
               }
-              if (markers.some((m) => /^P[01]$/i.test(m))) return true;
-              if (markers.some((m) => /^P2$/i.test(m))) return false;
-              return true; // unlabeled → fail-closed
+              if (markers.some((m) => m === 'P0' || m === 'P1')) return 'P0P1';
+              if (markers.some((m) => m === 'P2')) return 'P2';
+              return null; // unlabeled
+            }
+
+            // Block if any body is P0/P1 or unlabeled. Allow only when every
+            // scanned body is explicit P2 (later P0/P1 escalations still block;
+            // later P2 cannot downgrade an unlabeled opener).
+            function isBlockingSeverity(bodyText) {
+              return severityMarker(bodyText) !== 'P2';
+            }
+
+            function isBlockingCodexBodies(bodies) {
+              if (!bodies.length) return true;
+              let anyP0P1 = false;
+              let anyUnlabeled = false;
+              for (const body of bodies) {
+                const m = severityMarker(body);
+                if (m === 'P0P1') anyP0P1 = true;
+                else if (m === null) anyUnlabeled = true;
+              }
+              return anyP0P1 || anyUnlabeled;
             }
 
             // Ownership = opening comment. Non-Codex origin always blocks.
@@ -222,10 +240,13 @@ jobs:
                     unresolved += 1;
                     continue;
                   }
-                  // Severity from the opening Codex finding only — later P2: replies
-                  // must not downgrade an unlabeled / P0/P1 opener.
-                  const opener = comments[0]?.body || '';
-                  if (isBlockingSeverity(opener)) unresolved += 1;
+                  const codexBodies = comments
+                    .filter((c) => isCodexLogin(c.author?.login))
+                    .map((c) => c.body || '');
+                  // Codex-origin: all Codex bodies — escalations block; P2 replies cannot downgrade unlabeled.
+                  if (isBlockingCodexBodies(codexBodies.length ? codexBodies : [comments[0]?.body || ''])) {
+                    unresolved += 1;
+                  }
                 }
                 hasNextPage = conn.pageInfo.hasNextPage;
                 after = conn.pageInfo.endCursor;

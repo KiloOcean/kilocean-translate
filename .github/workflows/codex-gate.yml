@@ -169,18 +169,36 @@ jobs:
               return new RegExp(`(?:^|[^0-9a-f])${short}(?![0-9a-f])`).test(text);
             }
 
-            // Severity from explicit badge / [P#] / leading "P#:" only — not prose \bP2\b.
-            function isBlockingSeverity(bodyText) {
+            function severityMarker(bodyText) {
               const text = bodyText || '';
               const markers = [];
-              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1]);
-              for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1]);
+              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1].toUpperCase());
+              for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1].toUpperCase());
               for (const m of text.matchAll(/(?:^|\n)\s*(?:\*\*)?P([012])\b\s*:/gi)) {
                 markers.push(`P${m[1]}`);
               }
-              if (markers.some((m) => /^P[01]$/i.test(m))) return true;
-              if (markers.some((m) => /^P2$/i.test(m))) return false;
-              return true; // unlabeled → fail-closed
+              if (markers.some((m) => m === 'P0' || m === 'P1')) return 'P0P1';
+              if (markers.some((m) => m === 'P2')) return 'P2';
+              return null; // unlabeled
+            }
+
+            // Block if any body is P0/P1 or unlabeled. Allow only when every
+            // scanned body is explicit P2 (later P0/P1 escalations still block;
+            // later P2 cannot downgrade an unlabeled opener).
+            function isBlockingSeverity(bodyText) {
+              return severityMarker(bodyText) !== 'P2';
+            }
+
+            function isBlockingCodexBodies(bodies) {
+              if (!bodies.length) return true;
+              let anyP0P1 = false;
+              let anyUnlabeled = false;
+              for (const body of bodies) {
+                const m = severityMarker(body);
+                if (m === 'P0P1') anyP0P1 = true;
+                else if (m === null) anyUnlabeled = true;
+              }
+              return anyP0P1 || anyUnlabeled;
             }
 
             async function countUnresolvedCodexThreads(prNumber) {
@@ -215,10 +233,11 @@ jobs:
                   const comments = thread.comments?.nodes || [];
                   const hasCodex = comments.some((c) => isCodexLogin(c.author?.login));
                   if (!hasCodex) continue;
-                  // Opening Codex finding only (first Codex comment); replies cannot downgrade.
-                  const firstCodex = comments.find((c) => isCodexLogin(c.author?.login));
-                  const text = firstCodex?.body || comments[0]?.body || '';
-                  if (isBlockingSeverity(text)) unresolved += 1;
+                  const codexBodies = comments
+                    .filter((c) => isCodexLogin(c.author?.login))
+                    .map((c) => c.body || '');
+                  const bodies = codexBodies.length ? codexBodies : comments.map((c) => c.body || '');
+                  if (isBlockingCodexBodies(bodies)) unresolved += 1;
                 }
                 hasNextPage = conn.pageInfo.hasNextPage;
                 after = conn.pageInfo.endCursor;
