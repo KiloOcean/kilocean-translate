@@ -215,10 +215,9 @@ jobs:
                   const comments = thread.comments?.nodes || [];
                   const hasCodex = comments.some((c) => isCodexLogin(c.author?.login));
                   if (!hasCodex) continue;
-                  const codexBodies = comments
-                    .filter((c) => isCodexLogin(c.author?.login))
-                    .map((c) => c.body || '');
-                  const text = (codexBodies.length ? codexBodies : comments.map((c) => c.body || '')).join('\n');
+                  // Opening Codex finding only (first Codex comment); replies cannot downgrade.
+                  const firstCodex = comments.find((c) => isCodexLogin(c.author?.login));
+                  const text = firstCodex?.body || comments[0]?.body || '';
                   if (isBlockingSeverity(text)) unresolved += 1;
                 }
                 hasNextPage = conn.pageInfo.hasNextPage;
