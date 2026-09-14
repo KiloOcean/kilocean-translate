@@ -44,7 +44,7 @@ This page is the source of truth for merge policy.
 | Required check: **`Build & Test`** | CI job 名（`.github/workflows/ci.yml`） |
 | Required check: **`copilot-pull-request-reviewer`** | Copilot 官方审查 check（配额耗尽时可临时人工豁免，见上） |
 | Required check: **`Codex Review Gate`** | **job / check-run 名**（`.github/workflows/codex-gate.yml`），不是 workflow 展示名 |
-| **Require conversation resolution before merging** | 未解决行内线程挡住 Merge |
+| **Require conversation resolution before merging** | 未解决行内线程挡住 Merge（无严重度例外；见下方「原生保护」） |
 
 **Copilot 的 required check 不覆盖 Codex。** Codex（`chatgpt-codex-connector[bot]`）从不注册 `copilot-pull-request-reviewer`。
 
@@ -114,6 +114,16 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 打上 **`no-auto-merge`** 后 auto-merge 直接 skip。也可保持 draft，或把 base 改成非 `main`。
 
 ---
+
+
+### GitHub 原生保护 vs 工作流软门槛 | Native protection vs workflow soft gates
+
+GitHub branch protection **没有**严重度 / soft-path 过滤器：
+
+| 原生设置 | 与本仓工作流的关系 |
+|----------|-------------------|
+| Required check `copilot-pull-request-reviewer` | Auto Merge 的 **soft-path**（配额耗尽、check 缺失但 head 已有 Copilot review）只影响工作流自身判断。若该 check 仍是 required status check，`pulls.merge` / UI 仍会因缺失 check 被拒，除非临时去掉 required、或给合并 actor（含 `github-actions`）开 bypass。配额耗尽时的人工合入仍须 Codex Gate + Build，禁止 Build-only。 |
+| Require conversation resolution | 无作者/严重度例外。若开启，**未 Resolve 的纯 P2 也会挡住** merge。建议：Codex Gate 可对纯 P2 先行绿灯；合入前仍用 `P2: defer — …` Resolve（或关原生 conversation resolution，改信 Auto Merge 的 GraphQL 严重度门槛；若要「P2 真·保持 open 也能 API 合入」，给 `github-actions` bypass）。 |
 
 ## 评审严重度 | Review severity (P0 / P1 / P2)
 

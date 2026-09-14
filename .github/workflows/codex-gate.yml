@@ -169,14 +169,18 @@ jobs:
               return new RegExp(`(?:^|[^0-9a-f])${short}(?![0-9a-f])`).test(text);
             }
 
-            // Block P0/P1 (badge or text). Do not block P2-only. Unlabeled → high.
+            // Severity from explicit badge / [P#] / leading "P#:" only — not prose \bP2\b.
             function isBlockingSeverity(bodyText) {
               const text = bodyText || '';
-              const hasP0P1 = /\bP0\b|\bP1\b/i.test(text);
-              const hasP2 = /\bP2\b/i.test(text);
-              if (hasP0P1) return true;
-              if (hasP2) return false;
-              return true;
+              const markers = [];
+              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1]);
+              for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1]);
+              for (const m of text.matchAll(/(?:^|\n)\s*(?:\*\*)?P([012])\b\s*:/gi)) {
+                markers.push(`P${m[1]}`);
+              }
+              if (markers.some((m) => /^P[01]$/i.test(m))) return true;
+              if (markers.some((m) => /^P2$/i.test(m))) return false;
+              return true; // unlabeled → fail-closed
             }
 
             async function countUnresolvedCodexThreads(prNumber) {

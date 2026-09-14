@@ -171,18 +171,22 @@ jobs:
               return CODEX_LOGINS.has(login || '');
             }
 
-            // Match codex-gate.yml: P0/P1 (or unlabeled) block; pure P2 does not.
+            // Severity from explicit badge / [P#] / leading "P#:" only — not prose \bP2\b.
             function isBlockingSeverity(bodyText) {
               const text = bodyText || '';
-              const hasP0P1 = /\bP0\b|\bP1\b/i.test(text);
-              const hasP2 = /\bP2\b/i.test(text);
-              if (hasP0P1) return true;
-              if (hasP2) return false;
-              return true;
+              const markers = [];
+              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1]);
+              for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1]);
+              for (const m of text.matchAll(/(?:^|\n)\s*(?:\*\*)?P([012])\b\s*:/gi)) {
+                markers.push(`P${m[1]}`);
+              }
+              if (markers.some((m) => /^P[01]$/i.test(m))) return true;
+              if (markers.some((m) => /^P2$/i.test(m))) return false;
+              return true; // unlabeled → fail-closed
             }
 
-            // Non-Codex unresolved threads always block. Codex threads block only
-            // when severity is P0/P1 or unlabeled (pure P2 may stay open).
+            // Ownership = opening comment. Non-Codex origin always blocks.
+            // Codex-origin threads block only on P0/P1/unlabeled (pure P2 OK).
             async function countUnresolvedThreads(prNumber) {
               let unresolved = 0;
               let after = null;
@@ -213,8 +217,8 @@ jobs:
                 for (const thread of conn.nodes) {
                   if (thread.isResolved) continue;
                   const comments = thread.comments?.nodes || [];
-                  const hasCodex = comments.some((c) => isCodexLogin(c.author?.login));
-                  if (!hasCodex) {
+                  const originLogin = comments[0]?.author?.login || '';
+                  if (!isCodexLogin(originLogin)) {
                     unresolved += 1;
                     continue;
                   }
