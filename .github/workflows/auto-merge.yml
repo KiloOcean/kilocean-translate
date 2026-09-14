@@ -12,8 +12,11 @@
 #   - Relevant checks are completed and not failed (ignore Custom LLM Review
 #     and this workflow's own check name). Do NOT ignore Codex Review Gate.
 #     Multiple runs of the same check name: only the latest attempt counts.
-#   - Check "copilot-pull-request-reviewer" must exist on the head SHA
-#     and complete with conclusion success (missing / skipped / neutral skip)
+#   - Check "copilot-pull-request-reviewer" should exist on the head SHA
+#     and complete with conclusion success (skipped / neutral skip). Soft-path:
+#     if the official check is missing but head already has Copilot APPROVED or
+#     COMMENTED (quota death), treat Copilot check as satisfied; still fail-closed
+#     if there is no Copilot review on head.
 #   - Check "Codex Review Gate" (job name, not a workflow title) must exist
 #     on the head SHA and complete with conclusion success
 #     (missing / skipped / neutral skip)
@@ -239,17 +242,12 @@ jobs:
 
             const sha = pr.head.sha;
 
-            // listForRef returns { total_count, check_runs }. Iterate pages
-            // explicitly so we never treat the wrapper object as an array.
-            const checkRuns = [];
-            for await (const response of github.paginate.iterator(github.rest.checks.listForRef, {
-              owner,
-              repo,
-              ref: sha,
-              per_page: 100,
-            })) {
-              checkRuns.push(...(response.data.check_runs || []));
-            }
+            // Octokit paginate may unwrap listForRef so response.data is already the CheckRun array (not {check_runs}).
+            const checkRuns = await github.paginate(
+              github.rest.checks.listForRef,
+              { owner, repo, ref: sha, per_page: 100 },
+              (response) => response.data.check_runs ?? (Array.isArray(response.data) ? response.data : [])
+            );
 
             const latestChecks = latestPerName(checkRuns);
             const relevantChecks = latestChecks.filter((c) => !isIgnoredCheck(c.name));
@@ -299,13 +297,6 @@ jobs:
               return true;
             }
 
-            const copilotChecks = relevantChecks.filter((c) => COPILOT_CHECK_RE.test(c.name || ''));
-            if (!requireNamedCheck(copilotChecks, 'copilot-pull-request-reviewer')) return;
-
-            // Required-check name is the job name, not a workflow display title.
-            const codexGates = relevantChecks.filter((c) => (c.name || '') === CODEX_GATE_NAME);
-            if (!requireNamedCheck(codexGates, CODEX_GATE_NAME)) return;
-
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               owner,
               repo,
@@ -316,25 +307,42 @@ jobs:
             const copilotReviews = reviews.filter(
               (r) => COPILOT_LOGINS.has(r.user?.login || '') && r.state !== 'DISMISSED' && r.state !== 'PENDING'
             );
-            if (copilotReviews.length === 0) {
-              core.info(`PR #${prNumber}: no Copilot review yet — skip (will retry when review lands)`);
-              return;
-            }
-
             const withCommit = copilotReviews.filter((r) => r.commit_id);
             const forHead = withCommit.length
               ? withCommit.filter((r) => r.commit_id === sha)
               : copilotReviews;
-            if (forHead.length === 0) {
-              core.info(`PR #${prNumber}: no Copilot review for head ${sha.slice(0, 7)} — skip`);
+            const latest = forHead.length
+              ? forHead.sort((a, b) => new Date(b.submitted_at) - new Date(a.submitted_at))[0]
+              : null;
+            const copilotGate = latest
+              ? copilotReviewAllowsMerge(latest)
+              : { ok: false, reason: 'missing' };
+
+            const copilotChecks = relevantChecks.filter((c) => COPILOT_CHECK_RE.test(c.name || ''));
+            if (copilotChecks.length === 0) {
+              // Soft-path: Copilot quota death — official check never appears, but a head
+              // review that is APPROVED/COMMENTED still satisfies the Copilot gate.
+              if (!latest || !copilotGate.ok) {
+                core.info('copilot-pull-request-reviewer missing on head SHA — skip');
+                return;
+              }
+              core.info(`copilot official check missing; head review ${copilotGate.reason} allows merge`);
+            } else if (!requireNamedCheck(copilotChecks, 'copilot-pull-request-reviewer')) {
               return;
             }
 
-            const latest = forHead.sort(
-              (a, b) => new Date(b.submitted_at) - new Date(a.submitted_at)
-            )[0];
+            // Required-check name is the job name, not a workflow display title.
+            const codexGates = relevantChecks.filter((c) => (c.name || '') === CODEX_GATE_NAME);
+            if (!requireNamedCheck(codexGates, CODEX_GATE_NAME)) return;
 
-            const copilotGate = copilotReviewAllowsMerge(latest);
+            if (copilotReviews.length === 0) {
+              core.info(`PR #${prNumber}: no Copilot review yet — skip (will retry when review lands)`);
+              return;
+            }
+            if (!latest) {
+              core.info(`PR #${prNumber}: no Copilot review for head ${sha.slice(0, 7)} — skip`);
+              return;
+            }
             if (!copilotGate.ok) {
               core.info(
                 `PR #${prNumber}: latest Copilot review for head is ${latest.state} (${copilotGate.reason}) — skip`

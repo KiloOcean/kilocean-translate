@@ -19,9 +19,10 @@
 #   - Summary does not positively show Completed or 👍 no-findings → fail
 #   - Summary completed, but it does not mention the current head SHA
 #     (stale review of an older commit after synchronize) → fail
-#   - Summary completed, but unresolved Codex review threads remain → fail
+#   - Summary completed, but unresolved Codex P0/P1 (or unlabeled) threads remain → fail
+#     (open P2-only threads do not block; unlabeled defaults high / fail-closed)
 #   - Summary completed for this head SHA (or 👍 / no-findings) and zero
-#     unresolved Codex threads → success
+#     unresolved blocking Codex threads → success
 #   - GraphQL thread lookup failed + any Codex review comments exist → fail
 #
 # Re-runs when Codex posts/edits its summary or submits a review. Resolving
@@ -168,6 +169,16 @@ jobs:
               return new RegExp(`(?:^|[^0-9a-f])${short}(?![0-9a-f])`).test(text);
             }
 
+            // Block P0/P1 (badge or text). Do not block P2-only. Unlabeled → high.
+            function isBlockingSeverity(bodyText) {
+              const text = bodyText || '';
+              const hasP0P1 = /\bP0\b|\bP1\b/i.test(text);
+              const hasP2 = /\bP2\b/i.test(text);
+              if (hasP0P1) return true;
+              if (hasP2) return false;
+              return true;
+            }
+
             async function countUnresolvedCodexThreads(prNumber) {
               let unresolved = 0;
               let after = null;
@@ -181,7 +192,7 @@ jobs:
                           nodes {
                             isResolved
                             comments(first: 100) {
-                              nodes { author { login } }
+                              nodes { author { login } body }
                             }
                           }
                           pageInfo { hasNextPage endCursor }
@@ -197,10 +208,14 @@ jobs:
                   if (thread.isResolved) continue;
                   // Codex may reply in a human-started thread; do not only
                   // look at comments(first: 1).
-                  const hasCodex = (thread.comments?.nodes || []).some((c) =>
-                    isCodexLogin(c.author?.login)
-                  );
-                  if (hasCodex) unresolved += 1;
+                  const comments = thread.comments?.nodes || [];
+                  const hasCodex = comments.some((c) => isCodexLogin(c.author?.login));
+                  if (!hasCodex) continue;
+                  const codexBodies = comments
+                    .filter((c) => isCodexLogin(c.author?.login))
+                    .map((c) => c.body || '');
+                  const text = (codexBodies.length ? codexBodies : comments.map((c) => c.body || '')).join('\n');
+                  if (isBlockingSeverity(text)) unresolved += 1;
                 }
                 hasNextPage = conn.pageInfo.hasNextPage;
                 after = conn.pageInfo.endCursor;
@@ -324,12 +339,12 @@ jobs:
             }
 
             if (unresolvedCodex > 0) {
-              const msg = `${unresolvedCodex} unresolved Codex review thread(s). Resolve them, then re-run a pull_request_target-originated Gate job (thread resolve does not retrigger; non-PR events do not post Checks API results).`;
+              const msg = `${unresolvedCodex} unresolved Codex P0/P1 (or unlabeled) thread(s). Resolve them, then re-run a pull_request_target-originated Gate job (thread resolve does not retrigger; non-PR events do not post Checks API results).`;
               core.setFailed(msg);
               return;
             }
 
-            const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved Codex threads`;
+            const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved P0/P1 (or unlabeled) Codex threads`;
             core.info(ok);
             // Success = job conclusion. pull_request_target attaches "Codex Review Gate"
             // to the PR head check. Auto Merge listens via workflow_run — no dispatch.
