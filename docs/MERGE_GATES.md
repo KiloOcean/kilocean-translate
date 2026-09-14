@@ -14,7 +14,7 @@ This page is the source of truth for merge policy.
 |------|------|
 | **Build & Test** | `scripts/ci-check.mjs`（manifest / 权限 / 语法 / 静态安全禁令） |
 | **Codex Review Gate** | Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex **P0/P1（或未标注）** 行内线程（纯 P2 不挡） |
-| **Conversation resolution** | 所有 review threads（Copilot / Codex / 人类）已 resolve |
+| **Conversation resolution** | 非 Codex 线程须 resolve；Codex 仅 P0/P1（或未标注）须 resolve（纯 P2 可 open） |
 
 ### Copilot 配额耗尽时 | When Copilot quota is dead
 
@@ -99,7 +99,7 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
    - **`APPROVED` 或 `COMMENTED` 均可。不要求原生 `APPROVED`。**
    - 没有 Copilot review → 不合
    - `COMMENTED` + 未解决行内线程 → 不合（靠第 8 条）
-8. GraphQL `reviewThreads` 全部 `isResolved`（解析失败且仍有 review comments → fail-closed）
+8. GraphQL `reviewThreads`：**非 Codex** 未解决一律阻断；**Codex** 仅阻断未解决 **P0/P1（或未标注）**（纯 P2 可保持 open）。解析失败且仍有 review comments → fail-closed
 
 **永不**仅因 Build 绿灯自动合入。
 

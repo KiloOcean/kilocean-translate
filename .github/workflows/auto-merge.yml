@@ -26,7 +26,7 @@
 #     fail closed if any review comments exist and resolution is unknown)
 #
 # Blocks: draft, non-main base, no-auto-merge, skip-codex-gate, failed/pending relevant
-# checks, missing Copilot review, CHANGES_REQUESTED, unresolved threads.
+# checks, missing Copilot review, CHANGES_REQUESTED, unresolved blocking threads (non-Codex any; Codex P0/P1/unlabeled — pure P2 OK).
 #
 # Re-evaluates when CI succeeds, when Copilot submits a review, when
 # Codex Review Gate succeeds (workflow_run), or manual dispatch.
@@ -162,6 +162,27 @@ jobs:
               return prs[0]?.number ?? null;
             }
 
+            const CODEX_LOGINS = new Set([
+              'chatgpt-codex-connector[bot]',
+              'chatgpt-codex-connector',
+            ]);
+
+            function isCodexLogin(login) {
+              return CODEX_LOGINS.has(login || '');
+            }
+
+            // Match codex-gate.yml: P0/P1 (or unlabeled) block; pure P2 does not.
+            function isBlockingSeverity(bodyText) {
+              const text = bodyText || '';
+              const hasP0P1 = /\bP0\b|\bP1\b/i.test(text);
+              const hasP2 = /\bP2\b/i.test(text);
+              if (hasP0P1) return true;
+              if (hasP2) return false;
+              return true;
+            }
+
+            // Non-Codex unresolved threads always block. Codex threads block only
+            // when severity is P0/P1 or unlabeled (pure P2 may stay open).
             async function countUnresolvedThreads(prNumber) {
               let unresolved = 0;
               let after = null;
@@ -172,7 +193,12 @@ jobs:
                     repository(owner: $owner, name: $name) {
                       pullRequest(number: $number) {
                         reviewThreads(first: 100, after: $after) {
-                          nodes { isResolved }
+                          nodes {
+                            isResolved
+                            comments(first: 100) {
+                              nodes { author { login } body }
+                            }
+                          }
                           pageInfo { hasNextPage endCursor }
                         }
                       }
@@ -184,7 +210,20 @@ jobs:
                 if (!conn) {
                   throw new Error('GraphQL returned no reviewThreads connection');
                 }
-                unresolved += conn.nodes.filter((t) => !t.isResolved).length;
+                for (const thread of conn.nodes) {
+                  if (thread.isResolved) continue;
+                  const comments = thread.comments?.nodes || [];
+                  const hasCodex = comments.some((c) => isCodexLogin(c.author?.login));
+                  if (!hasCodex) {
+                    unresolved += 1;
+                    continue;
+                  }
+                  const codexBodies = comments
+                    .filter((c) => isCodexLogin(c.author?.login))
+                    .map((c) => c.body || '');
+                  const text = (codexBodies.length ? codexBodies : comments.map((c) => c.body || '')).join('\n');
+                  if (isBlockingSeverity(text)) unresolved += 1;
+                }
                 hasNextPage = conn.pageInfo.hasNextPage;
                 after = conn.pageInfo.endCursor;
               }
@@ -371,7 +410,7 @@ jobs:
             }
 
             core.info(
-              `Merging PR #${prNumber} at ${sha.slice(0, 7)} (CI green + Copilot ${copilotGate.reason} + threads resolved)`
+              `Merging PR #${prNumber} at ${sha.slice(0, 7)} (CI green + Copilot ${copilotGate.reason} + no blocking unresolved threads)`
             );
             await github.rest.pulls.merge({
               owner,
@@ -381,6 +420,6 @@ jobs:
               merge_method: 'squash',
               commit_title: `${pr.title} (#${prNumber})`,
               commit_message:
-                'Auto-merged: CI green + Copilot review on head SHA + all review threads resolved.',
+                'Auto-merged: CI green + Copilot review on head SHA + no blocking unresolved threads (Codex P2 may stay open).',
             });
             core.info(`Squash-merged PR #${prNumber}`);
