@@ -172,7 +172,8 @@ jobs:
             }
 
             function severityMarker(bodyText) {
-              const text = bodyText || '';
+              // Only the finding header / badge region — not later prose/quotes.
+              const text = (bodyText || '').slice(0, 600);
               const markers = [];
               for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1].toUpperCase());
               for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1].toUpperCase());
@@ -219,6 +220,7 @@ jobs:
                             isResolved
                             comments(first: 100) {
                               nodes { author { login } body }
+                              pageInfo { hasNextPage }
                             }
                           }
                           pageInfo { hasNextPage endCursor }
@@ -235,6 +237,10 @@ jobs:
                 for (const thread of conn.nodes) {
                   if (thread.isResolved) continue;
                   const comments = thread.comments?.nodes || [];
+                  if (thread.comments?.pageInfo?.hasNextPage) {
+                    unresolved += 1;
+                    continue;
+                  }
                   const originLogin = comments[0]?.author?.login || '';
                   if (!isCodexLogin(originLogin)) {
                     unresolved += 1;

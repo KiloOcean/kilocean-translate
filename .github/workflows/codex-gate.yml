@@ -65,7 +65,7 @@ on:
   pull_request_review:
     types: [submitted]
   pull_request_review_comment:
-    types: [created]
+    types: [created, edited]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -170,7 +170,8 @@ jobs:
             }
 
             function severityMarker(bodyText) {
-              const text = bodyText || '';
+              // Only the finding header / badge region — not later prose/quotes.
+              const text = (bodyText || '').slice(0, 600);
               const markers = [];
               for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1].toUpperCase());
               for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1].toUpperCase());
@@ -215,6 +216,7 @@ jobs:
                             isResolved
                             comments(first: 100) {
                               nodes { author { login } body }
+                              pageInfo { hasNextPage }
                             }
                           }
                           pageInfo { hasNextPage endCursor }
@@ -231,6 +233,11 @@ jobs:
                   // Codex may reply in a human-started thread; do not only
                   // look at comments(first: 1).
                   const comments = thread.comments?.nodes || [];
+                  if (thread.comments?.pageInfo?.hasNextPage) {
+                    // Fail closed: escalation beyond first 100 comments unseen.
+                    unresolved += 1;
+                    continue;
+                  }
                   const hasCodex = comments.some((c) => isCodexLogin(c.author?.login));
                   if (!hasCodex) continue;
                   const codexBodies = comments
