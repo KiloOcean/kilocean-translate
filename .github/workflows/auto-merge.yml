@@ -12,8 +12,11 @@
 #   - Relevant checks are completed and not failed (ignore Custom LLM Review
 #     and this workflow's own check name). Do NOT ignore Codex Review Gate.
 #     Multiple runs of the same check name: only the latest attempt counts.
-#   - Check "copilot-pull-request-reviewer" must exist on the head SHA
-#     and complete with conclusion success (missing / skipped / neutral skip)
+#   - Check "copilot-pull-request-reviewer" should exist on the head SHA
+#     and complete with conclusion success (skipped / neutral skip). Soft-path:
+#     if the official check is missing but head already has Copilot APPROVED or
+#     COMMENTED (quota death), treat Copilot check as satisfied; still fail-closed
+#     if there is no Copilot review on head.
 #   - Check "Codex Review Gate" (job name, not a workflow title) must exist
 #     on the head SHA and complete with conclusion success
 #     (missing / skipped / neutral skip)
@@ -23,7 +26,7 @@
 #     fail closed if any review comments exist and resolution is unknown)
 #
 # Blocks: draft, non-main base, no-auto-merge, skip-codex-gate, failed/pending relevant
-# checks, missing Copilot review, CHANGES_REQUESTED, unresolved threads.
+# checks, missing Copilot review, CHANGES_REQUESTED, unresolved blocking threads (non-Codex any; Codex P0/P1/unlabeled — pure P2 OK).
 #
 # Re-evaluates when CI succeeds, when Copilot submits a review, when
 # Codex Review Gate succeeds (workflow_run), or manual dispatch.
@@ -159,6 +162,50 @@ jobs:
               return prs[0]?.number ?? null;
             }
 
+            const CODEX_LOGINS = new Set([
+              'chatgpt-codex-connector[bot]',
+              'chatgpt-codex-connector',
+            ]);
+
+            function isCodexLogin(login) {
+              return CODEX_LOGINS.has(login || '');
+            }
+
+            function severityMarker(bodyText) {
+              // Only the finding header / badge region — not later prose/quotes.
+              const text = (bodyText || '').slice(0, 600);
+              const markers = [];
+              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1].toUpperCase());
+              for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1].toUpperCase());
+              for (const m of text.matchAll(/(?:^|\n)\s*(?:\*\*)?P([012])\b\s*:/gi)) {
+                markers.push(`P${m[1]}`);
+              }
+              if (markers.some((m) => m === 'P0' || m === 'P1')) return 'P0P1';
+              if (markers.some((m) => m === 'P2')) return 'P2';
+              return null; // unlabeled
+            }
+
+            // Block if any body is P0/P1 or unlabeled. Allow only when every
+            // scanned body is explicit P2 (later P0/P1 escalations still block;
+            // later P2 cannot downgrade an unlabeled opener).
+            function isBlockingSeverity(bodyText) {
+              return severityMarker(bodyText) !== 'P2';
+            }
+
+            function isBlockingCodexBodies(bodies) {
+              if (!bodies.length) return true;
+              let anyP0P1 = false;
+              let anyUnlabeled = false;
+              for (const body of bodies) {
+                const m = severityMarker(body);
+                if (m === 'P0P1') anyP0P1 = true;
+                else if (m === null) anyUnlabeled = true;
+              }
+              return anyP0P1 || anyUnlabeled;
+            }
+
+            // Ownership = opening comment. Non-Codex origin always blocks.
+            // Codex-origin threads block only on P0/P1/unlabeled (pure P2 OK).
             async function countUnresolvedThreads(prNumber) {
               let unresolved = 0;
               let after = null;
@@ -169,7 +216,13 @@ jobs:
                     repository(owner: $owner, name: $name) {
                       pullRequest(number: $number) {
                         reviewThreads(first: 100, after: $after) {
-                          nodes { isResolved }
+                          nodes {
+                            isResolved
+                            comments(first: 100) {
+                              nodes { author { login } body }
+                              pageInfo { hasNextPage }
+                            }
+                          }
                           pageInfo { hasNextPage endCursor }
                         }
                       }
@@ -181,7 +234,26 @@ jobs:
                 if (!conn) {
                   throw new Error('GraphQL returned no reviewThreads connection');
                 }
-                unresolved += conn.nodes.filter((t) => !t.isResolved).length;
+                for (const thread of conn.nodes) {
+                  if (thread.isResolved) continue;
+                  const comments = thread.comments?.nodes || [];
+                  if (thread.comments?.pageInfo?.hasNextPage) {
+                    unresolved += 1;
+                    continue;
+                  }
+                  const originLogin = comments[0]?.author?.login || '';
+                  if (!isCodexLogin(originLogin)) {
+                    unresolved += 1;
+                    continue;
+                  }
+                  const codexBodies = comments
+                    .filter((c) => isCodexLogin(c.author?.login))
+                    .map((c) => c.body || '');
+                  // Codex-origin: all Codex bodies — escalations block; P2 replies cannot downgrade unlabeled.
+                  if (isBlockingCodexBodies(codexBodies.length ? codexBodies : [comments[0]?.body || ''])) {
+                    unresolved += 1;
+                  }
+                }
                 hasNextPage = conn.pageInfo.hasNextPage;
                 after = conn.pageInfo.endCursor;
               }
@@ -239,17 +311,12 @@ jobs:
 
             const sha = pr.head.sha;
 
-            // listForRef returns { total_count, check_runs }. Iterate pages
-            // explicitly so we never treat the wrapper object as an array.
-            const checkRuns = [];
-            for await (const response of github.paginate.iterator(github.rest.checks.listForRef, {
-              owner,
-              repo,
-              ref: sha,
-              per_page: 100,
-            })) {
-              checkRuns.push(...(response.data.check_runs || []));
-            }
+            // Octokit paginate may unwrap listForRef so response.data is already the CheckRun array (not {check_runs}).
+            const checkRuns = await github.paginate(
+              github.rest.checks.listForRef,
+              { owner, repo, ref: sha, per_page: 100 },
+              (response) => response.data.check_runs ?? (Array.isArray(response.data) ? response.data : [])
+            );
 
             const latestChecks = latestPerName(checkRuns);
             const relevantChecks = latestChecks.filter((c) => !isIgnoredCheck(c.name));
@@ -299,13 +366,6 @@ jobs:
               return true;
             }
 
-            const copilotChecks = relevantChecks.filter((c) => COPILOT_CHECK_RE.test(c.name || ''));
-            if (!requireNamedCheck(copilotChecks, 'copilot-pull-request-reviewer')) return;
-
-            // Required-check name is the job name, not a workflow display title.
-            const codexGates = relevantChecks.filter((c) => (c.name || '') === CODEX_GATE_NAME);
-            if (!requireNamedCheck(codexGates, CODEX_GATE_NAME)) return;
-
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               owner,
               repo,
@@ -316,25 +376,42 @@ jobs:
             const copilotReviews = reviews.filter(
               (r) => COPILOT_LOGINS.has(r.user?.login || '') && r.state !== 'DISMISSED' && r.state !== 'PENDING'
             );
-            if (copilotReviews.length === 0) {
-              core.info(`PR #${prNumber}: no Copilot review yet — skip (will retry when review lands)`);
-              return;
-            }
-
             const withCommit = copilotReviews.filter((r) => r.commit_id);
             const forHead = withCommit.length
               ? withCommit.filter((r) => r.commit_id === sha)
               : copilotReviews;
-            if (forHead.length === 0) {
-              core.info(`PR #${prNumber}: no Copilot review for head ${sha.slice(0, 7)} — skip`);
+            const latest = forHead.length
+              ? forHead.sort((a, b) => new Date(b.submitted_at) - new Date(a.submitted_at))[0]
+              : null;
+            const copilotGate = latest
+              ? copilotReviewAllowsMerge(latest)
+              : { ok: false, reason: 'missing' };
+
+            const copilotChecks = relevantChecks.filter((c) => COPILOT_CHECK_RE.test(c.name || ''));
+            if (copilotChecks.length === 0) {
+              // Soft-path: Copilot quota death — official check never appears, but a head
+              // review that is APPROVED/COMMENTED still satisfies the Copilot gate.
+              if (!latest || !copilotGate.ok) {
+                core.info('copilot-pull-request-reviewer missing on head SHA — skip');
+                return;
+              }
+              core.info(`copilot official check missing; head review ${copilotGate.reason} allows merge`);
+            } else if (!requireNamedCheck(copilotChecks, 'copilot-pull-request-reviewer')) {
               return;
             }
 
-            const latest = forHead.sort(
-              (a, b) => new Date(b.submitted_at) - new Date(a.submitted_at)
-            )[0];
+            // Required-check name is the job name, not a workflow display title.
+            const codexGates = relevantChecks.filter((c) => (c.name || '') === CODEX_GATE_NAME);
+            if (!requireNamedCheck(codexGates, CODEX_GATE_NAME)) return;
 
-            const copilotGate = copilotReviewAllowsMerge(latest);
+            if (copilotReviews.length === 0) {
+              core.info(`PR #${prNumber}: no Copilot review yet — skip (will retry when review lands)`);
+              return;
+            }
+            if (!latest) {
+              core.info(`PR #${prNumber}: no Copilot review for head ${sha.slice(0, 7)} — skip`);
+              return;
+            }
             if (!copilotGate.ok) {
               core.info(
                 `PR #${prNumber}: latest Copilot review for head is ${latest.state} (${copilotGate.reason}) — skip`
@@ -363,7 +440,7 @@ jobs:
             }
 
             core.info(
-              `Merging PR #${prNumber} at ${sha.slice(0, 7)} (CI green + Copilot ${copilotGate.reason} + threads resolved)`
+              `Merging PR #${prNumber} at ${sha.slice(0, 7)} (CI green + Copilot ${copilotGate.reason} + no blocking unresolved threads)`
             );
             await github.rest.pulls.merge({
               owner,
@@ -373,6 +450,6 @@ jobs:
               merge_method: 'squash',
               commit_title: `${pr.title} (#${prNumber})`,
               commit_message:
-                'Auto-merged: CI green + Copilot review on head SHA + all review threads resolved.',
+                'Auto-merged: CI green + Copilot review on head SHA + no blocking unresolved threads (Codex P2 may stay open).',
             });
             core.info(`Squash-merged PR #${prNumber}`);

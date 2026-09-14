@@ -19,9 +19,10 @@
 #   - Summary does not positively show Completed or 👍 no-findings → fail
 #   - Summary completed, but it does not mention the current head SHA
 #     (stale review of an older commit after synchronize) → fail
-#   - Summary completed, but unresolved Codex review threads remain → fail
+#   - Summary completed, but unresolved Codex P0/P1 (or unlabeled) threads remain → fail
+#     (open P2-only threads do not block; unlabeled defaults high / fail-closed)
 #   - Summary completed for this head SHA (or 👍 / no-findings) and zero
-#     unresolved Codex threads → success
+#     unresolved blocking Codex threads → success
 #   - GraphQL thread lookup failed + any Codex review comments exist → fail
 #
 # Re-runs when Codex posts/edits its summary or submits a review. Resolving
@@ -64,7 +65,7 @@ on:
   pull_request_review:
     types: [submitted]
   pull_request_review_comment:
-    types: [created]
+    types: [created, edited]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -168,6 +169,39 @@ jobs:
               return new RegExp(`(?:^|[^0-9a-f])${short}(?![0-9a-f])`).test(text);
             }
 
+            function severityMarker(bodyText) {
+              // Only the finding header / badge region — not later prose/quotes.
+              const text = (bodyText || '').slice(0, 600);
+              const markers = [];
+              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) markers.push(m[1].toUpperCase());
+              for (const m of text.matchAll(/\[(P[012])\]/gi)) markers.push(m[1].toUpperCase());
+              for (const m of text.matchAll(/(?:^|\n)\s*(?:\*\*)?P([012])\b\s*:/gi)) {
+                markers.push(`P${m[1]}`);
+              }
+              if (markers.some((m) => m === 'P0' || m === 'P1')) return 'P0P1';
+              if (markers.some((m) => m === 'P2')) return 'P2';
+              return null; // unlabeled
+            }
+
+            // Block if any body is P0/P1 or unlabeled. Allow only when every
+            // scanned body is explicit P2 (later P0/P1 escalations still block;
+            // later P2 cannot downgrade an unlabeled opener).
+            function isBlockingSeverity(bodyText) {
+              return severityMarker(bodyText) !== 'P2';
+            }
+
+            function isBlockingCodexBodies(bodies) {
+              if (!bodies.length) return true;
+              let anyP0P1 = false;
+              let anyUnlabeled = false;
+              for (const body of bodies) {
+                const m = severityMarker(body);
+                if (m === 'P0P1') anyP0P1 = true;
+                else if (m === null) anyUnlabeled = true;
+              }
+              return anyP0P1 || anyUnlabeled;
+            }
+
             async function countUnresolvedCodexThreads(prNumber) {
               let unresolved = 0;
               let after = null;
@@ -181,7 +215,8 @@ jobs:
                           nodes {
                             isResolved
                             comments(first: 100) {
-                              nodes { author { login } }
+                              nodes { author { login } body }
+                              pageInfo { hasNextPage }
                             }
                           }
                           pageInfo { hasNextPage endCursor }
@@ -197,10 +232,19 @@ jobs:
                   if (thread.isResolved) continue;
                   // Codex may reply in a human-started thread; do not only
                   // look at comments(first: 1).
-                  const hasCodex = (thread.comments?.nodes || []).some((c) =>
-                    isCodexLogin(c.author?.login)
-                  );
-                  if (hasCodex) unresolved += 1;
+                  const comments = thread.comments?.nodes || [];
+                  if (thread.comments?.pageInfo?.hasNextPage) {
+                    // Fail closed: escalation beyond first 100 comments unseen.
+                    unresolved += 1;
+                    continue;
+                  }
+                  const hasCodex = comments.some((c) => isCodexLogin(c.author?.login));
+                  if (!hasCodex) continue;
+                  const codexBodies = comments
+                    .filter((c) => isCodexLogin(c.author?.login))
+                    .map((c) => c.body || '');
+                  const bodies = codexBodies.length ? codexBodies : comments.map((c) => c.body || '');
+                  if (isBlockingCodexBodies(bodies)) unresolved += 1;
                 }
                 hasNextPage = conn.pageInfo.hasNextPage;
                 after = conn.pageInfo.endCursor;
@@ -324,12 +368,12 @@ jobs:
             }
 
             if (unresolvedCodex > 0) {
-              const msg = `${unresolvedCodex} unresolved Codex review thread(s). Resolve them, then re-run a pull_request_target-originated Gate job (thread resolve does not retrigger; non-PR events do not post Checks API results).`;
+              const msg = `${unresolvedCodex} unresolved Codex P0/P1 (or unlabeled) thread(s). Resolve them, then re-run a pull_request_target-originated Gate job (thread resolve does not retrigger; non-PR events do not post Checks API results).`;
               core.setFailed(msg);
               return;
             }
 
-            const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved Codex threads`;
+            const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved P0/P1 (or unlabeled) Codex threads`;
             core.info(ok);
             // Success = job conclusion. pull_request_target attaches "Codex Review Gate"
             // to the PR head check. Auto Merge listens via workflow_run — no dispatch.

@@ -13,15 +13,15 @@ This page is the source of truth for merge policy.
 | 门槛 | 说明 |
 |------|------|
 | **Build & Test** | `scripts/ci-check.mjs`（manifest / 权限 / 语法 / 静态安全禁令） |
-| **Codex Review Gate** | Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex 行内线程 |
-| **Conversation resolution** | 所有 review threads（Copilot / Codex / 人类）已 resolve |
+| **Codex Review Gate** | Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex **P0/P1（或未标注）** 行内线程（纯 P2 不挡） |
+| **Conversation resolution** | 非 Codex 线程须 resolve；Codex 仅 P0/P1（或未标注）须 resolve（纯 P2 可 open） |
 
 ### Copilot 配额耗尽时 | When Copilot quota is dead
 
 - Copilot review **可以**临时豁免（人工合入）。
 - **仍然禁止**只靠 Build 绿灯合入。
 - **Codex Review Gate + conversation resolution** 仍是硬门槛。
-- Auto-merge 工作流默认仍要求 `copilot-pull-request-reviewer`；配额死时请人工合入，不要放宽成 "Build only"。
+- Auto-merge：**Soft-path** — 若官方 `copilot-pull-request-reviewer` check 缺失，但 head 已有 Copilot `APPROVED`/`COMMENTED` review，则视为 Copilot 门槛满足；仍无 head review → fail-closed。不要放宽成 "Build only"。
 
 ---
 
@@ -44,7 +44,7 @@ This page is the source of truth for merge policy.
 | Required check: **`Build & Test`** | CI job 名（`.github/workflows/ci.yml`） |
 | Required check: **`copilot-pull-request-reviewer`** | Copilot 官方审查 check（配额耗尽时可临时人工豁免，见上） |
 | Required check: **`Codex Review Gate`** | **job / check-run 名**（`.github/workflows/codex-gate.yml`），不是 workflow 展示名 |
-| **Require conversation resolution before merging** | 未解决行内线程挡住 Merge |
+| **Require conversation resolution before merging** | 未解决行内线程挡住 Merge（无严重度例外；见下方「原生保护」） |
 
 **Copilot 的 required check 不覆盖 Codex。** Codex（`chatgpt-codex-connector[bot]`）从不注册 `copilot-pull-request-reviewer`。
 
@@ -64,8 +64,8 @@ Codex 只发 issue comment（`<!-- codex-pull-request-review-summary -->`）和�
 | 20 分钟内从未发 Summary | 失败（`@codex review`；`skip-codex-gate` 会失败 Gate 并挡住自动合入） |
 | Summary Running / Failed / 无 Completed 或 👍 | 失败 |
 | Summary 已完成但未提及当前 head SHA | 失败（旧审查不算） |
-| 仍有未解决 Codex 行内线程 | 失败 |
-| 完成且 0 未解决 Codex 线程 | 通过 |
+| 仍有未解决 Codex **P0/P1（或未标注）** 行内线程 | 失败 |
+| 完成且 0 未解决阻塞级 Codex 线程（纯 P2 可保持 open） | 通过 |
 
 ### 权限 / 安全 | Permissions / security
 
@@ -93,13 +93,13 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 2. 没有 `no-auto-merge` label
 3. head SHA 上有成功的 **`Build & Test` check run**（fail closed；不用 legacy combined status）
 4. 相关 check 已完成且未失败（忽略 Custom LLM Review、Auto Merge 自己）。同名 check 只看最新 `created_at`
-5. head 上 **`copilot-pull-request-reviewer`** `conclusion: success`（缺失 / skipped / neutral → 不合）
+5. head 上 **`copilot-pull-request-reviewer`** `conclusion: success`（skipped / neutral → 不合）。**Soft-path：** 官方 check 缺失但 head 已有 Copilot `APPROVED`/`COMMENTED` → 视为满足；仍无 head review → fail-closed
 6. head 上 **`Codex Review Gate`** `conclusion: success`（缺失 / skipped / neutral → 不合）
 7. 该 head SHA 上已有 Copilot review，且**不是** `CHANGES_REQUESTED`
    - **`APPROVED` 或 `COMMENTED` 均可。不要求原生 `APPROVED`。**
    - 没有 Copilot review → 不合
    - `COMMENTED` + 未解决行内线程 → 不合（靠第 8 条）
-8. GraphQL `reviewThreads` 全部 `isResolved`（解析失败且仍有 review comments → fail-closed）
+8. GraphQL `reviewThreads`：**非 Codex** 未解决一律阻断；**Codex** 仅阻断未解决 **P0/P1（或未标注）**（纯 P2 可保持 open）。解析失败且仍有 review comments → fail-closed
 
 **永不**仅因 Build 绿灯自动合入。
 
@@ -115,27 +115,37 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 
 ---
 
+
+### GitHub 原生保护 vs 工作流软门槛 | Native protection vs workflow soft gates
+
+GitHub branch protection **没有**严重度 / soft-path 过滤器：
+
+| 原生设置 | 与本仓工作流的关系 |
+|----------|-------------------|
+| Required check `copilot-pull-request-reviewer` | Auto Merge 的 **soft-path**（配额耗尽、check 缺失但 head 已有 Copilot review）只影响工作流自身判断。若该 check 仍是 required status check，`pulls.merge` / UI 仍会因缺失 check 被拒，除非临时去掉 required、或给合并 actor（含 `github-actions`）开 bypass。配额耗尽时的人工合入仍须 Codex Gate + Build，禁止 Build-only。 |
+| Require conversation resolution | 无作者/严重度例外。若开启，**未 Resolve 的纯 P2 也会挡住** merge。建议：Codex Gate 可对纯 P2 先行绿灯；合入前仍用 `P2: defer — …` Resolve（或关原生 conversation resolution，改信 Auto Merge 的 GraphQL 严重度门槛；若要「P2 真·保持 open 也能 API 合入」，给 `github-actions` bypass）。 |
+
 ## 评审严重度 | Review severity (P0 / P1 / P2)
 
-合入前 review 意见按严重度分级。**当前 Gate 仍要求所有 review thread 已 Resolve**；短期路径是：P2 可在回复 rationale 后 Resolve（无需改代码），P0/P1 必须先改代码再 Resolve。
+合入前 review 意见按严重度分级。**Codex Review Gate 只阻断未解决的 P0/P1（以及未标注严重度的线程；未标注默认按高优先级 fail-closed）**。P2 可保持 open，或回复 rationale 后 Resolve（无需改代码）；P0/P1 必须先改代码再 Resolve。
 
 | 级别 | 含义 | 合入前要求 |
 |------|------|------------|
 | **P0** | 阻断：正确性错误、安全漏洞、数据丢失风险 | **必须改代码**，修复后再 Resolve |
 | **P1** | 高优先级：实质性缺陷或明显行为回归 | **必须改代码**，修复后再 Resolve |
-| **P2** | 可选：风格、命名、小优化、非阻塞建议 | **可不改代码**；回复后即可 Resolve |
+| **P2** | 可选：风格、命名、小优化、非阻塞建议 | **可不改代码**；可保持 open，或回复后 Resolve |
 
 ### P2 无代码改动时的 Resolve 话术
 
-在 thread 中回复其一，再点 Resolve：
+在 thread 中回复其一，再点 Resolve（也可不 Resolve，Gate 不因纯 P2 失败）：
 
 - `P2: defer — <reason>`（本次不做，后续再跟）
 - `P2: won't fix — <reason>`（明确不做）
 
 ### 未标注严重度时
 
-- 正确性 / 安全 / 数据丢失 → 按 **P0/P1** 处理（须改代码）
-- 纯 nit / style → 按 **P2** 处理（可 Resolve + rationale）
+- Gate / 正确性风险默认按 **P0/P1** 处理（须改代码；未标注会挡住 Codex Gate）
+- 纯 nit / style → 显式标 **P2**（可保持 open 或 Resolve + rationale）
 
 ### 对 Copilot / Codex
 
