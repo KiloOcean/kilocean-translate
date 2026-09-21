@@ -409,3 +409,19 @@ select:focus {
   padding: 0 12px;
   font-size: 12px;
 }
+
+.popup-footer {
+  margin-top: 10px;
+  text-align: right;
+}
+
+.popup-footer a {
+  color: #91a4ff;
+  font-size: 10px;
+  text-decoration: none;
+}
+
+.popup-footer a:hover {
+  text-decoration: underline;
+}
+
