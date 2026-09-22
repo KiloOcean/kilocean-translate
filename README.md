@@ -1,6 +1,6 @@
 # 千浩翻译 · Kilocean Translate
 
-Chrome / Edge 扩展：用你自己的 DeepSeek API Key，渐进式翻译当前网页，并自动跟译新加载内容。
+Chrome / Edge 扩展：用你自己的 DeepSeek 或 Kimi（Moonshot）API Key，渐进式翻译当前网页，并自动跟译新加载内容。
 
 **Chrome Web Store:** https://chromewebstore.google.com/detail/lmdbhjngjhlgbpmbjfffegjalchblpke
 
@@ -12,7 +12,7 @@ Chrome / Edge 扩展：用你自己的 DeepSeek API Key，渐进式翻译当前�
 - 整页渐进式翻译，不必等全部完成
 - 自动跟译滚动 / 交互后新加载的内容
 - 目标语言：简体中文、繁体中文、英语、日语、韩语
-- 支持 DeepSeek V4 Flash / V4 Pro
+- 支持 DeepSeek V4 Flash / V4 Pro，以及 Kimi（K2.6 / K3 / Moonshot V1 128k）
 - 一键清除译文并恢复页面
 - 导出翻译后 HTML；打印 / 保存 PDF
 - 自动跳过代码、输入框、链接、纯数字
@@ -23,22 +23,22 @@ Chrome / Edge 扩展：用你自己的 DeepSeek API Key，渐进式翻译当前�
 
 1. 打开 `chrome://extensions`，开启「开发者模式」
 2. 「加载已解压的扩展程序」，选择本仓库根目录
-3. 点击扩展图标，填入 DeepSeek API Key，选择语言、模型与显示模式后翻译
+3. 点击扩展图标，选择 DeepSeek 或 Kimi，填入对应 API Key，选择语言、模型与显示模式后翻译
 4. 需要划词翻译时，先打开一次扩展弹窗以注入当前标签页脚本，再回到页面选中文本
 
 ## 权限说明
 
 - `activeTab` / `scripting`：仅在你使用扩展时注入当前页
 - `storage`：本机保存 API Key 与显示模式
-- Host：仅 `https://api.deepseek.com/*`
+- Host：`https://api.deepseek.com/*`；启用 Kimi 时另需 `https://api.moonshot.cn/*`（及备用 `https://api.moonshot.ai/*`）
 
 ## 商店包
 
-正式发布请用商店后台上传的 zip（勿把含密钥的本地配置打进包）。当前版本见 `manifest.json`（1.3.1）。
+正式发布请用商店后台上传的 zip（勿把含密钥的本地配置打进包）。当前版本见 `manifest.json`（1.4.0）。
 
 ## 隐私
 
-网页文本会发往 DeepSeek API 以完成翻译；开发者不接收、不存储网页内容或你的 API Key。本扩展为独立第三方工具，与 DeepSeek 官方无隶属关系。
+网页文本会发往你选择的服务商 API（DeepSeek 或 Moonshot/Kimi）以完成翻译；开发者不接收、不存储网页内容或你的 API Key。本扩展为独立第三方工具，与 DeepSeek / Moonshot 官方无隶属关系。
 
 
 ## 质量门禁 / Quality Gate

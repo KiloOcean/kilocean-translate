@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "千浩翻译 · Kilocean Translate",
-  "version": "1.3.1",
-  "description": "Kilocean 千浩翻译：双语对照整页翻译、划词翻译，自动跟译新内容。权限极小，Key 只存在本机。",
+  "version": "1.4.0",
+  "description": "Kilocean 千浩翻译：DeepSeek / Kimi 自备 Key，双语对照整页翻译、划词翻译，自动跟译。权限极小，Key 只存在本机。无登录、无会员墙。",
   "minimum_chrome_version": "102",
   "permissions": [
     "activeTab",
@@ -10,7 +10,9 @@
     "storage"
   ],
   "host_permissions": [
-    "https://api.deepseek.com/*"
+    "https://api.deepseek.com/*",
+    "https://api.moonshot.cn/*",
+    "https://api.moonshot.ai/*"
   ],
   "background": {
     "service_worker": "background.js"

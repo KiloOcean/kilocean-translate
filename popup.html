@@ -19,11 +19,19 @@
       <section class="panel" aria-labelledby="settings-title">
         <div class="section-heading">
           <h2 id="settings-title">连接设置</h2>
-          <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">获取 Key</a>
+          <a id="get-key-link" href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">获取 Key</a>
         </div>
 
         <label class="field">
-          <span>DeepSeek API Key</span>
+          <span>服务商</span>
+          <select id="provider">
+            <option value="deepseek">DeepSeek</option>
+            <option value="kimi">Kimi（Moonshot）</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span id="api-key-label">DeepSeek API Key</span>
           <span class="password-wrap">
             <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" spellcheck="false">
             <button id="toggle-key" class="icon-button" type="button" aria-label="显示 API Key">显示</button>
@@ -110,7 +118,7 @@
         <p>HTML 会保留当前译文和原页面样式；PDF 将打开 Chrome 打印窗口。</p>
       </section>
 
-      <p class="privacy-note">API Key 仅保存在本机 Chrome 中。网页文本会发送至 DeepSeek 完成翻译。无登录、无会员墙。</p>
+      <p class="privacy-note">API Key 仅保存在本机 Chrome 中。网页文本会发送至你选择的服务商（DeepSeek 或 Kimi）完成翻译。无登录、无会员墙。</p>
 
       <footer class="popup-footer">
         <a href="mailto:qianhao1229@gmail.com?subject=%E5%8D%83%E6%B5%A9%E7%BF%BB%E8%AF%91%E5%8F%8D%E9%A6%88">反馈 / 联系</a>

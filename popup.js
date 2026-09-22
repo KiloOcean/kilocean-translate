@@ -2,7 +2,36 @@
 
 const Utils = globalThis.DeepSeekTranslatorUtils;
 
+const PROVIDER_META = {
+  deepseek: {
+    label: "DeepSeek",
+    keyLabel: "DeepSeek API Key",
+    keyUrl: "https://platform.deepseek.com/api_keys",
+    keyField: "deepseekApiKey",
+    models: [
+      { value: "deepseek-v4-flash", label: "V4 Flash · 快" },
+      { value: "deepseek-v4-pro", label: "V4 Pro · 准" }
+    ],
+    defaultModel: "deepseek-v4-flash"
+  },
+  kimi: {
+    label: "Kimi",
+    keyLabel: "Kimi API Key",
+    keyUrl: "https://platform.moonshot.cn/console/api-keys",
+    keyField: "kimiApiKey",
+    models: [
+      { value: "kimi-k2.6", label: "Kimi K2.6 · 推荐" },
+      { value: "kimi-k3", label: "Kimi K3" },
+      { value: "moonshot-v1-128k", label: "Moonshot V1 128k · 长文" }
+    ],
+    defaultModel: "kimi-k2.6"
+  }
+};
+
 const DEFAULT_SETTINGS = {
+  provider: "deepseek",
+  deepseekApiKey: "",
+  kimiApiKey: "",
   apiKey: "",
   model: "deepseek-v4-flash",
   targetLanguage: "zh-CN",
@@ -10,7 +39,10 @@ const DEFAULT_SETTINGS = {
 };
 
 const elements = {
+  provider: document.getElementById("provider"),
   apiKey: document.getElementById("api-key"),
+  apiKeyLabel: document.getElementById("api-key-label"),
+  getKeyLink: document.getElementById("get-key-link"),
   targetLanguage: document.getElementById("target-language"),
   model: document.getElementById("model"),
   toggleKey: document.getElementById("toggle-key"),
@@ -125,6 +157,10 @@ function persistSettingsNow() {
 elements.apiKey.addEventListener("input", schedulePersistSettings);
 elements.apiKey.addEventListener("change", persistSettingsNow);
 elements.apiKey.addEventListener("blur", persistSettingsNow);
+elements.provider.addEventListener("change", () => {
+  applyProviderUi(elements.provider.value, { resetModel: true });
+  persistSettingsNow();
+});
 elements.targetLanguage.addEventListener("change", persistSettingsNow);
 elements.model.addEventListener("change", persistSettingsNow);
 window.addEventListener("pagehide", persistSettingsNow);
@@ -181,7 +217,7 @@ elements.testConnection.addEventListener("click", async () => {
 
   elements.testConnection.disabled = true;
   elements.testConnection.textContent = "正在测试…";
-  setStatus("正在连接 DeepSeek", "发送一条最小测试请求", "loading");
+  setStatus(`正在连接 ${PROVIDER_META[elements.provider.value]?.label || "API"}`, "发送一条最小测试请求", "loading");
 
   try {
     const settings = await saveSettings();
@@ -281,13 +317,22 @@ async function initialize() {
   ]);
 
   currentTab = tabs[0];
-  elements.apiKey.value = settings.apiKey;
-  elements.targetLanguage.value = settings.targetLanguage;
-  elements.model.value = settings.model;
-  currentDisplayMode = Utils.normalizeDisplayMode(settings.displayMode);
+  const migrated = migrateSettings(settings);
+  const provider = PROVIDER_META[migrated.provider] ? migrated.provider : "deepseek";
+  elements.provider.value = provider;
+  applyProviderUi(provider, { resetModel: false });
+  elements.apiKey.value = migrated[PROVIDER_META[provider].keyField] || "";
+  elements.targetLanguage.value = migrated.targetLanguage;
+  if ([...elements.model.options].some((o) => o.value === migrated.model)) {
+    elements.model.value = migrated.model;
+  }
+  currentDisplayMode = Utils.normalizeDisplayMode(migrated.displayMode);
   renderDisplayMode();
   // Controls now mirror storage — safe to persist on hide/unload.
   initialized = true;
+  if (migrated._didMigrate) {
+    await saveSettings();
+  }
 
   if (!currentTab?.id) {
     throw new Error("找不到当前标签页");
@@ -316,13 +361,60 @@ async function initialize() {
   await refreshPendingSelection();
 }
 
+function migrateSettings(raw) {
+  const settings = { ...DEFAULT_SETTINGS, ...raw };
+  let provider = PROVIDER_META[settings.provider] ? settings.provider : "deepseek";
+  let deepseekApiKey = String(settings.deepseekApiKey || "").trim();
+  let kimiApiKey = String(settings.kimiApiKey || "").trim();
+  const legacy = String(settings.apiKey || "").trim();
+  let didMigrate = false;
+  if (!deepseekApiKey && legacy) {
+    deepseekApiKey = legacy;
+    didMigrate = true;
+  }
+  return {
+    ...settings,
+    provider,
+    deepseekApiKey,
+    kimiApiKey,
+    apiKey: "",
+    _didMigrate: didMigrate
+  };
+}
+
+function applyProviderUi(providerId, { resetModel }) {
+  const meta = PROVIDER_META[providerId] || PROVIDER_META.deepseek;
+  elements.apiKeyLabel.textContent = meta.keyLabel;
+  elements.getKeyLink.href = meta.keyUrl;
+  const previousModel = elements.model.value;
+  elements.model.innerHTML = "";
+  for (const item of meta.models) {
+    const option = document.createElement("option");
+    option.value = item.value;
+    option.textContent = item.label;
+    elements.model.appendChild(option);
+  }
+  if (!resetModel && meta.models.some((m) => m.value === previousModel)) {
+    elements.model.value = previousModel;
+  } else {
+    elements.model.value = meta.defaultModel;
+  }
+}
+
 async function saveSettings() {
+  const provider = PROVIDER_META[elements.provider.value] ? elements.provider.value : "deepseek";
+  const meta = PROVIDER_META[provider];
+  const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
   const settings = {
-    apiKey: elements.apiKey.value.trim(),
+    provider,
+    deepseekApiKey: String(stored.deepseekApiKey || "").trim(),
+    kimiApiKey: String(stored.kimiApiKey || "").trim(),
+    apiKey: "",
     targetLanguage: elements.targetLanguage.value,
     model: elements.model.value,
     displayMode: Utils.normalizeDisplayMode(currentDisplayMode)
   };
+  settings[meta.keyField] = elements.apiKey.value.trim();
   await chrome.storage.local.set(settings);
   return settings;
 }
@@ -340,7 +432,7 @@ function validateApiKey() {
     return true;
   }
   elements.apiKey.focus();
-  setStatus("缺少 API Key", "请先填写 DeepSeek API Key", "error");
+  setStatus("缺少 API Key", `请先填写 ${PROVIDER_META[elements.provider.value]?.label || ""} API Key`, "error");
   return false;
 }
 
