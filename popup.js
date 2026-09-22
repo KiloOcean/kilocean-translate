@@ -236,6 +236,7 @@ elements.testConnection.addEventListener("click", async () => {
     const settings = await saveSettings();
     const response = await chrome.runtime.sendMessage({
       type: "TEST_CONNECTION",
+      provider: settings.provider,
       targetLanguage: settings.targetLanguage,
       model: settings.model
     });
@@ -384,7 +385,9 @@ function migrateSettings(raw) {
   let kimiApiKey = String(settings.kimiApiKey || "").trim();
   const legacy = String(settings.apiKey || "").trim();
   let didMigrate = false;
-  if (!deepseekApiKey && legacy) {
+  // Only treat `apiKey` as a <=1.3.x DeepSeek key when no per-provider keys
+  // exist yet; a Kimi-only user's mirrored apiKey is not legacy storage.
+  if (!deepseekApiKey && !kimiApiKey && legacy) {
     deepseekApiKey = legacy;
     didMigrate = true;
   }

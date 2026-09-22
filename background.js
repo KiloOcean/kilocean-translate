@@ -46,8 +46,10 @@ async function loadSettings() {
   let deepseekApiKey = String(stored.deepseekApiKey || "").trim();
   const kimiApiKey = String(stored.kimiApiKey || "").trim();
   const legacyKey = String(stored.apiKey || "").trim();
-  // <=1.3.x stored a single DeepSeek key under `apiKey`; migrate it once.
-  if (!deepseekApiKey && legacyKey) {
+  // <=1.3.x stored a single DeepSeek key under `apiKey`; migrate it once,
+  // and only when no per-provider keys exist yet (a Kimi-only user's
+  // mirrored apiKey is not legacy storage).
+  if (!deepseekApiKey && !kimiApiKey && legacyKey) {
     deepseekApiKey = legacyKey;
   }
   const activeKey = provider === "kimi" ? kimiApiKey : deepseekApiKey;

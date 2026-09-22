@@ -8,7 +8,7 @@ I built a Chrome webpage translator around the complaints people keep posting ab
 
 - No account, no login nag, no extension membership wall
 - Bring your own DeepSeek or Kimi API key (key stays on-device)
-- Tiny permission surface: activeTab + scripting + storage; network only to the API host you selected
+- Tiny permission surface: activeTab + scripting + storage; host access only to DeepSeek and Moonshot/Kimi API endpoints (not every site)
 - Bilingual / translation-only / original; selection translate confirms before it spends tokens; follows dynamic content
 
 Store: https://chromewebstore.google.com/detail/lmdbhjngjhlgbpmbjfffegjalchblpke
