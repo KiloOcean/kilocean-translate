@@ -66,6 +66,10 @@ let statusTimer = null;
 let currentDisplayMode = Utils.DISPLAY_MODES.bilingual;
 let initialized = false;
 let displayModeOp = 0;
+// Active provider + per-provider keys so switching never mixes or clobbers
+// the two credentials; elements.apiKey always edits currentProvider's entry.
+let currentProvider = "deepseek";
+let providerKeys = { deepseek: "", kimi: "" };
 /** @type {{ text: string, rangeId: string } | null} */
 let pendingSelection = null;
 
@@ -158,7 +162,16 @@ elements.apiKey.addEventListener("input", schedulePersistSettings);
 elements.apiKey.addEventListener("change", persistSettingsNow);
 elements.apiKey.addEventListener("blur", persistSettingsNow);
 elements.provider.addEventListener("change", () => {
-  applyProviderUi(elements.provider.value, { resetModel: true });
+  const nextProvider = PROVIDER_META[elements.provider.value] ? elements.provider.value : "deepseek";
+  if (nextProvider === currentProvider) {
+    return;
+  }
+  // Bank the key shown in the input under the provider it belongs to, then
+  // swap the input to the newly selected provider's stored key.
+  providerKeys[currentProvider] = elements.apiKey.value.trim();
+  currentProvider = nextProvider;
+  applyProviderUi(nextProvider, { resetModel: true });
+  elements.apiKey.value = providerKeys[nextProvider];
   persistSettingsNow();
 });
 elements.targetLanguage.addEventListener("change", persistSettingsNow);
@@ -319,9 +332,11 @@ async function initialize() {
   currentTab = tabs[0];
   const migrated = migrateSettings(settings);
   const provider = PROVIDER_META[migrated.provider] ? migrated.provider : "deepseek";
+  currentProvider = provider;
+  providerKeys = { deepseek: migrated.deepseekApiKey, kimi: migrated.kimiApiKey };
   elements.provider.value = provider;
   applyProviderUi(provider, { resetModel: false });
-  elements.apiKey.value = migrated[PROVIDER_META[provider].keyField] || "";
+  elements.apiKey.value = providerKeys[provider];
   elements.targetLanguage.value = migrated.targetLanguage;
   if ([...elements.model.options].some((o) => o.value === migrated.model)) {
     elements.model.value = migrated.model;
@@ -363,7 +378,7 @@ async function initialize() {
 
 function migrateSettings(raw) {
   const settings = { ...DEFAULT_SETTINGS, ...raw };
-  let provider = PROVIDER_META[settings.provider] ? settings.provider : "deepseek";
+  const provider = PROVIDER_META[settings.provider] ? settings.provider : "deepseek";
   let deepseekApiKey = String(settings.deepseekApiKey || "").trim();
   let kimiApiKey = String(settings.kimiApiKey || "").trim();
   const legacy = String(settings.apiKey || "").trim();
@@ -377,7 +392,9 @@ function migrateSettings(raw) {
     provider,
     deepseekApiKey,
     kimiApiKey,
-    apiKey: "",
+    // content.js's selection gate still reads the legacy single-key field;
+    // mirror the active provider's key into it on every write.
+    apiKey: provider === "kimi" ? kimiApiKey : deepseekApiKey,
     _didMigrate: didMigrate
   };
 }
@@ -403,18 +420,17 @@ function applyProviderUi(providerId, { resetModel }) {
 
 async function saveSettings() {
   const provider = PROVIDER_META[elements.provider.value] ? elements.provider.value : "deepseek";
-  const meta = PROVIDER_META[provider];
-  const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
+  providerKeys[provider] = elements.apiKey.value.trim();
   const settings = {
     provider,
-    deepseekApiKey: String(stored.deepseekApiKey || "").trim(),
-    kimiApiKey: String(stored.kimiApiKey || "").trim(),
-    apiKey: "",
+    deepseekApiKey: providerKeys.deepseek,
+    kimiApiKey: providerKeys.kimi,
+    // Legacy mirror for content.js's selection key gate.
+    apiKey: providerKeys[provider],
     targetLanguage: elements.targetLanguage.value,
     model: elements.model.value,
     displayMode: Utils.normalizeDisplayMode(currentDisplayMode)
   };
-  settings[meta.keyField] = elements.apiKey.value.trim();
   await chrome.storage.local.set(settings);
   return settings;
 }

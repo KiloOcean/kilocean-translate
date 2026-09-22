@@ -144,9 +144,9 @@
     return nonEmptyLines.length === 0 ? 0 : nonEmptyLines.length;
   }
 
-  function parseTranslationPayload(content, expectedCount, sourceText) {
+  function parseTranslationPayload(content, expectedCount, sourceText, providerLabel = "DeepSeek") {
     if (typeof content !== "string" || content.trim() === "") {
-      throw new Error("DeepSeek 返回了空内容");
+      throw new Error(`${providerLabel} 返回了空内容`);
     }
 
     const cleaned = content
@@ -158,12 +158,12 @@
     try {
       payload = JSON.parse(cleaned);
     } catch {
-      throw new Error("DeepSeek 返回的翻译结果不是有效 JSON");
+      throw new Error(`${providerLabel} 返回的翻译结果不是有效 JSON`);
     }
 
     const translations = Array.isArray(payload) ? payload : payload.translations;
     if (!Array.isArray(translations)) {
-      throw new Error("DeepSeek 返回结果缺少 translations 数组");
+      throw new Error(`${providerLabel} 返回结果缺少 translations 数组`);
     }
 
     // A single multi-paragraph segment sometimes comes back as one entry per
@@ -187,7 +187,7 @@
     }
 
     if (translations.length !== expectedCount) {
-      throw new Error(`DeepSeek 返回 ${translations.length} 条结果，预期 ${expectedCount} 条`);
+      throw new Error(`${providerLabel} 返回 ${translations.length} 条结果，预期 ${expectedCount} 条`);
     }
 
     return translations.map((item, index) => {

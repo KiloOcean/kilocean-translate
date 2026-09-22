@@ -24,7 +24,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   provider: "deepseek",
   deepseekApiKey: "",
   kimiApiKey: "",
-  // Legacy field kept for one-time migration from <=1.3.x
+  // Mirror of the active provider's key: content.js's selection gate still
+  // reads this legacy single-key field (and <=1.3.x keys migrate from it).
   apiKey: "",
   model: "deepseek-v4-flash",
   targetLanguage: "zh-CN",
@@ -43,11 +44,20 @@ async function loadSettings() {
   const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
   const provider = normalizeProvider(stored.provider);
   let deepseekApiKey = String(stored.deepseekApiKey || "").trim();
-  let kimiApiKey = String(stored.kimiApiKey || "").trim();
+  const kimiApiKey = String(stored.kimiApiKey || "").trim();
   const legacyKey = String(stored.apiKey || "").trim();
+  // <=1.3.x stored a single DeepSeek key under `apiKey`; migrate it once.
   if (!deepseekApiKey && legacyKey) {
     deepseekApiKey = legacyKey;
-    await chrome.storage.local.set({ deepseekApiKey, apiKey: "" });
+  }
+  const activeKey = provider === "kimi" ? kimiApiKey : deepseekApiKey;
+  // Keep `apiKey` mirroring the active provider's key (content.js's selection
+  // gate reads it) and persist the migrated DeepSeek key. Write only on drift.
+  if (
+    String(stored.apiKey || "").trim() !== activeKey ||
+    String(stored.deepseekApiKey || "").trim() !== deepseekApiKey
+  ) {
+    await chrome.storage.local.set({ deepseekApiKey, apiKey: activeKey });
   }
   const providerConfig = getProviderConfig(provider);
   const model = providerConfig.models.includes(stored.model)
@@ -371,7 +381,8 @@ async function translateBatch(texts, targetLanguage, requestedModel) {
     return DeepSeekTranslatorUtils.parseTranslationPayload(
       content,
       texts.length,
-      texts.length === 1 ? texts[0] : undefined
+      texts.length === 1 ? texts[0] : undefined,
+      providerConfig.label
     );
   } catch (error) {
     const parseError = createError(error.message, "INVALID_API_RESPONSE");
