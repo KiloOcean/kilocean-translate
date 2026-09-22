@@ -10,7 +10,7 @@ CI 绿灯是**必要但不充分**条件。**禁止**仅凭 `Build & Test` 合�
 2. **Codex Review Gate**：Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex 行内线程
 3. **Conversation resolution**：所有 review threads 已 resolve
 4. **自测清单**勾选（见下）
-5. **权限未扩大**：`activeTab` / `scripting` / `storage`；host 仅 `https://api.deepseek.com/*`
+5. **权限克制**：`activeTab` / `scripting` / `storage`；host 仅翻译 API（`api.deepseek.com`，以及可选的 `api.moonshot.cn`）
 
 ### Copilot
 

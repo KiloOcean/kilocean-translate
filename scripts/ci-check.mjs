@@ -13,7 +13,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 
 const ALLOWED_PERMISSIONS = new Set(["activeTab", "scripting", "storage"]);
-const ALLOWED_HOST = "https://api.deepseek.com/*";
+const ALLOWED_HOSTS = new Set([
+  "https://api.deepseek.com/*",
+  "https://api.moonshot.cn/*",
+]);
 const JS_FILES = ["background.js", "content.js", "popup.js", "shared.js"];
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
@@ -72,12 +75,12 @@ function checkManifest() {
   }
 
   const hosts = Array.isArray(manifest.host_permissions) ? manifest.host_permissions : [];
-  if (hosts.length === 0) {
+  if (!hosts.includes("https://api.deepseek.com/*")) {
     fail("host_permissions must include https://api.deepseek.com/*");
   }
   for (const host of hosts) {
-    if (host !== ALLOWED_HOST && !host.startsWith("https://api.deepseek.com/")) {
-      fail(`disallowed host_permission: ${host} (only https://api.deepseek.com/* allowed)`);
+    if (!ALLOWED_HOSTS.has(host)) {
+      fail(`disallowed host_permission: ${host} (allowlist: ${[...ALLOWED_HOSTS].join(", ")})`);
     }
   }
 }

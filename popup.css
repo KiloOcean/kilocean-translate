@@ -106,6 +106,10 @@ h2 {
   font-size: 11px;
 }
 
+.key-field {
+  margin-top: 12px;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
