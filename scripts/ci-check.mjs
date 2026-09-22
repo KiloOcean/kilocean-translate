@@ -16,7 +16,6 @@ const ALLOWED_PERMISSIONS = new Set(["activeTab", "scripting", "storage"]);
 const ALLOWED_HOSTS = new Set([
   "https://api.deepseek.com/*",
   "https://api.moonshot.cn/*",
-  "https://api.moonshot.ai/*"
 ]);
 const JS_FILES = ["background.js", "content.js", "popup.js", "shared.js"];
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;

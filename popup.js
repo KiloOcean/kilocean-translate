@@ -266,6 +266,7 @@ elements.translate.addEventListener("click", async () => {
     const response = await chrome.tabs.sendMessage(currentTab.id, {
       type: "START_TRANSLATION",
       options: {
+        provider: settings.provider,
         targetLanguage: settings.targetLanguage,
         model: settings.model,
         displayMode: settings.displayMode

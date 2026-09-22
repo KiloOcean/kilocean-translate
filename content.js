@@ -59,9 +59,9 @@
   let selectionHostEl = null;
   let applyingDom = false;
   let applyingDomGeneration = 0;
-  /** @type {{ targetLanguage: string, model: string } | null} */
+  /** @type {{ provider: string, targetLanguage: string, model: string } | null} */
   let activeRunSettings = null;
-  /** @type {{ targetLanguage?: string, model?: string } | null} */
+  /** @type {{ provider?: string, targetLanguage?: string, model?: string } | null} */
   let deferredRunSettings = null;
 
   const state = {
@@ -71,6 +71,7 @@
     total: 0,
     failed: 0,
     error: "",
+    provider: "deepseek",
     targetLanguage: "zh-CN",
     model: "deepseek-v4-flash",
     displayMode: Utils.DISPLAY_MODES.bilingual
@@ -82,10 +83,14 @@
 
   chrome.storage.local.get({
     displayMode: Utils.DISPLAY_MODES.bilingual,
+    provider: state.provider,
     targetLanguage: state.targetLanguage,
     model: state.model
   }, (stored) => {
     state.displayMode = Utils.normalizeDisplayMode(stored.displayMode);
+    if (stored.provider === "kimi" || stored.provider === "deepseek") {
+      state.provider = stored.provider;
+    }
     if (stored.targetLanguage) {
       state.targetLanguage = stored.targetLanguage;
     }
@@ -124,6 +129,17 @@
         };
       } else {
         state.model = changes.model.newValue;
+      }
+    }
+    if (changes.provider?.newValue) {
+      const nextProvider = changes.provider.newValue === "kimi" ? "kimi" : "deepseek";
+      if (state.active) {
+        deferredRunSettings = {
+          ...(deferredRunSettings || {}),
+          provider: nextProvider
+        };
+      } else {
+        state.provider = nextProvider;
       }
     }
   });
@@ -224,6 +240,7 @@
   });
 
   async function startTranslation(options) {
+    const provider = options.provider === "kimi" ? "kimi" : "deepseek";
     const targetLanguage = options.targetLanguage || "zh-CN";
     const model = options.model || "deepseek-v4-flash";
     let displayMode = Utils.normalizeDisplayMode(
@@ -238,6 +255,7 @@
 
     if (
       state.active &&
+      state.provider === provider &&
       state.targetLanguage === targetLanguage &&
       state.model === model &&
       state.phase === "translating"
@@ -256,7 +274,7 @@
     // The stale chain keeps its own catch, so its late settle cannot reject here.
     workQueue = Promise.resolve();
     deferredRunSettings = null;
-    activeRunSettings = { targetLanguage, model };
+    activeRunSettings = { provider, targetLanguage, model };
     Object.assign(state, {
       active: true,
       phase: "translating",
@@ -264,6 +282,7 @@
       total: 0,
       failed: 0,
       error: "",
+      provider,
       targetLanguage,
       model,
       displayMode
@@ -329,6 +348,7 @@
 
   function getRunSettings() {
     return activeRunSettings || {
+      provider: state.provider || "deepseek",
       targetLanguage: state.targetLanguage,
       model: state.model
     };
@@ -940,6 +960,7 @@
     const response = await chrome.runtime.sendMessage({
       type: "TRANSLATE_BATCH",
       texts,
+      provider: runSettings.provider || "deepseek",
       targetLanguage: runSettings.targetLanguage,
       model: runSettings.model
     });
@@ -2327,6 +2348,7 @@
 
     try {
       const stored = await chrome.storage.local.get({
+        provider: state.provider || "deepseek",
         targetLanguage: state.targetLanguage,
         model: state.model,
         apiKey: ""
@@ -2366,7 +2388,8 @@
         return { ok: false, error: "无法定位划词位置，请重新选中后确认" };
       }
 
-      // Keep selection target/model local — never clobber pinned page-run state.
+      // Keep selection provider/target/model local — never clobber pinned page-run state.
+      const provider = stored.provider === "kimi" ? "kimi" : "deepseek";
       const targetLanguage = stored.targetLanguage || state.targetLanguage;
       const model = stored.model || state.model;
 
@@ -2411,6 +2434,7 @@
       const response = await chrome.runtime.sendMessage({
         type: "SELECTION_TRANSLATE_BATCH",
         texts: [gesture.text],
+        provider,
         targetLanguage,
         model
       });

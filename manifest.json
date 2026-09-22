@@ -11,8 +11,7 @@
   ],
   "host_permissions": [
     "https://api.deepseek.com/*",
-    "https://api.moonshot.cn/*",
-    "https://api.moonshot.ai/*"
+    "https://api.moonshot.cn/*"
   ],
   "background": {
     "service_worker": "background.js"

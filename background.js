@@ -12,7 +12,7 @@ const PROVIDERS = Object.freeze({
   kimi: Object.freeze({
     id: "kimi",
     label: "Kimi",
-    // Domestic Moonshot endpoint; api.moonshot.ai also permitted in manifest.
+    // Domestic Moonshot endpoint.
     apiUrl: "https://api.moonshot.cn/v1/chat/completions",
     models: Object.freeze(["kimi-k2.6", "kimi-k3", "moonshot-v1-128k"]),
     defaultModel: "kimi-k2.6",
@@ -106,7 +106,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "TRANSLATE_BATCH") {
-    translateBatch(message.texts, message.targetLanguage, message.model)
+    translateBatch(message.texts, message.targetLanguage, message.model, message.provider)
       .then((translations) => sendResponse({ ok: true, translations }))
       .catch((error) => sendResponse({
         ok: false,
@@ -130,7 +130,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
     selectionSendTimes.push(Date.now());
-    translateBatch(message.texts, message.targetLanguage, message.model)
+    translateBatch(message.texts, message.targetLanguage, message.model, message.provider)
       .then((translations) => sendResponse({ ok: true, translations }))
       .catch((error) => sendResponse({
         ok: false,
@@ -142,7 +142,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "TEST_CONNECTION") {
-    translateBatch(["Hello, world."], message.targetLanguage, message.model)
+    translateBatch(["Hello, world."], message.targetLanguage, message.model, message.provider)
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({
         ok: false,
@@ -292,13 +292,14 @@ async function setSelectionBadge(tabId, active) {
   }
 }
 
-async function translateBatch(texts, targetLanguage, requestedModel) {
+async function translateBatch(texts, targetLanguage, requestedModel, pinnedProvider) {
   if (!Array.isArray(texts) || texts.length === 0 || texts.length > 24) {
     throw createError("翻译批次格式不正确", "INVALID_BATCH");
   }
 
   const settings = await loadSettings();
-  const providerConfig = getProviderConfig(settings.provider);
+  const provider = normalizeProvider(pinnedProvider || settings.provider);
+  const providerConfig = getProviderConfig(provider);
   const apiKey = String(settings[providerConfig.keyField] || "").trim();
   if (!apiKey) {
     throw createError(`请先在扩展中填写 ${providerConfig.label} API Key`, "MISSING_API_KEY");
@@ -340,7 +341,7 @@ async function translateBatch(texts, targetLanguage, requestedModel) {
     max_tokens: 8192
   };
   // DeepSeek-only knob; omit for Kimi/Moonshot.
-  if (settings.provider === "deepseek") {
+  if (provider === "deepseek") {
     body.thinking = { type: "disabled" };
   }
 

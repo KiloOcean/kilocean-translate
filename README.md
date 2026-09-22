@@ -30,7 +30,7 @@ Chrome / Edge 扩展：用你自己的 DeepSeek 或 Kimi（Moonshot）API Key，
 
 - `activeTab` / `scripting`：仅在你使用扩展时注入当前页
 - `storage`：本机保存 API Key 与显示模式
-- Host：`https://api.deepseek.com/*`；启用 Kimi 时另需 `https://api.moonshot.cn/*`（及备用 `https://api.moonshot.ai/*`）
+- Host：`https://api.deepseek.com/*`；启用 Kimi 时另需 `https://api.moonshot.cn/*`
 
 ## 商店包
 
