@@ -29,6 +29,10 @@
   const SELECTION_SEND_MIN_INTERVAL_MS = 1000;
   const SELECTION_SEND_WINDOW_MS = 10000;
   const SELECTION_SEND_WINDOW_LIMIT = 8;
+  // On X hosts the page is mostly untranslated UI chrome (sidebar, trends,
+  // follow rows, footer); only tweet bodies and profile bios get translated.
+  // Generic sites keep the full-page behavior.
+  const IS_X_HOST = Utils.isXHost(location.hostname);
 
   /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, wraps: HTMLElement[], companion: HTMLElement, layout: string}>} */
   const blockRecords = new Map();
@@ -46,7 +50,7 @@
   let selectionGeneration = 0;
   /** Last selection translate key (target\0model\0text\0range) to avoid rebill on Shift release. */
   let lastSelectionKey = "";
-  /** Gesture snapshot shown in the panel; billed only by the panel's 「翻译」 click. */
+  /** Gesture snapshot previewed in the panel; billed only by the extension popup's confirm. */
   let pendingSelectionGesture = null;
   /** @type {string} text\0rangeIdentity of the selection last scheduled for translate. */
   let lastScheduledSelectionSnapshot = "";
@@ -497,6 +501,19 @@
     }
   }
 
+  // Full gate for a candidate block text: translatable shape, not page chrome
+  // (@handle / URL / counter / bare date), and not already in the target
+  // language (re-translating those duplicates them: "Home Home", "宝玉宝玉").
+  function shouldTranslateBlockText(text, targetLanguage) {
+    if (!Utils.isTranslatableText(text, targetLanguage)) {
+      return false;
+    }
+    if (Utils.isSkippableText(text)) {
+      return false;
+    }
+    return !Utils.isAlreadyTargetLanguage(text, targetLanguage);
+  }
+
   function collectBlocks(root) {
     const textNodes = collectTextNodes(root);
     const blocks = [];
@@ -512,7 +529,7 @@
       // blocks are not re-walked per text node (quadratic discovery).
       seen.add(block);
       const fullText = extractBlockText(block);
-      if (!fullText || !Utils.isTranslatableText(fullText, targetLanguage)) {
+      if (!shouldTranslateBlockText(fullText, targetLanguage)) {
         continue;
       }
       blocks.push(block);
@@ -535,7 +552,7 @@
         continue;
       }
       const ownText = extractBlockText(block, nested);
-      if (ownText && Utils.isTranslatableText(ownText, targetLanguage)) {
+      if (shouldTranslateBlockText(ownText, targetLanguage)) {
         withOwnText.push(block);
       }
     }
@@ -646,6 +663,22 @@
     return Boolean(el?.closest?.("[data-deepseek-translator-ui]"));
   }
 
+  // Text living outside any scope we translate: <time> timestamps and, on X,
+  // anything outside tweetText / UserDescription (usernames, handles, counts,
+  // nav chrome). Covers both discovery (isEligibleTextHost) and extraction
+  // (collectRawTextNodes) so neither path can pick it up.
+  function isNonTranslatableScope(parent) {
+    if (!parent) {
+      return true;
+    }
+    // <time> holds timestamps ("Oct 12", "2h"); translating them glues
+    // duplicates like "Oct 1210月12日".
+    if (parent.closest("time")) {
+      return true;
+    }
+    return IS_X_HOST && !parent.closest(Utils.X_TRANSLATABLE_SELECTOR);
+  }
+
   function isEligibleTextHost(parent) {
     if (!parent) {
       return false;
@@ -656,7 +689,31 @@
     if (parent.closest('[translate="no"], [contenteditable="true"], [data-deepseek-translator-ui]')) {
       return false;
     }
+    if (isNonTranslatableScope(parent)) {
+      return false;
+    }
     return !hasHiddenAncestor(parent);
+  }
+
+  // Mutation-queueing counterpart of isNonTranslatableScope for X: a
+  // page-owned mutation root is worth scheduling only when it lives inside
+  // tweetText / UserDescription, or carries one in its subtree (a freshly
+  // inserted timeline article nests tweetText several levels down).
+  // Everything else — sidebar, counters, nav chrome — can never yield an
+  // eligible block, and queueing it would endlessly reset the 450 ms
+  // debounce and pin state.phase at "translating" while export stays locked.
+  function isInXTranslatableMutationScope(node) {
+    if (!IS_X_HOST) {
+      return true;
+    }
+    const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    if (!el?.isConnected) {
+      return false;
+    }
+    return (
+      el.closest(Utils.X_TRANSLATABLE_SELECTOR) != null ||
+      el.querySelector(Utils.X_TRANSLATABLE_SELECTOR) != null
+    );
   }
 
   function shouldTranslateTextNode(node) {
@@ -685,7 +742,7 @@
 
     if (root.nodeType === Node.TEXT_NODE) {
       const parent = root.parentElement;
-      if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent)) {
+      if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent) || isNonTranslatableScope(parent)) {
         return [];
       }
       if (parent.closest('[translate="no"], [contenteditable="true"]')) {
@@ -698,7 +755,7 @@
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         const parent = node.parentElement;
-        if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent)) {
+        if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent) || isNonTranslatableScope(parent)) {
           return NodeFilter.FILTER_REJECT;
         }
         if (parent.closest('[translate="no"], [contenteditable="true"]')) {
@@ -720,6 +777,12 @@
     while (el && el !== document.body && el !== document.documentElement) {
       if (el.closest("[data-deepseek-translator-ui]")) {
         return null;
+      }
+      // On X, the tweetText / UserDescription container is always the block so
+      // the translation can land as its block-level sibling — never inline in
+      // the flex header / username rows that wrap tweet bodies.
+      if (IS_X_HOST && el.matches(Utils.X_TRANSLATABLE_SELECTOR)) {
+        return el;
       }
       if (BLOCK_TAGS.has(el.tagName)) {
         return el;
@@ -830,7 +893,7 @@
     for (const block of candidates) {
       const nested = descendantsOf.get(block) || [];
       const text = extractBlockText(block, nested);
-      if (!text || !Utils.isTranslatableText(text, runSettings.targetLanguage)) {
+      if (!shouldTranslateBlockText(text, runSettings.targetLanguage)) {
         continue;
       }
       segments.push({
@@ -1320,6 +1383,13 @@
       if (options.companionOnly) {
         placement = "companion";
       }
+      // X tweetText / UserDescription: the translation must be a block-level
+      // sibling AFTER the container (display:block; width:100%). Inserting it
+      // inside flex header/username rows squeezes quoted-tweet translations
+      // into narrow columns and stacks @handles vertically.
+      if (IS_X_HOST && block.matches(Utils.X_TRANSLATABLE_SELECTOR)) {
+        placement = "after-host";
+      }
       let wrap = null;
       let createdWraps = [];
       let layout = "wrap";
@@ -1775,7 +1845,7 @@
               if (refreshHost) {
                 pendingRefreshBlocks.add(refreshHost);
                 queuedDynamicWork = true;
-              } else if (record.target?.isConnected) {
+              } else if (record.target?.isConnected && isInXTranslatableMutationScope(record.target)) {
                 // In-flight translate may have no blockRecords yet — queue target
                 // so discovery retries after the pending request rejects the stale segment.
                 pendingRoots.add(record.target);
@@ -1803,6 +1873,9 @@
               queuedDynamicWork = true;
               return;
             }
+            if (!isInXTranslatableMutationScope(node)) {
+              return;
+            }
             pendingRoots.add(node);
             queuedDynamicWork = true;
           });
@@ -1817,7 +1890,11 @@
             queuedDynamicWork = true;
             continue;
           }
-          if (isDefinitelyIneligibleNode(node) || isIgnoredTranslatorMutation(node)) {
+          if (
+            isDefinitelyIneligibleNode(node) ||
+            isIgnoredTranslatorMutation(node) ||
+            !isInXTranslatableMutationScope(node)
+          ) {
             continue;
           }
           pendingRoots.add(node);
@@ -1879,6 +1956,10 @@
       dynamicTimer = null;
       pruneDetachedBlockRecords();
 
+      // X "Show more" expands a recorded tweetText in place: that content
+      // mutation lands in pendingRefreshBlocks, discardBlockRecord below
+      // removes the stale translation block + wraps, and the dynamic pass
+      // re-translates the full text in place. No extra observer needed.
       for (const block of pendingRefreshBlocks) {
         if (blockRecords.has(block)) {
           discardBlockRecord(block);
@@ -2093,14 +2174,38 @@
       return;
     }
     const host = selectionHostEl;
-    if (host && event.target !== host && !host.contains(event.target)) {
-      // A trusted outside press starts a fresh pointer gesture — drop the
-      // dedupe key so re-selecting the same range reopens the panel.
-      // ×/Escape still go through hideSelectionPanel with the key retained.
-      if (event.isTrusted !== false) {
-        lastSelectionKey = "";
-      }
+    if (host && (event.target === host || host.contains(event.target))) {
+      return;
+    }
+    // A trusted outside press starts a fresh pointer gesture — drop the
+    // dedupe key so re-selecting the same range translates again. This must
+    // also run when the host was already removed (dismissed earlier), or a
+    // stale key from the previous request dead-ends the next identical drag
+    // with 该选中文本已翻译.
+    // ×/Escape still go through hideSelectionPanel with the key retained.
+    if (event.isTrusted !== false) {
+      lastSelectionKey = "";
+    }
+    if (host) {
       hideSelectionPanel();
+    }
+  }
+
+  // True when the event's innermost target lives inside our selection panel
+  // (composedPath pierces the shadow boundary; window-level listeners only see
+  // the retargeted host). Panel mouseups — clicking 翻译 or × — must not be
+  // treated as a fresh page selection gesture that would re-open the confirm
+  // state and clobber the in-flight translation.
+  function isEventInsideSelectionPanel(event) {
+    const host = selectionHostEl;
+    if (!host?.shadowRoot || typeof event?.composedPath !== "function") {
+      return false;
+    }
+    try {
+      const innermost = event.composedPath()[0];
+      return innermost?.getRootNode?.() === host.shadowRoot;
+    } catch {
+      return false;
     }
   }
 
@@ -2110,6 +2215,9 @@
     }
     // Ignore synthetic page-script events that could burn the user's API key.
     if (event && event.isTrusted === false) {
+      return;
+    }
+    if (isEventInsideSelectionPanel(event)) {
       return;
     }
 
@@ -2218,8 +2326,12 @@
 
   /**
    * Open the page panel as a non-billable preview for a gesture snapshot.
-   * TRANSLATE_BATCH / SELECTION_TRANSLATE_BATCH waits for the extension popup
-   * confirm (page-inaccessible UI) — never a control in page-controlled DOM.
+   * The panel lives in the page DOM behind an open shadow root, so it can
+   * never be a billing-consent surface: it only previews the selection and
+   * points the user at the extension popup. SELECTION_TRANSLATE_BATCH fires
+   * only after that popup confirm (CONFIRM_SELECTION_TRANSLATE), and
+   * sendSelectionTranslation revalidates the live Selection against the
+   * gesture snapshot before anything is billed.
    */
   function showSelectionConfirm(event, gesture) {
     // The gesture snapshot taken synchronously at the trusted event is the
@@ -2267,18 +2379,14 @@
       return;
     }
 
-    // Preview-only: showing this page panel never bills. Consent happens in the
-    // extension popup (page-inaccessible). The stored snapshot is exactly what
-    // CONFIRM_SELECTION_TRANSLATE may later send.
+    // Preview-only: showing this page panel never bills — the panel is
+    // page-hosted DOM and cannot be a consent surface. Billing needs the
+    // extension popup's confirm, always bound to this stored gesture
+    // snapshot.
     pendingSelectionGesture = gesture;
     const panel = ensureSelectionPanel();
     positionSelectionPanel(panel, rect);
-    setSelectionPanelState(
-      panel,
-      "confirm",
-      "打开扩展弹窗确认翻译",
-      gesture.text
-    );
+    setSelectionPanelState(panel, "confirm", "", gesture.text);
     try {
       void chrome.runtime.sendMessage({
         type: "SET_PENDING_SELECTION",
@@ -2473,6 +2581,14 @@
       }
 
       setSelectionPanelState(panel, "success", translation, gesture.text);
+      // The popup confirm one-shots the worker-side pending before the
+      // content message runs; clear again defensively so no replaced pending
+      // can leave a stale badge the popup would confirm against.
+      try {
+        void chrome.runtime.sendMessage({ type: "CLEAR_PENDING_SELECTION" });
+      } catch {
+        // Worker may be asleep; the pending one-shots on its own.
+      }
     } catch (error) {
       if (requestId && requestId !== selectionGeneration) {
         return;
@@ -2554,31 +2670,28 @@
           line-height: 1;
           padding: 2px 4px;
         }
+        .source {
+          white-space: pre-wrap;
+          word-break: break-word;
+          max-height: 72px;
+          overflow: auto;
+          color: #7f879b;
+          font-size: 11px;
+        }
+        .source[hidden] { display: none; }
         .body {
           white-space: pre-wrap;
           word-break: break-word;
           max-height: 220px;
           overflow: auto;
         }
+        .body[hidden] { display: none; }
         .body.loading { color: #9299ae; }
         .body.error { color: #ff8b96; }
-        .source {
-          margin-top: 8px;
-          padding-top: 8px;
-          border-top: 1px solid rgba(255, 255, 255, 0.08);
-          color: #7f879b;
-          font-size: 11px;
-          white-space: pre-wrap;
-          word-break: break-word;
-          max-height: 72px;
-          overflow: auto;
-        }
-        .source[hidden] { display: none; }
         .hint {
           margin-top: 8px;
           color: #91a4ff;
           font-size: 11px;
-          line-height: 1.4;
         }
         .hint[hidden] { display: none; }
       </style>
@@ -2587,9 +2700,9 @@
           <span class="label">千浩翻译 · 划词</span>
           <button class="close" type="button" aria-label="关闭">×</button>
         </div>
-        <div class="body loading">正在翻译选中文本…</div>
         <div class="source" hidden></div>
-        <div class="hint" hidden>打开扩展弹窗确认翻译</div>
+        <div class="body loading">正在翻译选中文本…</div>
+        <div class="hint" hidden>请在扩展弹窗中确认翻译（点击工具栏中的扩展图标）</div>
       </div>
     `;
 
@@ -2599,8 +2712,23 @@
       hideSelectionPanel();
     });
 
-    // No billable controls in page-controlled DOM (open shadow on attacker-owned
-    // pages can be overlaid). Consent lives in the extension popup only.
+    // Clicking into the panel must not collapse the page selection: the
+    // popup confirm still revalidates the live Selection against the
+    // previewed gesture, so a panel tap losing the selection would dead-end
+    // the confirm with 划词已收起.
+    shadow.querySelector(".panel").addEventListener("mousedown", (event) => {
+      if (event.target?.closest?.(".close")) {
+        return;
+      }
+      event.preventDefault();
+    });
+
+    // Deliberately no translate button here: the panel is page-hosted DOM
+    // behind an open shadow root, so page script could restyle or overlay any
+    // button and a trusted click on it would not establish informed consent.
+    // The .hint copy above directs the user to the extension popup — the only
+    // surface that can confirm SELECTION_TRANSLATE_BATCH (popup confirm →
+    // CONFIRM_SELECTION_TRANSLATE → sendSelectionTranslation).
 
     return host;
   }
@@ -2612,7 +2740,7 @@
       Math.max(margin, rect.left),
       window.innerWidth - panelWidth - margin
     );
-    const estimatedHeight = 140;
+    const estimatedHeight = 170;
     const below = rect.bottom + 10;
     const top = below + estimatedHeight > window.innerHeight
       ? Math.max(margin, rect.top - 10 - estimatedHeight)
@@ -2628,27 +2756,19 @@
     const hint = host.shadowRoot.querySelector(".hint");
     body.className = `body ${tone}`;
     body.textContent = message;
-    // Confirm/preview state: show source text + off-page consent hint.
-    // Never expose a billable control in this page-controlled panel.
-    if (tone === "confirm" && sourceText) {
+    // Confirm/preview state: show the selected text plus the popup-confirm
+    // hint. The panel itself holds no billable control — consent lives in
+    // the extension popup only.
+    body.hidden = tone === "confirm";
+    if ((tone === "confirm" || tone === "success") && sourceText) {
       source.hidden = false;
       source.textContent = sourceText;
-      if (hint) {
-        hint.hidden = false;
-        hint.textContent = "打开扩展弹窗确认翻译";
-      }
-    } else if (tone === "success" && sourceText) {
-      source.hidden = false;
-      source.textContent = sourceText;
-      if (hint) {
-        hint.hidden = true;
-      }
     } else {
       source.hidden = true;
       source.textContent = "";
-      if (hint) {
-        hint.hidden = true;
-      }
+    }
+    if (hint) {
+      hint.hidden = tone !== "confirm";
     }
     host.hidden = false;
   }
@@ -2696,9 +2816,10 @@
       clearTimeout(selectionTimer);
       selectionTimer = null;
     }
+    // Fully remove the card and drop our ref: listeners, shadow content and
+    // page-visible chrome all go away; ensureSelectionPanel rebuilds on demand.
     const host = selectionHostEl;
-    if (host) {
-      host.hidden = true;
-    }
+    selectionHostEl = null;
+    host?.remove();
   }
 })();
