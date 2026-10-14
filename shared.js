@@ -70,9 +70,12 @@
   }
 
   // True when the text already looks like the run's target language, so
-  // translating it again would only duplicate it on screen ("Home Home",
-  // "宝玉宝玉"). The ratio base is letter-class characters only (Han + kana +
-  // hangul + Latin letters); digits, punctuation and symbols never vote.
+  // translating it again would only duplicate it on screen ("宝玉宝玉").
+  // The ratio base is letter-class characters only (Han + kana + hangul +
+  // Latin letters); digits, punctuation and symbols never vote. Latin script
+  // alone can never establish a target (English/French/Spanish/German share
+  // it), so Latin-script targets never take the shortcut — they fail open to
+  // translation instead of silently skipping foreign Latin paragraphs.
   function isAlreadyTargetLanguage(text, targetLang) {
     if (typeof text !== "string") {
       return false;
@@ -84,7 +87,11 @@
 
     const countMatches = (value, pattern) => (value.match(pattern) || []).length;
     const han = countMatches(trimmed, /\p{Script=Han}/gu);
-    const kana = countMatches(trimmed, /[\u3040-\u30FF\u31F0-\u31FF]/gu);
+    // Kana letters only: hiragana + katakana (+ phonetic extensions).
+    // Block-edge punctuation — U+30FB ・, U+30FC ー, U+3000–303F CJK
+    // punctuation — must not count, or "你好・世界" would be misread as
+    // already-Japanese and skip its ja translation.
+    const kana = countMatches(trimmed, /[\u3041-\u3096\u30A1-\u30FA\u31F0-\u31FF]/gu);
     const hangul = countMatches(trimmed, /[\uAC00-\uD7A3\u1100-\u11FF]/gu);
     const latin = countMatches(trimmed, /\p{Script=Latin}/gu);
     const letterClass = han + kana + hangul + latin;
@@ -94,6 +101,11 @@
 
     const code = String(targetLang || "").toLowerCase();
     if (code.startsWith("zh")) {
+      // Han-heavy Japanese/Korean prose (今日は良い天気ですね) must not be
+      // mistaken for Chinese: any kana or hangul disqualifies the shortcut.
+      if (kana > 0 || hangul > 0) {
+        return false;
+      }
       return han / letterClass >= 0.5;
     }
     if (code === "ja") {
@@ -103,10 +115,9 @@
     if (code === "ko") {
       return hangul / letterClass >= 0.3;
     }
-    // Latin-script targets (en, …): mostly Latin letters with almost no
-    // CJK script mixed in.
-    const cjk = han + kana + hangul;
-    return latin / letterClass >= 0.5 && cjk / letterClass < 0.2;
+    // Latin-script targets (en, fr, es, de, …): a shared script cannot prove
+    // the target language — be conservative and always translate.
+    return false;
   }
 
   // True for page chrome that must never be translated: @handles, bare URLs,

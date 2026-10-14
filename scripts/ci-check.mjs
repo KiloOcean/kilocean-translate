@@ -631,8 +631,7 @@ function checkXLayoutHeuristics() {
     }
   };
 
-  // Already-target-language detection ("Home Home" / "宝玉宝玉" duplication).
-  assertTrue(isAlreadyTargetLanguage("Home", "en"), "isAlreadyTargetLanguage: 'Home' en skips");
+  // Already-target-language detection ("宝玉宝玉" duplication).
   assertTrue(isAlreadyTargetLanguage("宝玉", "zh"), "isAlreadyTargetLanguage: '宝玉' zh skips");
   assertFalse(isAlreadyTargetLanguage("Hello world", "zh"), "isAlreadyTargetLanguage: 'Hello world' zh translates");
   assertFalse(isAlreadyTargetLanguage("你好", "en"), "isAlreadyTargetLanguage: '你好' en translates");
@@ -641,6 +640,19 @@ function checkXLayoutHeuristics() {
   assertTrue(isAlreadyTargetLanguage("今日は良い天気ですね", "ja"), "isAlreadyTargetLanguage: kana-bearing text skips for ja");
   assertTrue(isAlreadyTargetLanguage("안녕하세요", "ko"), "isAlreadyTargetLanguage: hangul text skips for ko");
   assertFalse(isAlreadyTargetLanguage(42, "en"), "isAlreadyTargetLanguage: non-string translates (fail open to other gates)");
+
+  // Kana letters only: block punctuation (U+30FB ・ etc.) must never make
+  // text count as Japanese.
+  assertFalse(isAlreadyTargetLanguage("你好・世界", "ja"), "isAlreadyTargetLanguage: '你好・世界' ja translates (middle dot is not kana)");
+  // Kana/hangul disqualify the Chinese shortcut: Han-heavy Japanese prose
+  // must stay eligible for zh translation.
+  assertFalse(isAlreadyTargetLanguage("今日は良い天気ですね", "zh-CN"), "isAlreadyTargetLanguage: Japanese prose translates to zh-CN");
+  // Latin script alone cannot prove English — French/Spanish/German
+  // paragraphs must stay eligible (conservative: never shortcut for en).
+  assertFalse(isAlreadyTargetLanguage("Home", "en"), "isAlreadyTargetLanguage: 'Home' en translates (Latin script is not proof of English)");
+  assertFalse(isAlreadyTargetLanguage("Bonjour le monde", "en"), "isAlreadyTargetLanguage: French translates for en");
+  assertFalse(isAlreadyTargetLanguage("Hola mundo", "en"), "isAlreadyTargetLanguage: Spanish translates for en");
+  assertFalse(isAlreadyTargetLanguage("Das ist ein deutscher Satz", "en"), "isAlreadyTargetLanguage: German translates for en");
 
   // Skippable page chrome.
   assertTrue(isSkippableText("@karpathy"), "isSkippableText: @handle");

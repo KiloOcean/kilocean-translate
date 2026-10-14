@@ -50,7 +50,7 @@
   let selectionGeneration = 0;
   /** Last selection translate key (target\0model\0text\0range) to avoid rebill on Shift release. */
   let lastSelectionKey = "";
-  /** Gesture snapshot shown in the panel; billed only by the panel's 「翻译」 click. */
+  /** Gesture snapshot previewed in the panel; billed only by the extension popup's confirm. */
   let pendingSelectionGesture = null;
   /** @type {string} text\0rangeIdentity of the selection last scheduled for translate. */
   let lastScheduledSelectionSnapshot = "";
@@ -2146,13 +2146,19 @@
       return;
     }
     const host = selectionHostEl;
-    if (host && event.target !== host && !host.contains(event.target)) {
-      // A trusted outside press starts a fresh pointer gesture — drop the
-      // dedupe key so re-selecting the same range reopens the panel.
-      // ×/Escape still go through hideSelectionPanel with the key retained.
-      if (event.isTrusted !== false) {
-        lastSelectionKey = "";
-      }
+    if (host && (event.target === host || host.contains(event.target))) {
+      return;
+    }
+    // A trusted outside press starts a fresh pointer gesture — drop the
+    // dedupe key so re-selecting the same range translates again. This must
+    // also run when the host was already removed (dismissed earlier), or a
+    // stale key from the previous request dead-ends the next identical drag
+    // with 该选中文本已翻译.
+    // ×/Escape still go through hideSelectionPanel with the key retained.
+    if (event.isTrusted !== false) {
+      lastSelectionKey = "";
+    }
+    if (host) {
       hideSelectionPanel();
     }
   }
@@ -2292,10 +2298,12 @@
 
   /**
    * Open the page panel as a non-billable preview for a gesture snapshot.
-   * SELECTION_TRANSLATE_BATCH fires only after the user explicitly clicks the
-   * panel's 「翻译」 button (trusted click only) — or confirms in the extension
-   * popup — and sendSelectionTranslation revalidates the live Selection against
-   * the gesture snapshot before anything is billed.
+   * The panel lives in the page DOM behind an open shadow root, so it can
+   * never be a billing-consent surface: it only previews the selection and
+   * points the user at the extension popup. SELECTION_TRANSLATE_BATCH fires
+   * only after that popup confirm (CONFIRM_SELECTION_TRANSLATE), and
+   * sendSelectionTranslation revalidates the live Selection against the
+   * gesture snapshot before anything is billed.
    */
   function showSelectionConfirm(event, gesture) {
     // The gesture snapshot taken synchronously at the trusted event is the
@@ -2343,9 +2351,10 @@
       return;
     }
 
-    // Preview-only: showing this page panel never bills. Billing needs the
-    // explicit trusted click on the panel's 翻译 button (or the extension
-    // popup's confirm), always bound to this stored gesture snapshot.
+    // Preview-only: showing this page panel never bills — the panel is
+    // page-hosted DOM and cannot be a consent surface. Billing needs the
+    // extension popup's confirm, always bound to this stored gesture
+    // snapshot.
     pendingSelectionGesture = gesture;
     const panel = ensureSelectionPanel();
     positionSelectionPanel(panel, rect);
@@ -2544,8 +2553,9 @@
       }
 
       setSelectionPanelState(panel, "success", translation, gesture.text);
-      // The in-panel 翻译 click already consumed the gesture; drop the
-      // worker-side pending + badge so the popup cannot confirm a stale one.
+      // The popup confirm one-shots the worker-side pending before the
+      // content message runs; clear again defensively so no replaced pending
+      // can leave a stale badge the popup would confirm against.
       try {
         void chrome.runtime.sendMessage({ type: "CLEAR_PENDING_SELECTION" });
       } catch {
@@ -2650,22 +2660,12 @@
         .body[hidden] { display: none; }
         .body.loading { color: #9299ae; }
         .body.error { color: #ff8b96; }
-        .actions {
-          display: flex;
-          justify-content: flex-end;
+        .hint {
           margin-top: 8px;
+          color: #91a4ff;
+          font-size: 11px;
         }
-        .actions[hidden] { display: none; }
-        .translate {
-          border: 0;
-          border-radius: 8px;
-          padding: 6px 16px;
-          background: #4f6bff;
-          color: #fff;
-          cursor: pointer;
-          font: 600 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        }
-        .translate:hover { background: #3d59e6; }
+        .hint[hidden] { display: none; }
       </style>
       <div class="panel" role="dialog" aria-label="选中翻译">
         <div class="top">
@@ -2674,7 +2674,7 @@
         </div>
         <div class="source" hidden></div>
         <div class="body loading">正在翻译选中文本…</div>
-        <div class="actions" hidden><button class="translate" type="button">翻译</button></div>
+        <div class="hint" hidden>请在扩展弹窗中确认翻译（点击工具栏中的扩展图标）</div>
       </div>
     `;
 
@@ -2684,9 +2684,10 @@
       hideSelectionPanel();
     });
 
-    // Clicking into the panel must not collapse the page selection: without
-    // preventDefault on mousedown, the 翻译 click would clear it and the
-    // live-selection guard would reject the just-confirmed gesture.
+    // Clicking into the panel must not collapse the page selection: the
+    // popup confirm still revalidates the live Selection against the
+    // previewed gesture, so a panel tap losing the selection would dead-end
+    // the confirm with 划词已收起.
     shadow.querySelector(".panel").addEventListener("mousedown", (event) => {
       if (event.target?.closest?.(".close")) {
         return;
@@ -2694,25 +2695,12 @@
       event.preventDefault();
     });
 
-    // Billable consent: only a trusted, explicit user click on this button
-    // starts SELECTION_TRANSLATE_BATCH. Page-synthetic clicks (isTrusted
-    // false) never bill; sendSelectionTranslation still revalidates the live
-    // Selection against the previewed gesture snapshot, dedupes unchanged
-    // selections, and the worker enforces its own send quota.
-    shadow.querySelector(".translate").addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (event.isTrusted === false) {
-        return;
-      }
-      const gesture = pendingSelectionGesture;
-      if (!gesture?.text || !gesture.rangeId) {
-        setSelectionPanelState(host, "error", "没有待确认的划词翻译，请重新选中");
-        return;
-      }
-      pendingSelectionGesture = null;
-      void sendSelectionTranslation(gesture);
-    });
+    // Deliberately no translate button here: the panel is page-hosted DOM
+    // behind an open shadow root, so page script could restyle or overlay any
+    // button and a trusted click on it would not establish informed consent.
+    // The .hint copy above directs the user to the extension popup — the only
+    // surface that can confirm SELECTION_TRANSLATE_BATCH (popup confirm →
+    // CONFIRM_SELECTION_TRANSLATE → sendSelectionTranslation).
 
     return host;
   }
@@ -2737,11 +2725,12 @@
   function setSelectionPanelState(host, tone, message, sourceText) {
     const body = host.shadowRoot.querySelector(".body");
     const source = host.shadowRoot.querySelector(".source");
-    const actions = host.shadowRoot.querySelector(".actions");
+    const hint = host.shadowRoot.querySelector(".hint");
     body.className = `body ${tone}`;
     body.textContent = message;
-    // Confirm/preview state: show the selected text plus the explicit 翻译
-    // button — the only in-panel control that can start a billable request.
+    // Confirm/preview state: show the selected text plus the popup-confirm
+    // hint. The panel itself holds no billable control — consent lives in
+    // the extension popup only.
     body.hidden = tone === "confirm";
     if ((tone === "confirm" || tone === "success") && sourceText) {
       source.hidden = false;
@@ -2750,8 +2739,8 @@
       source.hidden = true;
       source.textContent = "";
     }
-    if (actions) {
-      actions.hidden = tone !== "confirm";
+    if (hint) {
+      hint.hidden = tone !== "confirm";
     }
     host.hidden = false;
   }
