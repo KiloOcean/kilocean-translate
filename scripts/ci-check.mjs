@@ -659,6 +659,13 @@ function checkXLayoutHeuristics() {
   assertFalse(isAlreadyTargetLanguage("中文 Привет мир", "zh-CN"), "isAlreadyTargetLanguage: Han minority amid Cyrillic translates for zh-CN");
   assertFalse(isAlreadyTargetLanguage("かな Привет мир", "ja"), "isAlreadyTargetLanguage: kana minority amid Cyrillic translates for ja");
   assertFalse(isAlreadyTargetLanguage("한국어 مرحبا بالعالم", "ko"), "isAlreadyTargetLanguage: hangul minority amid Arabic translates for ko");
+  // Strict no-foreign-letter rule: mixed-script text must never take the
+  // shortcut even when the target-script share alone clears the ratio floor
+  // ("한국어 Привет" is 3/9 Hangul >= 0.3; "かな test" is 2/6 kana >= 0.2).
+  assertFalse(isAlreadyTargetLanguage("한국어 Привет", "ko"), "isAlreadyTargetLanguage: Hangul share clears ko floor but Cyrillic letters force translation");
+  assertFalse(isAlreadyTargetLanguage("かな test", "ja"), "isAlreadyTargetLanguage: kana share clears ja floor but Latin letters force translation");
+  // The prolonged sound mark is an allowed Japanese letter, not a foreign one.
+  assertTrue(isAlreadyTargetLanguage("スーパー", "ja"), "isAlreadyTargetLanguage: kana word with prolonged marks skips for ja");
 
   // Skippable page chrome.
   assertTrue(isSkippableText("@karpathy"), "isSkippableText: @handle");
@@ -686,6 +693,99 @@ function checkXLayoutHeuristics() {
   assertFalse(isXHost("notx.com"), "isXHost: notx.com must not match");
 }
 
+function checkXMutationScopeGate() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for X mutation scope test: ${error.message}`);
+    return;
+  }
+
+  // Every pendingRoots queue site inside startObserving must route through
+  // the X-scope predicate: out-of-scope churn (sidebar, counters, nav) can
+  // never yield an eligible block, and queueing it would endlessly reset the
+  // 450 ms debounce and pin state.phase at "translating" while export stays
+  // locked.
+  const observerSource = extractContentFunction("startObserving");
+  if (!observerSource) {
+    fail("content.js: cannot extract startObserving for mutation scope test");
+    return;
+  }
+  const queueSites = (observerSource.match(/pendingRoots\.add\(/g) || []).length;
+  const guardedSites = (observerSource.match(/isInXTranslatableMutationScope\(/g) || []).length;
+  if (queueSites !== 3 || guardedSites < 3) {
+    fail(
+      `content.js: startObserving must gate all 3 pendingRoots.add sites (removal target, addedNodes, characterData) through isInXTranslatableMutationScope — found ${queueSites} queue sites, ${guardedSites} guards`
+    );
+    return;
+  }
+
+  const fnSource = extractContentFunction("isInXTranslatableMutationScope");
+  if (!fnSource) {
+    fail("content.js: cannot extract isInXTranslatableMutationScope for scope test");
+    return;
+  }
+
+  const compile = (isXHost) => {
+    try {
+      return new Function(
+        "IS_X_HOST",
+        "Node",
+        "Utils",
+        `${fnSource}\nreturn isInXTranslatableMutationScope;`
+      )(isXHost, { ELEMENT_NODE: 1, TEXT_NODE: 3 }, utils);
+    } catch (error) {
+      fail(`isInXTranslatableMutationScope extract failed: ${error.message}`);
+      return null;
+    }
+  };
+
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertFalse = (actual, label) => {
+    if (actual !== false) {
+      fail(`${label}: expected false, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // Minimal element stubs: closest() = ancestor-or-self selector hit,
+  // querySelector() = descendant selector hit.
+  const el = ({ closestResult = null, descendantResult = null, connected = true } = {}) => ({
+    nodeType: 1,
+    isConnected: connected,
+    closest: () => closestResult,
+    querySelector: () => descendantResult
+  });
+  const text = (parent) => ({ nodeType: 3, parentElement: parent });
+
+  const onX = compile(true);
+  if (!onX) {
+    return;
+  }
+  // In scope: inside (or being) tweetText/UserDescription, or a subtree that
+  // carries one (freshly inserted timeline article).
+  assertTrue(onX(el({ closestResult: {} })), "X mutation scope: tweetText element itself is in scope");
+  assertTrue(onX(el({ descendantResult: {} })), "X mutation scope: subtree containing tweetText is in scope");
+  assertTrue(onX(text(el({ closestResult: {} }))), "X mutation scope: text node inside tweetText is in scope");
+  // Out of scope: page chrome and detached roots must not queue work.
+  assertFalse(onX(el()), "X mutation scope: sidebar chrome element is out of scope");
+  assertFalse(onX(el({ connected: false })), "X mutation scope: detached element is out of scope");
+  assertFalse(onX(text(el())), "X mutation scope: text node in chrome is out of scope");
+  assertFalse(onX(text(null)), "X mutation scope: parentless text node is out of scope");
+
+  // Off X the gate must stay open — other sites have no scope restriction.
+  const offX = compile(false);
+  if (!offX) {
+    return;
+  }
+  assertTrue(offX(el()), "X mutation scope: non-X host keeps every root queueable");
+}
+
 function main() {
   console.log("kilocean-translate ci-check");
   console.log(`root: ${ROOT}`);
@@ -702,6 +802,7 @@ function main() {
   checkJoinSplitTranslations();
   checkJoinRawTextNodesNormalize();
   checkXLayoutHeuristics();
+  checkXMutationScopeGate();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -711,7 +812,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate");
   process.exit(0);
 }
 

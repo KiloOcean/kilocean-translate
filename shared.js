@@ -71,14 +71,16 @@
 
   // True when the text already looks like the run's target language, so
   // translating it again would only duplicate it on screen ("宝玉宝玉").
-  // The ratio base is every Unicode letter (\p{L}) — Han, kana, hangul,
-  // Latin, Cyrillic, Arabic, Greek, … — so digits, punctuation and symbols
-  // never vote, and a target-script minority inside foreign prose cannot
-  // establish the target ("中文 Привет мир" must still translate to zh).
-  // Latin script alone can never establish a target (English/French/Spanish/
-  // German share it), so Latin-script targets never take the shortcut — they
-  // fail open to translation instead of silently skipping foreign Latin
-  // paragraphs.
+  // Strict rule: the shortcut applies only when the text carries NO
+  // foreign-script letters — every Unicode letter (\p{L}) must belong to the
+  // target's allowed scripts (zh: Han only; ja: Han + kana + prolonged
+  // mark; ko: Hangul + Han) — and the per-target minimum ratio must still
+  // hold. Digits, punctuation and symbols never vote. A target-script
+  // minority inside foreign prose ("한국어 Привет", "かな test",
+  // "中文 Привет мир") always fails open to translation: a low ratio alone
+  // must never drop a mixed block. Latin-script targets (en, fr, es, de, …)
+  // never take the shortcut at all — a shared script proves nothing about
+  // the language.
   function isAlreadyTargetLanguage(text, targetLang) {
     if (typeof text !== "string") {
       return false;
@@ -91,14 +93,17 @@
     const countMatches = (value, pattern) => (value.match(pattern) || []).length;
     const han = countMatches(trimmed, /\p{Script=Han}/gu);
     // Kana letters only: hiragana + katakana (+ phonetic extensions).
-    // Block-edge punctuation — U+30FB ・, U+30FC ー, U+3000–303F CJK
-    // punctuation — must not count, or "你好・世界" would be misread as
-    // already-Japanese and skip its ja translation.
+    // Block-edge punctuation — U+30FB ・, U+3000–303F CJK punctuation —
+    // must not count, or "你好・世界" would be misread as already-Japanese
+    // and skip its ja translation.
     const kana = countMatches(trimmed, /[\u3041-\u3096\u30A1-\u30FA\u31F0-\u31FF]/gu);
+    // U+30FC (chouonpu, the prolonged sound mark) is a letter (Lm), so it
+    // votes in the denominator; Japanese allows it next to kana without
+    // counting it as a kana vote.
+    const prolonged = countMatches(trimmed, /\u30FC/gu);
     const hangul = countMatches(trimmed, /[\uAC00-\uD7A3\u1100-\u11FF]/gu);
-    // Every letter votes in the denominator, including scripts with no
-    // numerator here (Cyrillic, Arabic, Greek, …): counting only
-    // Han + kana + hangul + Latin made "中文 Привет мир" 100% Han.
+    // Every letter votes, including scripts with no numerator here (Latin,
+    // Cyrillic, Arabic, Greek, …) — any one of them is a foreign letter.
     const letters = countMatches(trimmed, /\p{L}/gu);
     if (letters < 2) {
       return false;
@@ -106,22 +111,18 @@
 
     const code = String(targetLang || "").toLowerCase();
     if (code.startsWith("zh")) {
-      // Han-heavy Japanese/Korean prose (今日は良い天気ですね) must not be
-      // mistaken for Chinese: any kana or hangul disqualifies the shortcut.
-      if (kana > 0 || hangul > 0) {
-        return false;
-      }
-      return han / letters >= 0.5;
+      // Han letters only: any kana, hangul, Latin or other-script letter
+      // makes this Japanese/Korean/mixed prose, not Chinese.
+      return han === letters && han / letters >= 0.5;
     }
     if (code === "ja") {
-      // Japanese prose reliably carries kana; kanji-only edge cases fall
-      // through. 0.2 floor (was 0.15 on the old script-only base): with
-      // every letter voting, two lone kana amid Cyrillic ("かな Привет
-      // мир") must not establish Japanese.
-      return kana / letters >= 0.2;
+      // Kanji-only edge cases still fall through via the 0.2 kana floor:
+      // "你好・世界" holds no foreign letter but no kana vote either.
+      return han + kana + prolonged === letters && kana / letters >= 0.2;
     }
     if (code === "ko") {
-      return hangul / letters >= 0.3;
+      // Hangul + hanja only; the 0.3 hangul floor drops hanja-only text.
+      return hangul + han === letters && hangul / letters >= 0.3;
     }
     // Latin-script targets (en, fr, es, de, …): a shared script cannot prove
     // the target language — be conservative and always translate.

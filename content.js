@@ -695,6 +695,27 @@
     return !hasHiddenAncestor(parent);
   }
 
+  // Mutation-queueing counterpart of isNonTranslatableScope for X: a
+  // page-owned mutation root is worth scheduling only when it lives inside
+  // tweetText / UserDescription, or carries one in its subtree (a freshly
+  // inserted timeline article nests tweetText several levels down).
+  // Everything else — sidebar, counters, nav chrome — can never yield an
+  // eligible block, and queueing it would endlessly reset the 450 ms
+  // debounce and pin state.phase at "translating" while export stays locked.
+  function isInXTranslatableMutationScope(node) {
+    if (!IS_X_HOST) {
+      return true;
+    }
+    const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    if (!el?.isConnected) {
+      return false;
+    }
+    return (
+      el.closest(Utils.X_TRANSLATABLE_SELECTOR) != null ||
+      el.querySelector(Utils.X_TRANSLATABLE_SELECTOR) != null
+    );
+  }
+
   function shouldTranslateTextNode(node) {
     if (!node?.parentElement) {
       return false;
@@ -1824,7 +1845,7 @@
               if (refreshHost) {
                 pendingRefreshBlocks.add(refreshHost);
                 queuedDynamicWork = true;
-              } else if (record.target?.isConnected) {
+              } else if (record.target?.isConnected && isInXTranslatableMutationScope(record.target)) {
                 // In-flight translate may have no blockRecords yet — queue target
                 // so discovery retries after the pending request rejects the stale segment.
                 pendingRoots.add(record.target);
@@ -1852,6 +1873,9 @@
               queuedDynamicWork = true;
               return;
             }
+            if (!isInXTranslatableMutationScope(node)) {
+              return;
+            }
             pendingRoots.add(node);
             queuedDynamicWork = true;
           });
@@ -1866,7 +1890,11 @@
             queuedDynamicWork = true;
             continue;
           }
-          if (isDefinitelyIneligibleNode(node) || isIgnoredTranslatorMutation(node)) {
+          if (
+            isDefinitelyIneligibleNode(node) ||
+            isIgnoredTranslatorMutation(node) ||
+            !isInXTranslatableMutationScope(node)
+          ) {
             continue;
           }
           pendingRoots.add(node);
