@@ -71,11 +71,14 @@
 
   // True when the text already looks like the run's target language, so
   // translating it again would only duplicate it on screen ("宝玉宝玉").
-  // The ratio base is letter-class characters only (Han + kana + hangul +
-  // Latin letters); digits, punctuation and symbols never vote. Latin script
-  // alone can never establish a target (English/French/Spanish/German share
-  // it), so Latin-script targets never take the shortcut — they fail open to
-  // translation instead of silently skipping foreign Latin paragraphs.
+  // The ratio base is every Unicode letter (\p{L}) — Han, kana, hangul,
+  // Latin, Cyrillic, Arabic, Greek, … — so digits, punctuation and symbols
+  // never vote, and a target-script minority inside foreign prose cannot
+  // establish the target ("中文 Привет мир" must still translate to zh).
+  // Latin script alone can never establish a target (English/French/Spanish/
+  // German share it), so Latin-script targets never take the shortcut — they
+  // fail open to translation instead of silently skipping foreign Latin
+  // paragraphs.
   function isAlreadyTargetLanguage(text, targetLang) {
     if (typeof text !== "string") {
       return false;
@@ -93,9 +96,11 @@
     // already-Japanese and skip its ja translation.
     const kana = countMatches(trimmed, /[\u3041-\u3096\u30A1-\u30FA\u31F0-\u31FF]/gu);
     const hangul = countMatches(trimmed, /[\uAC00-\uD7A3\u1100-\u11FF]/gu);
-    const latin = countMatches(trimmed, /\p{Script=Latin}/gu);
-    const letterClass = han + kana + hangul + latin;
-    if (letterClass < 2) {
+    // Every letter votes in the denominator, including scripts with no
+    // numerator here (Cyrillic, Arabic, Greek, …): counting only
+    // Han + kana + hangul + Latin made "中文 Привет мир" 100% Han.
+    const letters = countMatches(trimmed, /\p{L}/gu);
+    if (letters < 2) {
       return false;
     }
 
@@ -106,14 +111,17 @@
       if (kana > 0 || hangul > 0) {
         return false;
       }
-      return han / letterClass >= 0.5;
+      return han / letters >= 0.5;
     }
     if (code === "ja") {
-      // Japanese prose reliably carries kana; kanji-only edge cases fall through.
-      return kana / letterClass >= 0.15;
+      // Japanese prose reliably carries kana; kanji-only edge cases fall
+      // through. 0.2 floor (was 0.15 on the old script-only base): with
+      // every letter voting, two lone kana amid Cyrillic ("かな Привет
+      // мир") must not establish Japanese.
+      return kana / letters >= 0.2;
     }
     if (code === "ko") {
-      return hangul / letterClass >= 0.3;
+      return hangul / letters >= 0.3;
     }
     // Latin-script targets (en, fr, es, de, …): a shared script cannot prove
     // the target language — be conservative and always translate.
@@ -143,7 +151,12 @@
     if (/^\d+\s*(?:[smhdw]|sec|min|hr|wk)\s*(?:ago)?$/i.test(trimmed)) {
       return true;
     }
-    if (/^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:\s*,?\s*\d{4})?$/i.test(trimmed)) {
+    // Bare dates: real month names or standard abbreviations only (incl.
+    // "Sept"), word-bounded — "Market 12" / "Octopus 12" / "Decemberish 3"
+    // are ordinary text before a number and must stay translatable.
+    if (
+      /^(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\b\.?\s+\d{1,2}(?:\s*,?\s*\d{4})?$/i.test(trimmed)
+    ) {
       return true;
     }
     return false;

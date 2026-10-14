@@ -653,6 +653,12 @@ function checkXLayoutHeuristics() {
   assertFalse(isAlreadyTargetLanguage("Bonjour le monde", "en"), "isAlreadyTargetLanguage: French translates for en");
   assertFalse(isAlreadyTargetLanguage("Hola mundo", "en"), "isAlreadyTargetLanguage: Spanish translates for en");
   assertFalse(isAlreadyTargetLanguage("Das ist ein deutscher Satz", "en"), "isAlreadyTargetLanguage: German translates for en");
+  // Mixed-script text: every Unicode letter votes in the ratio denominator,
+  // so a target-script minority amid Cyrillic/Arabic must fail open to
+  // translation instead of being classified as already zh-CN / ja / ko.
+  assertFalse(isAlreadyTargetLanguage("中文 Привет мир", "zh-CN"), "isAlreadyTargetLanguage: Han minority amid Cyrillic translates for zh-CN");
+  assertFalse(isAlreadyTargetLanguage("かな Привет мир", "ja"), "isAlreadyTargetLanguage: kana minority amid Cyrillic translates for ja");
+  assertFalse(isAlreadyTargetLanguage("한국어 مرحبا بالعالم", "ko"), "isAlreadyTargetLanguage: hangul minority amid Arabic translates for ko");
 
   // Skippable page chrome.
   assertTrue(isSkippableText("@karpathy"), "isSkippableText: @handle");
@@ -660,10 +666,17 @@ function checkXLayoutHeuristics() {
   assertTrue(isSkippableText("12万"), "isSkippableText: counter 12万");
   assertTrue(isSkippableText("https://x.com/a"), "isSkippableText: bare URL");
   assertTrue(isSkippableText("Oct 12"), "isSkippableText: bare date Oct 12");
+  assertTrue(isSkippableText("October 12, 2026"), "isSkippableText: bare date with full month name");
+  assertTrue(isSkippableText("Sept 12"), "isSkippableText: bare date Sept abbreviation");
   assertTrue(isSkippableText("2h"), "isSkippableText: relative time 2h");
   assertFalse(isSkippableText("Hello world"), "isSkippableText: normal English sentence");
   assertFalse(isSkippableText("这是一句正常的话"), "isSkippableText: normal Chinese sentence");
   assertFalse(isSkippableText("Octopus live long lives"), "isSkippableText: month-prefixed real sentence");
+  // Month regex must be word-bounded: ordinary words that merely start with
+  // a month abbreviation stay translatable instead of being dropped as dates.
+  assertFalse(isSkippableText("Market 12"), "isSkippableText: 'Market 12' is not a date");
+  assertFalse(isSkippableText("Octopus 12"), "isSkippableText: 'Octopus 12' is not a date");
+  assertFalse(isSkippableText("Decemberish 3"), "isSkippableText: 'Decemberish 3' is not a date");
 
   // X host gating.
   assertTrue(isXHost("x.com"), "isXHost: x.com");
