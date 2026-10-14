@@ -29,6 +29,10 @@
   const SELECTION_SEND_MIN_INTERVAL_MS = 1000;
   const SELECTION_SEND_WINDOW_MS = 10000;
   const SELECTION_SEND_WINDOW_LIMIT = 8;
+  // On X hosts the page is mostly untranslated UI chrome (sidebar, trends,
+  // follow rows, footer); only tweet bodies and profile bios get translated.
+  // Generic sites keep the full-page behavior.
+  const IS_X_HOST = Utils.isXHost(location.hostname);
 
   /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, wraps: HTMLElement[], companion: HTMLElement, layout: string}>} */
   const blockRecords = new Map();
@@ -497,6 +501,19 @@
     }
   }
 
+  // Full gate for a candidate block text: translatable shape, not page chrome
+  // (@handle / URL / counter / bare date), and not already in the target
+  // language (re-translating those duplicates them: "Home Home", "宝玉宝玉").
+  function shouldTranslateBlockText(text, targetLanguage) {
+    if (!Utils.isTranslatableText(text, targetLanguage)) {
+      return false;
+    }
+    if (Utils.isSkippableText(text)) {
+      return false;
+    }
+    return !Utils.isAlreadyTargetLanguage(text, targetLanguage);
+  }
+
   function collectBlocks(root) {
     const textNodes = collectTextNodes(root);
     const blocks = [];
@@ -512,7 +529,7 @@
       // blocks are not re-walked per text node (quadratic discovery).
       seen.add(block);
       const fullText = extractBlockText(block);
-      if (!fullText || !Utils.isTranslatableText(fullText, targetLanguage)) {
+      if (!shouldTranslateBlockText(fullText, targetLanguage)) {
         continue;
       }
       blocks.push(block);
@@ -535,7 +552,7 @@
         continue;
       }
       const ownText = extractBlockText(block, nested);
-      if (ownText && Utils.isTranslatableText(ownText, targetLanguage)) {
+      if (shouldTranslateBlockText(ownText, targetLanguage)) {
         withOwnText.push(block);
       }
     }
@@ -646,6 +663,22 @@
     return Boolean(el?.closest?.("[data-deepseek-translator-ui]"));
   }
 
+  // Text living outside any scope we translate: <time> timestamps and, on X,
+  // anything outside tweetText / UserDescription (usernames, handles, counts,
+  // nav chrome). Covers both discovery (isEligibleTextHost) and extraction
+  // (collectRawTextNodes) so neither path can pick it up.
+  function isNonTranslatableScope(parent) {
+    if (!parent) {
+      return true;
+    }
+    // <time> holds timestamps ("Oct 12", "2h"); translating them glues
+    // duplicates like "Oct 1210月12日".
+    if (parent.closest("time")) {
+      return true;
+    }
+    return IS_X_HOST && !parent.closest(Utils.X_TRANSLATABLE_SELECTOR);
+  }
+
   function isEligibleTextHost(parent) {
     if (!parent) {
       return false;
@@ -654,6 +687,9 @@
       return false;
     }
     if (parent.closest('[translate="no"], [contenteditable="true"], [data-deepseek-translator-ui]')) {
+      return false;
+    }
+    if (isNonTranslatableScope(parent)) {
       return false;
     }
     return !hasHiddenAncestor(parent);
@@ -685,7 +721,7 @@
 
     if (root.nodeType === Node.TEXT_NODE) {
       const parent = root.parentElement;
-      if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent)) {
+      if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent) || isNonTranslatableScope(parent)) {
         return [];
       }
       if (parent.closest('[translate="no"], [contenteditable="true"]')) {
@@ -698,7 +734,7 @@
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         const parent = node.parentElement;
-        if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent)) {
+        if (!parent || BLOCKED_TAGS.has(parent.tagName) || isTranslatorUiElement(parent) || hasHiddenAncestor(parent) || isNonTranslatableScope(parent)) {
           return NodeFilter.FILTER_REJECT;
         }
         if (parent.closest('[translate="no"], [contenteditable="true"]')) {
@@ -720,6 +756,12 @@
     while (el && el !== document.body && el !== document.documentElement) {
       if (el.closest("[data-deepseek-translator-ui]")) {
         return null;
+      }
+      // On X, the tweetText / UserDescription container is always the block so
+      // the translation can land as its block-level sibling — never inline in
+      // the flex header / username rows that wrap tweet bodies.
+      if (IS_X_HOST && el.matches(Utils.X_TRANSLATABLE_SELECTOR)) {
+        return el;
       }
       if (BLOCK_TAGS.has(el.tagName)) {
         return el;
@@ -830,7 +872,7 @@
     for (const block of candidates) {
       const nested = descendantsOf.get(block) || [];
       const text = extractBlockText(block, nested);
-      if (!text || !Utils.isTranslatableText(text, runSettings.targetLanguage)) {
+      if (!shouldTranslateBlockText(text, runSettings.targetLanguage)) {
         continue;
       }
       segments.push({
@@ -1319,6 +1361,13 @@
       // after-host would hide the whole nowrap flex host including those nested blocks.
       if (options.companionOnly) {
         placement = "companion";
+      }
+      // X tweetText / UserDescription: the translation must be a block-level
+      // sibling AFTER the container (display:block; width:100%). Inserting it
+      // inside flex header/username rows squeezes quoted-tweet translations
+      // into narrow columns and stacks @handles vertically.
+      if (IS_X_HOST && block.matches(Utils.X_TRANSLATABLE_SELECTOR)) {
+        placement = "after-host";
       }
       let wrap = null;
       let createdWraps = [];
@@ -1879,6 +1928,10 @@
       dynamicTimer = null;
       pruneDetachedBlockRecords();
 
+      // X "Show more" expands a recorded tweetText in place: that content
+      // mutation lands in pendingRefreshBlocks, discardBlockRecord below
+      // removes the stale translation block + wraps, and the dynamic pass
+      // re-translates the full text in place. No extra observer needed.
       for (const block of pendingRefreshBlocks) {
         if (blockRecords.has(block)) {
           discardBlockRecord(block);
@@ -2104,12 +2157,33 @@
     }
   }
 
+  // True when the event's innermost target lives inside our selection panel
+  // (composedPath pierces the shadow boundary; window-level listeners only see
+  // the retargeted host). Panel mouseups — clicking 翻译 or × — must not be
+  // treated as a fresh page selection gesture that would re-open the confirm
+  // state and clobber the in-flight translation.
+  function isEventInsideSelectionPanel(event) {
+    const host = selectionHostEl;
+    if (!host?.shadowRoot || typeof event?.composedPath !== "function") {
+      return false;
+    }
+    try {
+      const innermost = event.composedPath()[0];
+      return innermost?.getRootNode?.() === host.shadowRoot;
+    } catch {
+      return false;
+    }
+  }
+
   function onSelectionMaybeTranslate(event, alreadyClaimed = false) {
     if (!alreadyClaimed && !claimSelectionEvent(event)) {
       return;
     }
     // Ignore synthetic page-script events that could burn the user's API key.
     if (event && event.isTrusted === false) {
+      return;
+    }
+    if (isEventInsideSelectionPanel(event)) {
       return;
     }
 
@@ -2218,8 +2292,10 @@
 
   /**
    * Open the page panel as a non-billable preview for a gesture snapshot.
-   * TRANSLATE_BATCH / SELECTION_TRANSLATE_BATCH waits for the extension popup
-   * confirm (page-inaccessible UI) — never a control in page-controlled DOM.
+   * SELECTION_TRANSLATE_BATCH fires only after the user explicitly clicks the
+   * panel's 「翻译」 button (trusted click only) — or confirms in the extension
+   * popup — and sendSelectionTranslation revalidates the live Selection against
+   * the gesture snapshot before anything is billed.
    */
   function showSelectionConfirm(event, gesture) {
     // The gesture snapshot taken synchronously at the trusted event is the
@@ -2267,18 +2343,13 @@
       return;
     }
 
-    // Preview-only: showing this page panel never bills. Consent happens in the
-    // extension popup (page-inaccessible). The stored snapshot is exactly what
-    // CONFIRM_SELECTION_TRANSLATE may later send.
+    // Preview-only: showing this page panel never bills. Billing needs the
+    // explicit trusted click on the panel's 翻译 button (or the extension
+    // popup's confirm), always bound to this stored gesture snapshot.
     pendingSelectionGesture = gesture;
     const panel = ensureSelectionPanel();
     positionSelectionPanel(panel, rect);
-    setSelectionPanelState(
-      panel,
-      "confirm",
-      "打开扩展弹窗确认翻译",
-      gesture.text
-    );
+    setSelectionPanelState(panel, "confirm", "", gesture.text);
     try {
       void chrome.runtime.sendMessage({
         type: "SET_PENDING_SELECTION",
@@ -2473,6 +2544,13 @@
       }
 
       setSelectionPanelState(panel, "success", translation, gesture.text);
+      // The in-panel 翻译 click already consumed the gesture; drop the
+      // worker-side pending + badge so the popup cannot confirm a stale one.
+      try {
+        void chrome.runtime.sendMessage({ type: "CLEAR_PENDING_SELECTION" });
+      } catch {
+        // Worker may be asleep; the pending one-shots on its own.
+      }
     } catch (error) {
       if (requestId && requestId !== selectionGeneration) {
         return;
@@ -2554,42 +2632,49 @@
           line-height: 1;
           padding: 2px 4px;
         }
+        .source {
+          white-space: pre-wrap;
+          word-break: break-word;
+          max-height: 72px;
+          overflow: auto;
+          color: #7f879b;
+          font-size: 11px;
+        }
+        .source[hidden] { display: none; }
         .body {
           white-space: pre-wrap;
           word-break: break-word;
           max-height: 220px;
           overflow: auto;
         }
+        .body[hidden] { display: none; }
         .body.loading { color: #9299ae; }
         .body.error { color: #ff8b96; }
-        .source {
+        .actions {
+          display: flex;
+          justify-content: flex-end;
           margin-top: 8px;
-          padding-top: 8px;
-          border-top: 1px solid rgba(255, 255, 255, 0.08);
-          color: #7f879b;
-          font-size: 11px;
-          white-space: pre-wrap;
-          word-break: break-word;
-          max-height: 72px;
-          overflow: auto;
         }
-        .source[hidden] { display: none; }
-        .hint {
-          margin-top: 8px;
-          color: #91a4ff;
-          font-size: 11px;
-          line-height: 1.4;
+        .actions[hidden] { display: none; }
+        .translate {
+          border: 0;
+          border-radius: 8px;
+          padding: 6px 16px;
+          background: #4f6bff;
+          color: #fff;
+          cursor: pointer;
+          font: 600 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         }
-        .hint[hidden] { display: none; }
+        .translate:hover { background: #3d59e6; }
       </style>
       <div class="panel" role="dialog" aria-label="选中翻译">
         <div class="top">
           <span class="label">千浩翻译 · 划词</span>
           <button class="close" type="button" aria-label="关闭">×</button>
         </div>
-        <div class="body loading">正在翻译选中文本…</div>
         <div class="source" hidden></div>
-        <div class="hint" hidden>打开扩展弹窗确认翻译</div>
+        <div class="body loading">正在翻译选中文本…</div>
+        <div class="actions" hidden><button class="translate" type="button">翻译</button></div>
       </div>
     `;
 
@@ -2599,8 +2684,35 @@
       hideSelectionPanel();
     });
 
-    // No billable controls in page-controlled DOM (open shadow on attacker-owned
-    // pages can be overlaid). Consent lives in the extension popup only.
+    // Clicking into the panel must not collapse the page selection: without
+    // preventDefault on mousedown, the 翻译 click would clear it and the
+    // live-selection guard would reject the just-confirmed gesture.
+    shadow.querySelector(".panel").addEventListener("mousedown", (event) => {
+      if (event.target?.closest?.(".close")) {
+        return;
+      }
+      event.preventDefault();
+    });
+
+    // Billable consent: only a trusted, explicit user click on this button
+    // starts SELECTION_TRANSLATE_BATCH. Page-synthetic clicks (isTrusted
+    // false) never bill; sendSelectionTranslation still revalidates the live
+    // Selection against the previewed gesture snapshot, dedupes unchanged
+    // selections, and the worker enforces its own send quota.
+    shadow.querySelector(".translate").addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.isTrusted === false) {
+        return;
+      }
+      const gesture = pendingSelectionGesture;
+      if (!gesture?.text || !gesture.rangeId) {
+        setSelectionPanelState(host, "error", "没有待确认的划词翻译，请重新选中");
+        return;
+      }
+      pendingSelectionGesture = null;
+      void sendSelectionTranslation(gesture);
+    });
 
     return host;
   }
@@ -2612,7 +2724,7 @@
       Math.max(margin, rect.left),
       window.innerWidth - panelWidth - margin
     );
-    const estimatedHeight = 140;
+    const estimatedHeight = 170;
     const below = rect.bottom + 10;
     const top = below + estimatedHeight > window.innerHeight
       ? Math.max(margin, rect.top - 10 - estimatedHeight)
@@ -2625,30 +2737,21 @@
   function setSelectionPanelState(host, tone, message, sourceText) {
     const body = host.shadowRoot.querySelector(".body");
     const source = host.shadowRoot.querySelector(".source");
-    const hint = host.shadowRoot.querySelector(".hint");
+    const actions = host.shadowRoot.querySelector(".actions");
     body.className = `body ${tone}`;
     body.textContent = message;
-    // Confirm/preview state: show source text + off-page consent hint.
-    // Never expose a billable control in this page-controlled panel.
-    if (tone === "confirm" && sourceText) {
+    // Confirm/preview state: show the selected text plus the explicit 翻译
+    // button — the only in-panel control that can start a billable request.
+    body.hidden = tone === "confirm";
+    if ((tone === "confirm" || tone === "success") && sourceText) {
       source.hidden = false;
       source.textContent = sourceText;
-      if (hint) {
-        hint.hidden = false;
-        hint.textContent = "打开扩展弹窗确认翻译";
-      }
-    } else if (tone === "success" && sourceText) {
-      source.hidden = false;
-      source.textContent = sourceText;
-      if (hint) {
-        hint.hidden = true;
-      }
     } else {
       source.hidden = true;
       source.textContent = "";
-      if (hint) {
-        hint.hidden = true;
-      }
+    }
+    if (actions) {
+      actions.hidden = tone !== "confirm";
     }
     host.hidden = false;
   }
@@ -2696,9 +2799,10 @@
       clearTimeout(selectionTimer);
       selectionTimer = null;
     }
+    // Fully remove the card and drop our ref: listeners, shadow content and
+    // page-visible chrome all go away; ensureSelectionPanel rebuilds on demand.
     const host = selectionHostEl;
-    if (host) {
-      host.hidden = true;
-    }
+    selectionHostEl = null;
+    host?.remove();
   }
 })();

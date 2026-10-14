@@ -22,6 +22,10 @@
     original: "original"
   });
 
+  // On X (Twitter) hosts the translator only touches tweet bodies and profile
+  // bios; sidebar / trends / follow rows / footer chrome must stay untouched.
+  const X_TRANSLATABLE_SELECTOR = '[data-testid="tweetText"], [data-testid="UserDescription"]';
+
   function getTargetLanguageName(code) {
     return TARGET_LANGUAGE_NAMES[code] || code || "简体中文";
   }
@@ -63,6 +67,83 @@
     }
 
     return true;
+  }
+
+  // True when the text already looks like the run's target language, so
+  // translating it again would only duplicate it on screen ("Home Home",
+  // "宝玉宝玉"). The ratio base is letter-class characters only (Han + kana +
+  // hangul + Latin letters); digits, punctuation and symbols never vote.
+  function isAlreadyTargetLanguage(text, targetLang) {
+    if (typeof text !== "string") {
+      return false;
+    }
+    const trimmed = text.trim();
+    if (trimmed.length < 2) {
+      return false;
+    }
+
+    const countMatches = (value, pattern) => (value.match(pattern) || []).length;
+    const han = countMatches(trimmed, /\p{Script=Han}/gu);
+    const kana = countMatches(trimmed, /[\u3040-\u30FF\u31F0-\u31FF]/gu);
+    const hangul = countMatches(trimmed, /[\uAC00-\uD7A3\u1100-\u11FF]/gu);
+    const latin = countMatches(trimmed, /\p{Script=Latin}/gu);
+    const letterClass = han + kana + hangul + latin;
+    if (letterClass < 2) {
+      return false;
+    }
+
+    const code = String(targetLang || "").toLowerCase();
+    if (code.startsWith("zh")) {
+      return han / letterClass >= 0.5;
+    }
+    if (code === "ja") {
+      // Japanese prose reliably carries kana; kanji-only edge cases fall through.
+      return kana / letterClass >= 0.15;
+    }
+    if (code === "ko") {
+      return hangul / letterClass >= 0.3;
+    }
+    // Latin-script targets (en, …): mostly Latin letters with almost no
+    // CJK script mixed in.
+    const cjk = han + kana + hangul;
+    return latin / letterClass >= 0.5 && cjk / letterClass < 0.2;
+  }
+
+  // True for page chrome that must never be translated: @handles, bare URLs,
+  // counters ("1.9K", "12万"), relative times ("2h") and bare dates ("Oct 12") —
+  // translating those yields glued duplicates like "Oct 1210月12日".
+  function isSkippableText(text) {
+    if (typeof text !== "string") {
+      return false;
+    }
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return false;
+    }
+    if (/^@[\w.\-]+$/u.test(trimmed)) {
+      return true;
+    }
+    if (/^(?:https?:\/\/|www\.)\S+$/i.test(trimmed)) {
+      return true;
+    }
+    if (/^\d[\d.,]*(?:\s?[万萬亿億]|[KkMmBb])?\+?$/.test(trimmed)) {
+      return true;
+    }
+    if (/^\d+\s*(?:[smhdw]|sec|min|hr|wk)\s*(?:ago)?$/i.test(trimmed)) {
+      return true;
+    }
+    if (/^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:\s*,?\s*\d{4})?$/i.test(trimmed)) {
+      return true;
+    }
+    return false;
+  }
+
+  // X hosts: x.com / twitter.com plus subdomains such as mobile.twitter.com.
+  // "notx.com" must not match.
+  function isXHost(hostname) {
+    const host = String(hostname || "").trim().toLowerCase().replace(/\.$/u, "");
+    return host === "x.com" || host === "twitter.com" ||
+      host.endsWith(".x.com") || host.endsWith(".twitter.com");
   }
 
   function preserveWhitespace(original, translated) {
@@ -219,9 +300,13 @@
   return {
     DISPLAY_MODES,
     TARGET_LANGUAGE_NAMES,
+    X_TRANSLATABLE_SELECTOR,
     normalizeDisplayMode,
     getTargetLanguageName,
     isTranslatableText,
+    isAlreadyTargetLanguage,
+    isSkippableText,
+    isXHost,
     preserveWhitespace,
     chunkSegments,
     hasMultiParagraphSource,

@@ -588,6 +588,79 @@ function checkJoinRawTextNodesNormalize() {
   );
 }
 
+function checkXLayoutHeuristics() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for X heuristic tests: ${error.message}`);
+    return;
+  }
+
+  const { isAlreadyTargetLanguage, isSkippableText, isXHost, X_TRANSLATABLE_SELECTOR } = utils;
+  if (typeof isAlreadyTargetLanguage !== "function") {
+    fail("shared.js: isAlreadyTargetLanguage export missing");
+    return;
+  }
+  if (typeof isSkippableText !== "function") {
+    fail("shared.js: isSkippableText export missing");
+    return;
+  }
+  if (typeof isXHost !== "function") {
+    fail("shared.js: isXHost export missing");
+    return;
+  }
+  if (
+    typeof X_TRANSLATABLE_SELECTOR !== "string" ||
+    !X_TRANSLATABLE_SELECTOR.includes("tweetText") ||
+    !X_TRANSLATABLE_SELECTOR.includes("UserDescription")
+  ) {
+    fail("shared.js: X_TRANSLATABLE_SELECTOR must cover tweetText and UserDescription");
+    return;
+  }
+
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertFalse = (actual, label) => {
+    if (actual !== false) {
+      fail(`${label}: expected false, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // Already-target-language detection ("Home Home" / "宝玉宝玉" duplication).
+  assertTrue(isAlreadyTargetLanguage("Home", "en"), "isAlreadyTargetLanguage: 'Home' en skips");
+  assertTrue(isAlreadyTargetLanguage("宝玉", "zh"), "isAlreadyTargetLanguage: '宝玉' zh skips");
+  assertFalse(isAlreadyTargetLanguage("Hello world", "zh"), "isAlreadyTargetLanguage: 'Hello world' zh translates");
+  assertFalse(isAlreadyTargetLanguage("你好", "en"), "isAlreadyTargetLanguage: '你好' en translates");
+  // Full target codes and ja/ko script probes.
+  assertTrue(isAlreadyTargetLanguage("今天天气很好", "zh-CN"), "isAlreadyTargetLanguage: zh-CN code skips Han text");
+  assertTrue(isAlreadyTargetLanguage("今日は良い天気ですね", "ja"), "isAlreadyTargetLanguage: kana-bearing text skips for ja");
+  assertTrue(isAlreadyTargetLanguage("안녕하세요", "ko"), "isAlreadyTargetLanguage: hangul text skips for ko");
+  assertFalse(isAlreadyTargetLanguage(42, "en"), "isAlreadyTargetLanguage: non-string translates (fail open to other gates)");
+
+  // Skippable page chrome.
+  assertTrue(isSkippableText("@karpathy"), "isSkippableText: @handle");
+  assertTrue(isSkippableText("1.9K"), "isSkippableText: counter 1.9K");
+  assertTrue(isSkippableText("12万"), "isSkippableText: counter 12万");
+  assertTrue(isSkippableText("https://x.com/a"), "isSkippableText: bare URL");
+  assertTrue(isSkippableText("Oct 12"), "isSkippableText: bare date Oct 12");
+  assertTrue(isSkippableText("2h"), "isSkippableText: relative time 2h");
+  assertFalse(isSkippableText("Hello world"), "isSkippableText: normal English sentence");
+  assertFalse(isSkippableText("这是一句正常的话"), "isSkippableText: normal Chinese sentence");
+  assertFalse(isSkippableText("Octopus live long lives"), "isSkippableText: month-prefixed real sentence");
+
+  // X host gating.
+  assertTrue(isXHost("x.com"), "isXHost: x.com");
+  assertTrue(isXHost("twitter.com"), "isXHost: twitter.com");
+  assertTrue(isXHost("mobile.twitter.com"), "isXHost: mobile.twitter.com");
+  assertFalse(isXHost("example.com"), "isXHost: example.com");
+  assertFalse(isXHost("notx.com"), "isXHost: notx.com must not match");
+}
+
 function main() {
   console.log("kilocean-translate ci-check");
   console.log(`root: ${ROOT}`);
@@ -603,6 +676,7 @@ function main() {
   checkParseTranslationPayload();
   checkJoinSplitTranslations();
   checkJoinRawTextNodesNormalize();
+  checkXLayoutHeuristics();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -612,7 +686,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics");
   process.exit(0);
 }
 
