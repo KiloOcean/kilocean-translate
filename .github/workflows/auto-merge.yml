@@ -17,24 +17,37 @@
 #     if the official check is missing but head already has Copilot APPROVED or
 #     COMMENTED (quota death), treat Copilot check as satisfied; still fail-closed
 #     if there is no Copilot review on head.
+#     TODO(2026-10-29): remove Copilot COMMENTED/quota soft-path after 1-2
+#     weeks of stable Copilot Pro+ quota.
 #   - Check "Codex Review Gate" (job name, not a workflow title) must exist
 #     on the head SHA and complete with conclusion success
 #     (missing / skipped / neutral skip)
 #   - Latest Copilot review for the head SHA exists and is APPROVED or
 #     COMMENTED (not CHANGES_REQUESTED; missing review does not merge)
-#   - GraphQL reviewThreads: every thread isResolved (REST fallback:
-#     fail closed if any review comments exist and resolution is unknown)
+#   - GraphQL reviewThreads: every non-Codex thread resolved; Codex threads
+#     resolved or non-blocking (explicit P2 / keyword-free unlabeled may stay
+#     open — same severity rule as codex-gate.yml; REST fallback: fail closed
+#     if any review comments exist and resolution is unknown)
 #
 # Blocks: draft, non-main base, no-auto-merge, skip-codex-gate, failed/pending relevant
-# checks, missing Copilot review, CHANGES_REQUESTED, unresolved blocking threads (non-Codex any; Codex P0/P1/unlabeled — pure P2 OK).
+# checks, missing Copilot review, CHANGES_REQUESTED, unresolved blocking threads
+# (non-Codex any; Codex P0/P1 or unlabeled-with-security/correctness-keyword —
+# plain unlabeled and pure P2 do not block).
 #
 # Re-evaluates when CI succeeds, when Copilot submits a review, when
 # Codex Review Gate succeeds (workflow_run), or manual dispatch.
 # Codex Gate does not dispatch this workflow (Gate is read-only).
 # Note: workflow_run only runs from the default branch once this file is merged.
-# After resolving threads, re-run a pull_request-originated Codex Review Gate
-# job (to refresh the head check), and/or workflow_dispatch this workflow —
-# thread resolution does not emit a workflow event.
+# For workflow_run triggers this workflow only acts when an open PR whose
+# head.sha == workflow_run.head_sha exists (workflow_run.pull_requests lookup,
+# then fallback to listing open PRs filtered by head SHA); otherwise core.info
+# and return. workflow_run runs whose event is 'push' to main (default branch)
+# are skipped at the job level — no empty runs on main.
+# Resolving a review thread re-runs Codex Review Gate via
+# pull_request_review_thread; when that Gate run succeeds, this workflow
+# re-evaluates via workflow_run. The head-SHA required check is only refreshed
+# by pull_request_target-originated Gate runs, so re-run one of those when the
+# head check is stale; workflow_dispatch also re-evaluates directly.
 
 name: Auto Merge
 
@@ -52,8 +65,10 @@ on:
         type: string
 
 concurrency:
-  group: auto-merge-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.workflow_run.head_branch || github.run_id }}
-  cancel-in-progress: true
+  # One queue per PR (latest events wait for, not cancel, an in-flight
+  # evaluation of the same PR — a merge in progress must not be cancelled).
+  group: auto-merge-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -70,7 +85,10 @@ jobs:
       (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success' &&
         (github.event.workflow_run.event == 'pull_request' ||
-          github.event.workflow_run.name == 'Codex Review Gate')) ||
+          github.event.workflow_run.name == 'Codex Review Gate') &&
+        (github.event.workflow_run.event != 'push' ||
+          (github.event.workflow_run.head_branch != 'main' &&
+            github.event.workflow_run.head_branch != github.event.repository.default_branch))) ||
       (github.event_name == 'pull_request_review' &&
         contains(fromJSON('["approved", "commented"]'), github.event.review.state) &&
         contains(fromJSON('["copilot-pull-request-reviewer[bot]", "copilot-pull-request-reviewer"]'), github.event.review.user.login))
@@ -149,17 +167,30 @@ jobs:
                 return n;
               }
               const run = context.payload.workflow_run;
-              // Codex Gate often originates from issue_comment; pull_requests is empty.
-              if (run.pull_requests && run.pull_requests.length > 0) {
-                return run.pull_requests[0].number;
+              // Codex Gate often originates from issue_comment, so
+              // run.pull_requests is empty; it can also be stale (closed PR
+              // or an older head SHA). Verify each candidate: open PR whose
+              // head.sha == workflow_run.head_sha.
+              for (const cand of run.pull_requests || []) {
+                const { data: candPr } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: cand.number,
+                });
+                if (candPr.state === 'open' && candPr.head.sha === run.head_sha) {
+                  return candPr.number;
+                }
               }
-              const { data: prs } = await github.rest.pulls.list({
+              // Fallback: list open PRs filtered by head SHA (branch-name
+              // lookup misses renames and fork heads).
+              const openPrs = await github.paginate(github.rest.pulls.list, {
                 owner,
                 repo,
                 state: 'open',
-                head: `${owner}:${run.head_branch}`,
+                per_page: 100,
               });
-              return prs[0]?.number ?? null;
+              const match = openPrs.find((p) => p.head.sha === run.head_sha);
+              return match?.number ?? null;
             }
 
             const CODEX_LOGINS = new Set([
@@ -185,27 +216,40 @@ jobs:
               return null; // unlabeled
             }
 
-            // Block if any body is P0/P1 or unlabeled. Allow only when every
-            // scanned body is explicit P2 (later P0/P1 escalations still block;
-            // later P2 cannot downgrade an unlabeled opener).
+            // Security / correctness keywords promote an unlabeled Codex
+            // thread from non-blocking P2 to blocking. Case-insensitive
+            // substring match on the thread body. Must stay in sync with
+            // codex-gate.yml.
+            const BLOCKING_KEYWORDS = [
+              'security', 'vulnerab', 'injection', 'xss', 'csrf', 'rce',
+              'secret', 'token leak', 'credential', 'auth bypass',
+              'privilege', 'data loss', 'corrupt', 'race condition',
+              'deadlock', 'crash', 'incorrect result', 'wrong result',
+              'regression',
+            ];
+
+            function bodyHasBlockingKeyword(bodyText) {
+              const text = (bodyText || '').toLowerCase();
+              return BLOCKING_KEYWORDS.some((k) => text.includes(k));
+            }
+
+            // Blocking = explicit P0/P1, or an unlabeled body carrying a
+            // security/correctness keyword. Unlabeled without a keyword is
+            // non-blocking P2; explicit P2 never blocks.
             function isBlockingSeverity(bodyText) {
-              return severityMarker(bodyText) !== 'P2';
+              const m = severityMarker(bodyText);
+              if (m === 'P0P1') return true;
+              if (m === 'P2') return false;
+              return bodyHasBlockingKeyword(bodyText);
             }
 
             function isBlockingCodexBodies(bodies) {
-              if (!bodies.length) return true;
-              let anyP0P1 = false;
-              let anyUnlabeled = false;
-              for (const body of bodies) {
-                const m = severityMarker(body);
-                if (m === 'P0P1') anyP0P1 = true;
-                else if (m === null) anyUnlabeled = true;
-              }
-              return anyP0P1 || anyUnlabeled;
+              return bodies.some((body) => isBlockingSeverity(body));
             }
 
             // Ownership = opening comment. Non-Codex origin always blocks.
-            // Codex-origin threads block only on P0/P1/unlabeled (pure P2 OK).
+            // Codex-origin threads block only on P0/P1 or unlabeled with a
+            // security/correctness keyword (plain unlabeled and pure P2 OK).
             async function countUnresolvedThreads(prNumber) {
               let unresolved = 0;
               let after = null;
@@ -249,7 +293,9 @@ jobs:
                   const codexBodies = comments
                     .filter((c) => isCodexLogin(c.author?.login))
                     .map((c) => c.body || '');
-                  // Codex-origin: all Codex bodies — escalations block; P2 replies cannot downgrade unlabeled.
+                  // Codex-origin: all Codex bodies — P0/P1 escalations and
+                  // keyword-flagged unlabeled bodies block; P2 replies cannot
+                  // downgrade an unlabeled opener.
                   if (isBlockingCodexBodies(codexBodies.length ? codexBodies : [comments[0]?.body || ''])) {
                     unresolved += 1;
                   }
@@ -276,7 +322,7 @@ jobs:
                 core.setFailed('workflow_dispatch pr_number did not resolve to a PR');
                 return;
               }
-              core.info('No open PR found — skip');
+              core.info('No open PR matches this event (no open PR with this head SHA / PR number) — skip');
               return;
             }
 
@@ -391,6 +437,8 @@ jobs:
             if (copilotChecks.length === 0) {
               // Soft-path: Copilot quota death — official check never appears, but a head
               // review that is APPROVED/COMMENTED still satisfies the Copilot gate.
+              // TODO(2026-10-29): remove Copilot COMMENTED/quota soft-path after 1-2
+              // weeks of stable Copilot Pro+ quota.
               if (!latest || !copilotGate.ok) {
                 core.info('copilot-pull-request-reviewer missing on head SHA — skip');
                 return;

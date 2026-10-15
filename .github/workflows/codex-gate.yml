@@ -10,7 +10,8 @@
 #     (label documents a manual/admin escape hatch only; never reports
 #     success that would satisfy Auto Merge's required Codex Gate check.
 #     pull_request jobs cannot emit a true "neutral" job conclusion.)
-#   - Draft PR → success without dispatch (re-runs on ready_for_review)
+#   - Draft PR → FAIL the Gate job (draft must not report success;
+#     re-runs on ready_for_review)
 #   - No Codex Review Summary comment yet:
 #       * head commit younger than ~20 minutes → fail (still waiting)
 #       * otherwise → fail (timeout; comment @codex review)
@@ -19,15 +20,24 @@
 #   - Summary does not positively show Completed or 👍 no-findings → fail
 #   - Summary completed, but it does not mention the current head SHA
 #     (stale review of an older commit after synchronize) → fail
-#   - Summary completed, but unresolved Codex P0/P1 (or unlabeled) threads remain → fail
-#     (open P2-only threads do not block; unlabeled defaults high / fail-closed)
+#   - Summary completed, but unresolved blocking Codex threads remain → fail.
+#     Severity rule — blocking is: explicit P0/P1, or an unlabeled thread whose
+#     body (case-insensitive) contains a security/correctness keyword. Unlabeled
+#     without a keyword counts as non-blocking P2; explicit P2 never blocks.
+#     Keywords: security, vulnerab, injection, xss, csrf, rce, secret,
+#     token leak, credential, auth bypass, privilege, data loss, corrupt,
+#     race condition, deadlock, crash, incorrect result, wrong result,
+#     regression.
 #   - Summary completed for this head SHA (or 👍 / no-findings) and zero
 #     unresolved blocking Codex threads → success
 #   - GraphQL thread lookup failed + any Codex review comments exist → fail
 #
-# Re-runs when Codex posts/edits its summary or submits a review. Resolving
-# threads does not emit an event — Re-run a *pull_request_target*-originated Gate
-# job from Actions (reattaches the required check to head SHA), or
+# Re-runs when Codex posts/edits its summary, submits a review, or when a
+# review thread is resolved/unresolved (pull_request_review_thread trigger) —
+# resolving threads re-runs the Gate automatically. Runs that originate from
+# non-pull_request_target events do not attach the required check to the PR
+# head SHA; to refresh that check, Re-run a *pull_request_target*-originated
+# Gate job from Actions (reattaches the required check to head SHA), or
 # workflow_dispatch Auto Merge after Gate is already green on that SHA.
 #
 # Security (trusted evaluator):
@@ -44,9 +54,12 @@
 #     state fetched via API; there is no secret exfil surface and no path
 #     for PR YAML/shell to run inside this job.
 #
-# issue_comment / pull_request_review / review_comment / workflow_dispatch
-# still run the evaluator and show a workflow run in Actions. pull_request_target
-# attaches the job conclusion check to the PR the same way pull_request did.
+# issue_comment / pull_request_review / review_comment / review_thread /
+# workflow_dispatch still run the evaluator and show a workflow run in
+# Actions. pull_request_target attaches the job conclusion check to the PR
+# the same way pull_request did. Non-PR contexts — no resolvable PR number
+# (push / default-branch style runs) or a closed/merged PR — core.info and
+# return success: nothing to gate, not a failure.
 # Auto Merge listens to workflow_run for "Codex Review Gate" and does not
 # need Gate to dispatch it.
 #
@@ -66,6 +79,10 @@ on:
     types: [submitted]
   pull_request_review_comment:
     types: [created, edited]
+  # Resolving/unresolving a review thread re-runs the Gate so a freshly
+  # cleaned-up PR re-evaluates without a manual re-run.
+  pull_request_review_thread:
+    types: [resolved, unresolved]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -92,6 +109,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'pull_request_review' ||
       github.event_name == 'pull_request_review_comment' ||
+      github.event_name == 'pull_request_review_thread' ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request)
     steps:
       - name: Evaluate Codex review
@@ -183,23 +201,36 @@ jobs:
               return null; // unlabeled
             }
 
-            // Block if any body is P0/P1 or unlabeled. Allow only when every
-            // scanned body is explicit P2 (later P0/P1 escalations still block;
-            // later P2 cannot downgrade an unlabeled opener).
+            // Security / correctness keywords promote an unlabeled Codex
+            // thread from non-blocking P2 to blocking. Case-insensitive
+            // substring match on the thread body.
+            const BLOCKING_KEYWORDS = [
+              'security', 'vulnerab', 'injection', 'xss', 'csrf', 'rce',
+              'secret', 'token leak', 'credential', 'auth bypass',
+              'privilege', 'data loss', 'corrupt', 'race condition',
+              'deadlock', 'crash', 'incorrect result', 'wrong result',
+              'regression',
+            ];
+
+            function bodyHasBlockingKeyword(bodyText) {
+              const text = (bodyText || '').toLowerCase();
+              return BLOCKING_KEYWORDS.some((k) => text.includes(k));
+            }
+
+            // Blocking = explicit P0/P1, or an unlabeled body carrying a
+            // security/correctness keyword. Unlabeled without a keyword is
+            // non-blocking P2; explicit P2 never blocks. Later P0/P1
+            // escalations still block; later P2 cannot downgrade an
+            // unlabeled opener.
             function isBlockingSeverity(bodyText) {
-              return severityMarker(bodyText) !== 'P2';
+              const m = severityMarker(bodyText);
+              if (m === 'P0P1') return true;
+              if (m === 'P2') return false;
+              return bodyHasBlockingKeyword(bodyText);
             }
 
             function isBlockingCodexBodies(bodies) {
-              if (!bodies.length) return true;
-              let anyP0P1 = false;
-              let anyUnlabeled = false;
-              for (const body of bodies) {
-                const m = severityMarker(body);
-                if (m === 'P0P1') anyP0P1 = true;
-                else if (m === null) anyUnlabeled = true;
-              }
-              return anyP0P1 || anyUnlabeled;
+              return bodies.some((body) => isBlockingSeverity(body));
             }
 
             async function countUnresolvedCodexThreads(prNumber) {
@@ -264,7 +295,9 @@ jobs:
 
             const prNumber = await resolvePrNumber();
             if (!prNumber) {
-              core.setFailed('Could not resolve PR number');
+              // Non-PR context (no resolvable PR — push / default-branch style
+              // event): nothing to gate, and not a failure of any PR's check.
+              core.info('No PR number resolved for this event — nothing to gate');
               return;
             }
 
@@ -273,6 +306,12 @@ jobs:
               repo,
               pull_number: prNumber,
             });
+
+            if (pr.merged || pr.state !== 'open') {
+              core.info(`PR #${prNumber} is ${pr.merged ? 'merged' : pr.state} — nothing to gate`);
+              return;
+            }
+
             const sha = pr.head.sha;
 
             if (pr.labels.some((l) => l.name === 'skip-codex-gate')) {
@@ -286,7 +325,11 @@ jobs:
             }
 
             if (pr.draft) {
-              core.info(`PR #${prNumber} is draft — passing until ready_for_review`);
+              // Draft PRs must not report success — a green Gate on a draft
+              // would over-permissively satisfy branch protection later.
+              const msg = 'PR is draft — Gate fails until ready_for_review';
+              core.info(`PR #${prNumber}: ${msg}`);
+              core.setFailed(msg);
               return;
             }
 
@@ -368,12 +411,12 @@ jobs:
             }
 
             if (unresolvedCodex > 0) {
-              const msg = `${unresolvedCodex} unresolved Codex P0/P1 (or unlabeled) thread(s). Resolve them, then re-run a pull_request_target-originated Gate job (thread resolve does not retrigger; non-PR events do not post Checks API results).`;
+              const msg = `${unresolvedCodex} unresolved blocking Codex thread(s) — P0/P1, or unlabeled containing a security/correctness keyword (security, vulnerab, injection, xss, csrf, rce, secret, token leak, credential, auth bypass, privilege, data loss, corrupt, race condition, deadlock, crash, incorrect result, wrong result, regression). Resolve them — resolving a thread re-runs the Gate via pull_request_review_thread (non-PR events do not post Checks API results; re-run a pull_request_target-originated Gate job to refresh the head-SHA check).`;
               core.setFailed(msg);
               return;
             }
 
-            const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved P0/P1 (or unlabeled) Codex threads`;
+            const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved blocking Codex threads (P0/P1 or keyword-flagged unlabeled; plain unlabeled counts as non-blocking P2)`;
             core.info(ok);
             // Success = job conclusion. pull_request_target attaches "Codex Review Gate"
             // to the PR head check. Auto Merge listens via workflow_run — no dispatch.

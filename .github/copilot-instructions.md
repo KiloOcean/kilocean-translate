@@ -34,7 +34,7 @@ Kilocean Translate is a Chrome/Edge MV3 extension: progressive page translation 
 node scripts/ci-check.mjs
 ```
 
-Merge policy: docs/MERGE_GATES.md and AGENTS.md — Build + Codex Review Gate (P0/P1/unlabeled) + blocking threads; never Build-only. Copilot soft-path: missing official check but head APPROVED/COMMENTED OK for Auto Merge; required-check / native conversation resolution limits documented in MERGE_GATES.
+Merge policy: docs/MERGE_GATES.md and AGENTS.md — Build + Codex Review Gate (P0/P1 or unlabeled-with-security/correctness-keyword) + blocking threads; never Build-only. Copilot soft-path: missing official check but head APPROVED/COMMENTED OK for Auto Merge; required-check / native conversation resolution limits documented in MERGE_GATES.
 
 ## Agent behavior
 
@@ -52,4 +52,4 @@ When leaving review comments (Copilot or Codex), **tag each finding** with sever
 
 Unlabeled comments: treat correctness/security/data-loss as P0/P1; treat nit/style as P2.
 
-Codex Review Gate / Auto Merge block unresolved Codex **P0/P1 (or unlabeled)**; pure Codex **P2 may stay open**, or Resolve after `P2: defer — <reason>` / `P2: won't fix — <reason>`. Non-Codex threads still must be resolved. GitHub native conversation resolution has no severity filter — see `docs/MERGE_GATES.md`.
+Codex Review Gate / Auto Merge block unresolved Codex **P0/P1 (or unlabeled whose body contains a security/correctness keyword)**; pure Codex **P2 and plain unlabeled may stay open**, or Resolve after `P2: defer — <reason>` / `P2: won't fix — <reason>`. Non-Codex threads still must be resolved. GitHub native conversation resolution has no severity filter — see `docs/MERGE_GATES.md`.
