@@ -157,4 +157,4 @@ node scripts/ci-check.mjs
 
 ### Copilot quota dead
 
-Manual merge still requires codex / Codex Review Gate green + conversation resolution + Build green. Never merge on Build alone.
+Manual merge still requires all hard gates: `ci / Build & Test`, `ci / Secret Scan`, `codex / Codex Review Gate`, `qa / QA Gate` (`qa-passed`) green + blocking conversation resolution. Only the Copilot review may be waived. Never merge on Build alone.
