@@ -110,6 +110,115 @@ function isContentRunCancelled(cancelledRuns, tabId, runId) {
   return Number.isInteger(cancelledUpTo) && runId <= cancelledUpTo;
 }
 
+// Per-tab whole-page translation slots. content.js keeps its own local
+// throttle, but a tab can host several content-script instances (re-injection,
+// frames) whose combined TRANSLATE_BATCH load only the worker can observe:
+// the cap here is the authoritative one, cross-instance and cross-page.
+// Each granted slot owns an AbortController so a tab navigation/close can
+// abort the in-flight fetch (and its worker-side retries) immediately.
+/** @type {Map<number, { running: number, waiters: { resolve: () => void, reject: (error: Error) => void }[], controllers: Set<AbortController>, cancelled: boolean }>} */
+const tabTranslateSlots = new Map();
+
+function getTabTranslateSlotState(tabId) {
+  let state = tabTranslateSlots.get(tabId);
+  if (!state) {
+    state = { running: 0, waiters: [], controllers: new Set(), cancelled: false };
+    tabTranslateSlots.set(tabId, state);
+  }
+  return state;
+}
+
+// Run `task(signal)` under the tab's batch cap: grant immediately while the
+// tab holds fewer than MAX_INFLIGHT_TRANSLATE_BATCHES in-flight batches,
+// otherwise queue until a slot frees. Queued tasks rejected by a tab
+// cancellation never consume a slot.
+async function withTabTranslateSlot(tabId, task) {
+  if (tabId == null) {
+    return task(null);
+  }
+  const state = getTabTranslateSlotState(tabId);
+  if (state.cancelled) {
+    throw createError("翻译已取消", "RUN_CANCELLED");
+  }
+  if (state.running >= DeepSeekTranslatorUtils.MAX_INFLIGHT_TRANSLATE_BATCHES) {
+    await new Promise((resolve, reject) => {
+      state.waiters.push({ resolve, reject });
+    });
+    if (state.cancelled) {
+      // The slot was handed over just as the tab got cancelled — pass it on
+      // (there is nothing to run) and report the cancellation.
+      releaseTabTranslateSlot(state);
+      throw createError("翻译已取消", "RUN_CANCELLED");
+    }
+  } else {
+    state.running += 1;
+  }
+  const controller = new AbortController();
+  state.controllers.add(controller);
+  try {
+    return await task(controller.signal);
+  } finally {
+    state.controllers.delete(controller);
+    releaseTabTranslateSlot(state);
+  }
+}
+
+function releaseTabTranslateSlot(state) {
+  const next = state.waiters.shift();
+  if (next) {
+    // Hand the slot straight to the next waiter — the count stays put.
+    next.resolve();
+    return;
+  }
+  state.running = Math.max(0, state.running - 1);
+}
+
+// Cancel every in-flight and queued TRANSLATE_BATCH of a tab (whole-page
+// navigation destroyed its content script, or the tab closed): abort the
+// in-flight fetches via their controllers, reject queued waiters, and drop
+// the slot state so the tab's next page starts fresh. SPA view swaps inside
+// the same document keep going through CANCEL_TRANSLATE_BATCHES instead.
+function cancelTabTranslateBatches(tabId) {
+  const state = tabTranslateSlots.get(tabId);
+  if (!state) {
+    return;
+  }
+  tabTranslateSlots.delete(tabId);
+  state.cancelled = true;
+  for (const controller of state.controllers) {
+    controller.abort();
+  }
+  state.controllers.clear();
+  const waiters = state.waiters.splice(0);
+  for (const waiter of waiters) {
+    waiter.reject(createError("翻译已取消", "RUN_CANCELLED"));
+  }
+}
+
+// URL identity ignoring the fragment: an in-page anchor jump keeps the same
+// document and must not count as a whole-tab navigation.
+function stripUrlHash(url) {
+  const value = String(url || "");
+  const hashAt = value.indexOf("#");
+  return hashAt === -1 ? value : value.slice(0, hashAt);
+}
+
+/** @type {Map<number, string>} tabId → last seen onUpdated url. */
+const lastTabUrls = new Map();
+
+// True for a changeInfo that destroys the page's content script: a full
+// load, or a URL change beyond the fragment. Records the tab's latest url on
+// the side so later changes can be compared against it.
+function isWholeTabNavigationChange(tabId, changeInfo) {
+  let urlNavigation = false;
+  if (changeInfo.url != null) {
+    const previous = lastTabUrls.get(tabId);
+    urlNavigation = previous == null || stripUrlHash(previous) !== stripUrlHash(changeInfo.url);
+    lastTabUrls.set(tabId, changeInfo.url);
+  }
+  return changeInfo.status === "loading" || urlNavigation;
+}
+
 const SELECTION_SEND_MIN_INTERVAL_MS = 1000;
 const SELECTION_SEND_WINDOW_MS = 10000;
 const SELECTION_SEND_WINDOW_LIMIT = 8;
@@ -123,6 +232,8 @@ chrome.runtime.onInstalled.addListener(async () => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   void clearPendingSelection(tabId);
   cancelledContentRuns.delete(tabId);
+  lastTabUrls.delete(tabId);
+  cancelTabTranslateBatches(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -130,6 +241,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   // selection + badge so the popup cannot confirm against a new document.
   if (changeInfo.url != null || changeInfo.status === "loading") {
     void clearPendingSelection(tabId);
+  }
+  // A whole-page change (full load, or a non-hash url change) kills every
+  // content-script instance of the old document: abort its in-flight and
+  // queued TRANSLATE_BATCHes so nothing keeps billing a dead page.
+  if (isWholeTabNavigationChange(tabId, changeInfo)) {
+    cancelTabTranslateBatches(tabId);
   }
 });
 
@@ -141,12 +258,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "TRANSLATE_BATCH") {
     // runId (content-script run generation) lets a later CANCEL_TRANSLATE_BATCHES
     // stop this request's remaining retry attempts — no orphan retries billing
-    // an abandoned generation.
+    // an abandoned generation. The per-tab slot gate caps concurrent batches
+    // across every content-script instance of the tab and hands the task an
+    // AbortController that whole-tab navigation / tab removal can abort.
     const tabId = Number.isInteger(sender.tab?.id) ? sender.tab.id : null;
     const runId = Number.isInteger(message.runId) ? message.runId : null;
-    translateBatch(message.texts, message.targetLanguage, message.model, message.provider, undefined, {
-      isCancelled: () => isContentRunCancelled(cancelledContentRuns, tabId, runId)
-    })
+    withTabTranslateSlot(tabId, (signal) => translateBatch(
+      message.texts,
+      message.targetLanguage,
+      message.model,
+      message.provider,
+      undefined,
+      {
+        isCancelled: () => isContentRunCancelled(cancelledContentRuns, tabId, runId),
+        signal
+      }
+    ))
       .then((translations) => sendResponse({ ok: true, translations }))
       .catch((error) => sendResponse({
         ok: false,
@@ -358,10 +485,13 @@ async function translateBatch(
   timeoutMs = DeepSeekTranslatorUtils.FETCH_TIMEOUT_MS.translation,
   // Injectable so tests run the retry loop without wall-clock delays.
   // isCancelled is polled before every attempt and after every backoff sleep
-  // so an abandoned run stops billing immediately.
+  // so an abandoned run stops billing immediately; signal aborts the in-flight
+  // fetch itself (tab navigation / removal); now drives the total deadline.
   {
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    isCancelled = () => false
+    isCancelled = () => false,
+    signal = null,
+    now = Date.now
   } = {}
 ) {
   if (!Array.isArray(texts) || texts.length === 0 || texts.length > 24) {
@@ -423,13 +553,38 @@ async function translateBatch(
   // "正在翻译" forever), plus bounded retry: 429 / 5xx / timeout get a second
   // and third attempt with backoff (Retry-After honored). Every other 4xx —
   // and any non-timeout network error — surfaces immediately.
+  //
+  // timeoutMs is a TOTAL budget for the whole call — every attempt, every
+  // Retry-After/backoff wait, every body read draws from the same deadline.
+  // Each attempt passes its remaining budget to fetchWithTimeout; a wait that
+  // cannot leave MIN_ATTEMPT_BUDGET_MS of room for one more meaningful
+  // attempt fails fast instead of sleeping past the deadline.
+  const runCancelled = () => Boolean(signal && signal.aborted) || isCancelled();
   const maxAttempts = 1 + DeepSeekTranslatorUtils.MAX_PROVIDER_RETRIES;
+  const deadline = now() + timeoutMs;
   let response;
   let responseText = "";
+  // Last 429/5xx response: when the budget runs out mid-retry-cycle, its
+  // friendly busy / rate-limit message is what the user should see (a bare
+  // timeout hint would hide the actual cause).
+  let lastRetryableResponse = null;
   for (let attempt = 0; ; attempt += 1) {
     const canRetry = attempt < maxAttempts - 1;
-    if (isCancelled()) {
+    if (runCancelled()) {
       throw createError("翻译已取消", "RUN_CANCELLED");
+    }
+    // Remaining budget cannot fund another meaningful attempt (never the
+    // first attempt — its budget is the full deadline). After 429/5xx surface
+    // that response's friendly message; otherwise the timeout error.
+    if (
+      attempt > 0 &&
+      !DeepSeekTranslatorUtils.canRetryWithinBudget(0, deadline, now)
+    ) {
+      if (lastRetryableResponse) {
+        response = lastRetryableResponse;
+        break;
+      }
+      throw DeepSeekTranslatorUtils.createFetchTimeoutError();
     }
     try {
       const attemptResponse = await DeepSeekTranslatorUtils.fetchWithTimeout(providerConfig.apiUrl, {
@@ -439,7 +594,7 @@ async function translateBatch(
           "Content-Type": "application/json"
         },
         body: JSON.stringify(body)
-      }, timeoutMs);
+      }, Math.max(deadline - now(), 1), signal);
       responseText = await attemptResponse.text();
       if (
         attemptResponse.ok ||
@@ -449,10 +604,18 @@ async function translateBatch(
         response = attemptResponse;
         break;
       }
-      await sleep(DeepSeekTranslatorUtils.computeRetryDelay(
+      lastRetryableResponse = attemptResponse;
+      const retryDelay = DeepSeekTranslatorUtils.computeRetryDelay(
         attempt,
         attemptResponse.headers?.get?.("Retry-After")
-      ));
+      );
+      if (!DeepSeekTranslatorUtils.canRetryWithinBudget(retryDelay, deadline, now)) {
+        // Retry-After / backoff cannot fit in the remaining budget — do not
+        // wait, surface the response's friendly message now.
+        response = attemptResponse;
+        break;
+      }
+      await sleep(retryDelay);
     } catch (error) {
       if (DeepSeekTranslatorUtils.isTimeoutError(error)) {
         if (!canRetry) {
@@ -460,9 +623,24 @@ async function translateBatch(
           // would only obscure the cause.
           throw error;
         }
-        // Timeouts are transient like 5xx: re-arm the same deadline and try
-        // again (no Retry-After exists for an aborted request).
-        await sleep(DeepSeekTranslatorUtils.computeRetryDelay(attempt));
+        if (runCancelled()) {
+          throw createError("翻译已取消", "RUN_CANCELLED");
+        }
+        // Compute the delay once: the budget check and the sleep must agree,
+        // or jitter could sleep past what was checked.
+        const timeoutRetryDelay = DeepSeekTranslatorUtils.computeRetryDelay(attempt);
+        if (!DeepSeekTranslatorUtils.canRetryWithinBudget(timeoutRetryDelay, deadline, now)) {
+          // The deadline cannot fund the backoff plus another attempt.
+          throw error;
+        }
+        // Timeouts are transient like 5xx: re-arm with the remaining budget
+        // and try again (no Retry-After exists for an aborted request).
+        lastRetryableResponse = null;
+        await sleep(timeoutRetryDelay);
+      } else if (runCancelled()) {
+        // fetchWithTimeout rethrows the raw abort error when an external
+        // cancellation signal (tab navigation / removal) cut the request.
+        throw createError("翻译已取消", "RUN_CANCELLED");
       } else {
         const wrapped = createError(`无法连接 ${providerConfig.label}：${error.message}`, "NETWORK_ERROR");
         wrapped.canSplit = false;
@@ -472,7 +650,7 @@ async function translateBatch(
     // A retryable failure just slept out its backoff (status or timeout
     // retry): cancellation usually lands during that sleep, so re-check
     // before the next billable attempt instead of retrying a dead run.
-    if (isCancelled()) {
+    if (runCancelled()) {
       throw createError("翻译已取消", "RUN_CANCELLED");
     }
   }

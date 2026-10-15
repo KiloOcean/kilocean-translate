@@ -31,6 +31,13 @@
   });
   const FETCH_TIMEOUT_MESSAGE = "请求超时，请检查网络或稍后重试";
 
+  // Smallest remaining deadline budget still worth one more provider
+  // attempt. Below it a fresh request would almost certainly be cut off
+  // mid-flight, so the caller fails fast instead (timeout, or the busy hint
+  // when the last failure was 429/5xx). The first attempt is exempt: its
+  // budget is the whole deadline, which callers keep well above this floor.
+  const MIN_ATTEMPT_BUDGET_MS = 1000;
+
   // DeepSeek chat models: the API renamed deepseek-v4-flash → deepseek-flash
   // (DeepSeek-V4.1-Flash, see selftest/deepseek-connectivity-2026-10-15.md).
   // Saved settings may still hold the legacy name; migrateModelName maps it
@@ -492,6 +499,18 @@
       (error.isTimeout === true || error.code === "FETCH_TIMEOUT");
   }
 
+  // True when waiting `delayMs` still leaves enough of the deadline budget
+  // for one more meaningful attempt (MIN_ATTEMPT_BUDGET_MS of headroom).
+  // translateBatch consults it before every backoff / Retry-After sleep so a
+  // wait that cannot fit inside the total deadline never happens at all.
+  // Pure so tests drive the retry loop with an injected clock.
+  function canRetryWithinBudget(delayMs, deadline, now = Date.now()) {
+    if (!Number.isFinite(deadline)) {
+      return true;
+    }
+    return Number(delayMs) + MIN_ATTEMPT_BUDGET_MS <= deadline - now();
+  }
+
   // Bounded retry policy for provider requests: 429 / 5xx / timeout get at
   // most MAX_PROVIDER_RETRIES extra attempts with ~1s / ~3s backoff (±20%
   // jitter). Other 4xx never change outcome on retry and fail fast. A
@@ -551,20 +570,41 @@
   // non-streaming; a future chunked read should instead reset the timer on
   // each chunk (idle deadline). Aborting rejects with the user-facing Chinese
   // timeout error, ready for popup/status/toast surfaces.
-  async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS.translation) {
+  //
+  // An optional `externalSignal` (tab navigation / removal cancellation)
+  // aborts the same controller but must NOT be reported as a timeout: the
+  // deadline timer sets `deadlineAborted` first so the catch paths can tell
+  // the two abort sources apart — a cancelled request rethrows the raw abort
+  // error for the caller to classify as RUN_CANCELLED.
+  async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS.translation, externalSignal = null) {
     const controller = new AbortController();
-    let timer = setTimeout(() => controller.abort(), timeoutMs);
-    const clearTimer = () => {
+    let deadlineAborted = false;
+    const onExternalAbort = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort();
+      } else {
+        externalSignal.addEventListener("abort", onExternalAbort);
+      }
+    }
+    let timer = setTimeout(() => {
+      deadlineAborted = true;
+      controller.abort();
+    }, timeoutMs);
+    const teardown = () => {
       clearTimeout(timer);
       timer = null;
+      if (externalSignal) {
+        externalSignal.removeEventListener("abort", onExternalAbort);
+      }
     };
 
     let response;
     try {
       response = await fetch(url, { ...options, signal: controller.signal });
     } catch (error) {
-      clearTimer();
-      if (controller.signal.aborted) {
+      teardown();
+      if (deadlineAborted) {
         throw createFetchTimeoutError();
       }
       throw error;
@@ -578,12 +618,12 @@
       try {
         return await response[method](...args);
       } catch (error) {
-        if (controller.signal.aborted) {
+        if (deadlineAborted) {
           throw createFetchTimeoutError();
         }
         throw error;
       } finally {
-        clearTimer();
+        teardown();
       }
     };
     return {
@@ -610,9 +650,11 @@
     MAX_PROVIDER_RETRIES,
     RETRY_BASE_DELAYS_MS,
     RETRY_AFTER_CAP_MS,
+    MIN_ATTEMPT_BUDGET_MS,
     isRetryableStatus,
     parseRetryAfterMs,
     computeRetryDelay,
+    canRetryWithinBudget,
     normalizeDisplayMode,
     getTargetLanguageName,
     isTranslatableText,
@@ -629,6 +671,7 @@
     sanitizeExportFilename,
     buildExportFilename,
     fetchWithTimeout,
-    isTimeoutError
+    isTimeoutError,
+    createFetchTimeoutError
   };
 });

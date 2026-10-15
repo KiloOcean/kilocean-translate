@@ -5,9 +5,10 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -1482,9 +1483,12 @@ async function checkModelMigrationAndRetryPolicy() {
     ]);
   };
 
-  const runTranslate = async (label, storage, handlers, timeoutMs = 1000, extraOptions = {}) => {
+  const runTranslate = async (label, storage, handlers, timeoutMs = 30000, extraOptions = {}) => {
     let calls = 0;
     const delays = [];
+    // Fake clock: only the recorded (zero-real-delay) backoff sleeps advance
+    // it, so total-deadline arithmetic is deterministic regardless of jitter.
+    const clock = { now: 0 };
     const queue = [...handlers];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (url, options) => {
@@ -1500,7 +1504,11 @@ async function checkModelMigrationAndRetryPolicy() {
           undefined,
           undefined,
           timeoutMs,
-          { sleep: async (ms) => { delays.push(ms); }, ...extraOptions }
+          {
+            sleep: async (ms) => { delays.push(ms); clock.now += ms; },
+            now: () => clock.now,
+            ...extraOptions
+          }
         ),
         label
       );
@@ -1611,19 +1619,33 @@ async function checkModelMigrationAndRetryPolicy() {
     assertInRange(rateLimited.delays[1], 2400, 3600, "translateBatch: second delay after 503 uses ~3s backoff");
   }
 
-  // Timeout is retried: first attempt hangs, second succeeds (short deadline).
-  const timedOutThenOk = await runTranslate(
-    "timeout then 200",
+  // Total deadline (P1-1): a hung first attempt burns the whole budget, so
+  // the ~1s backoff no longer fits and the call must fail with the verbatim
+  // timeout error after exactly one fetch — never a second billable attempt
+  // past the deadline.
+  const startedHung = Date.now();
+  const hungExhausted = await runTranslate(
+    "hung fetch exhausts total deadline",
     deepseekStorage,
-    [hangUntilAbort, () => jsonResponse(200, okBody)],
+    [hangUntilAbort],
     25
   );
-  if (!timedOutThenOk.ok) {
-    fail(`translateBatch: timeout-then-200 must succeed, got ${JSON.stringify(timedOutThenOk.error?.message)}`);
+  const hungElapsed = Date.now() - startedHung;
+  if (hungExhausted.ok) {
+    fail("translateBatch: hung fetch with an exhausted budget must reject");
   } else {
-    assertEqual(timedOutThenOk.calls, 2, "translateBatch: a timed-out attempt is retried once");
-    assertInRange(timedOutThenOk.delays[0], 800, 1200, "translateBatch: timeout retry uses the ~1s backoff");
+    assertEqual(hungExhausted.calls, 1, "translateBatch: no retry once the total deadline is spent");
+    assertEqual(hungExhausted.delays.length, 0, "translateBatch: budget-exhausted timeout never sleeps out a backoff");
+    assertEqual(hungExhausted.error.message, utils.FETCH_TIMEOUT_MESSAGE, "translateBatch: budget exhaustion surfaces the verbatim timeout message");
+    if (hungElapsed > 1500) {
+      fail(`translateBatch: hung fetch must settle within the deadline budget, took ${hungElapsed}ms`);
+    }
   }
+
+  // A hung attempt whose budget still funds the backoff + retry does retry —
+  // the timeout branch is exercised by the cancel-during-timeout-backoff
+  // test below (cancellation is checked before the budget throw) and the vm
+  // hung-fetch test in checkTotalDeadlineBudget.
 
   // ---- Run cancellation: abandoned generations must stop billing ----
   // Pure lookup: cancel marks "every run ≤ N from this tab is dead".
@@ -1660,7 +1682,7 @@ async function checkModelMigrationAndRetryPolicy() {
       cancelAfterFirstCall = true;
       return jsonResponse(503, '{"error":{"message":"down"}}');
     }],
-    1000,
+    30000,
     { isCancelled: () => cancelAfterFirstCall }
   );
   if (cancelledMidBackoff.ok) {
@@ -2113,6 +2135,755 @@ async function checkSpaRefreshAndSelectionLifecycle() {
   }
 }
 
+// ---- P1-1: total deadline budget ----
+async function checkTotalDeadlineBudget() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for deadline-budget tests: ${error.message}`);
+    return;
+  }
+  const {
+    canRetryWithinBudget,
+    MIN_ATTEMPT_BUDGET_MS,
+    createFetchTimeoutError,
+    isTimeoutError,
+    FETCH_TIMEOUT_MESSAGE
+  } = utils;
+
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertFalse = (actual, label) => {
+    if (actual !== false) {
+      fail(`${label}: expected false, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  if (typeof canRetryWithinBudget !== "function") {
+    fail("shared.js: canRetryWithinBudget export missing (total-deadline helper)");
+    return;
+  }
+  if (MIN_ATTEMPT_BUDGET_MS !== 1000) {
+    fail(`deadline budget: MIN_ATTEMPT_BUDGET_MS must be 1000ms, got ${JSON.stringify(MIN_ATTEMPT_BUDGET_MS)}`);
+  }
+
+  // Pure budget arithmetic: a wait is affordable only when it leaves
+  // MIN_ATTEMPT_BUDGET_MS of the deadline for the next attempt.
+  const at = (ms) => () => ms;
+  assertFalse(canRetryWithinBudget(0, 1000, at(500)), "canRetryWithinBudget: 500ms left cannot fund a 1000ms-minimum attempt");
+  assertTrue(canRetryWithinBudget(0, 1500, at(500)), "canRetryWithinBudget: exactly the minimum headroom fits");
+  assertTrue(canRetryWithinBudget(4000, 15000, at(0)), "canRetryWithinBudget: 4s wait inside a fresh 15s budget");
+  assertFalse(canRetryWithinBudget(10000, 15000, at(5000)), "canRetryWithinBudget: 10s wait + minimum exceeds 10s left");
+  assertTrue(canRetryWithinBudget(1e9, Infinity, at(12345)), "canRetryWithinBudget: no deadline always fits");
+
+  const timeoutError = createFetchTimeoutError();
+  if (!isTimeoutError(timeoutError) || timeoutError.message !== FETCH_TIMEOUT_MESSAGE || timeoutError.canSplit !== false) {
+    fail("createFetchTimeoutError: must produce the recognizable verbatim timeout error");
+  }
+
+  // Functional: the shipping translateBatch honors the total budget.
+  const harness = buildBackgroundHarness(utils);
+  if (!harness) {
+    fail("background.js: cannot build harness for deadline-budget functional tests");
+    return;
+  }
+
+  const okBody = JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({ translations: ["你好"] }) } }]
+  });
+  const jsonResponse = (status, body, headers = {}) => ({
+    ok: status === 200,
+    status,
+    statusText: "",
+    headers: { get: (name) => headers[String(name).toLowerCase()] ?? null },
+    url: "https://api.deepseek.com/chat/completions",
+    text: async () => body
+  });
+  const deepseekStorage = {
+    provider: "deepseek",
+    deepseekApiKey: "sk-deadline",
+    model: "deepseek-flash",
+    targetLanguage: "zh-CN",
+    displayMode: "bilingual"
+  };
+  const runWithClock = async (handlers, timeoutMs) => {
+    let calls = 0;
+    const delays = [];
+    const clock = { now: 0 };
+    const queue = [...handlers];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      calls += 1;
+      return (queue.length > 1 ? queue.shift() : queue[0])(url, options);
+    };
+    try {
+      const result = await Promise.race([
+        harness({ ...deepseekStorage }).translateBatch(
+          ["Hello"],
+          "zh-CN",
+          undefined,
+          undefined,
+          timeoutMs,
+          { sleep: async (ms) => { delays.push(ms); clock.now += ms; }, now: () => clock.now }
+        ),
+        new Promise((resolve) => setTimeout(() => {
+          fail("deadline-budget functional test: no settlement within 3000ms");
+          resolve(undefined);
+        }, 3000))
+      ]);
+      return { ok: true, result, calls, delays };
+    } catch (error) {
+      return { ok: false, error, calls, delays };
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  };
+
+  // Retry-After larger than the whole budget: never waited out, exactly one
+  // call, friendly rate-limit message (not the timeout hint).
+  const hugeRetryAfter = await runWithClock(
+    [() => jsonResponse(429, '{"error":{"message":"rate"}}', { "retry-after": "30" })],
+    2000
+  );
+  if (hugeRetryAfter.ok) {
+    fail("translateBatch: 429 with an unaffordable Retry-After must reject");
+  } else {
+    assertEqual(hugeRetryAfter.calls, 1, "translateBatch: unaffordable Retry-After makes no second call");
+    assertEqual(hugeRetryAfter.delays.length, 0, "translateBatch: unaffordable Retry-After is never slept out");
+    assertEqual(hugeRetryAfter.error.message, "DeepSeek 请求过于频繁，请稍后重试", "translateBatch: unaffordable Retry-After surfaces the friendly 429 message");
+  }
+
+  // Budget exhausts mid 5xx cycle: first backoff fits, the second cannot, so
+  // the call stops after 2 calls with the busy message instead of sleeping
+  // past the deadline.
+  const exhaustedMidCycle = await runWithClock(
+    [() => jsonResponse(503, '{"error":{"message":"down"}}'), () => jsonResponse(503, '{"error":{"down"}}')],
+    2500
+  );
+  if (exhaustedMidCycle.ok) {
+    fail("translateBatch: budget exhausted mid-5xx-cycle must reject");
+  } else {
+    assertEqual(exhaustedMidCycle.calls, 2, "translateBatch: second 5xx backoff that no longer fits stops the cycle");
+    assertEqual(exhaustedMidCycle.delays.length, 1, "translateBatch: only the affordable backoff was slept");
+    assertEqual(
+      exhaustedMidCycle.error.message,
+      "服务商繁忙或故障，请稍后重试，或在设置里切换到另一服务商 状态：https://status.deepseek.com",
+      "translateBatch: budget exhaustion after 5xx surfaces the busy message"
+    );
+  }
+
+  // Sanity: a generous budget keeps the retry cycle intact (503, 503 → 200).
+  const recovered = await runWithClock(
+    [
+      () => jsonResponse(503, "{}"),
+      () => jsonResponse(503, "{}"),
+      () => jsonResponse(200, okBody)
+    ],
+    30000
+  );
+  if (!recovered.ok) {
+    fail(`translateBatch: generous budget must keep retries working, got ${JSON.stringify(recovered.error?.message)}`);
+  } else {
+    assertEqual(recovered.calls, 3, "translateBatch: generous budget retries both times");
+  }
+
+  // Static: every attempt passes its remaining budget (not the fixed timeout)
+  // into fetchWithTimeout, and the loop consults canRetryWithinBudget.
+  const background = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"));
+  if (!/Math\.max\(deadline - now\(\),\s*1\)/.test(background)) {
+    fail("background.js: each attempt must pass its remaining deadline budget into fetchWithTimeout");
+  }
+  if (!/canRetryWithinBudget\(/.test(background)) {
+    fail("background.js: the retry loop must gate waits on DeepSeekTranslatorUtils.canRetryWithinBudget");
+  }
+  if ((background.match(/canRetryWithinBudget\(/g) || []).length < 3) {
+    fail("background.js: canRetryWithinBudget must gate pre-attempt budget, status backoff and timeout backoff");
+  }
+}
+
+// ---- P1-2: per-tab concurrency + navigation/tab-close cancellation ----
+// Load the REAL background.js + shared.js into a node:vm context with a
+// stubbed chrome API and fetch so the tests drive the shipping wiring
+// (listener registration, slot gate, abort plumbing).
+function buildBackgroundVm({ storageData = {}, fetchImpl, setTimeoutImpl = setTimeout } = {}) {
+  const backgroundSource = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
+  const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
+  const listeners = { installed: [], message: [], tabsUpdated: [], tabsRemoved: [] };
+  const storage = { ...storageData };
+  const extensionId = "ci-test-extension-id";
+  const chromeStub = {
+    runtime: {
+      id: extensionId,
+      onInstalled: { addListener: (fn) => listeners.installed.push(fn) },
+      onMessage: { addListener: (fn) => listeners.message.push(fn) }
+    },
+    tabs: {
+      onRemoved: { addListener: (fn) => listeners.tabsRemoved.push(fn) },
+      onUpdated: { addListener: (fn) => listeners.tabsUpdated.push(fn) }
+    },
+    action: {
+      setBadgeText: async () => {},
+      setBadgeBackgroundColor: async () => {}
+    },
+    storage: {
+      local: {
+        get: async (defaults) => ({ ...defaults, ...storage }),
+        set: async (updates) => { Object.assign(storage, updates); }
+      },
+      session: { get: async () => ({}), set: async () => {}, remove: async () => {} }
+    }
+  };
+  const sandbox = {
+    chrome: chromeStub,
+    console,
+    setTimeout: setTimeoutImpl,
+    clearTimeout,
+    AbortController,
+    fetch: fetchImpl
+  };
+  const context = vm.createContext(sandbox);
+  sandbox.importScripts = (file) => {
+    vm.runInContext(
+      file === "shared.js" ? sharedSource : fs.readFileSync(path.join(ROOT, file), "utf8"),
+      context,
+      { filename: file }
+    );
+  };
+  vm.runInContext(backgroundSource, context, { filename: "background.js" });
+
+  if (listeners.message.length !== 1) {
+    throw new Error(`background.js must register exactly one runtime.onMessage listener, got ${listeners.message.length}`);
+  }
+  if (listeners.tabsUpdated.length !== 1 || listeners.tabsRemoved.length !== 1) {
+    throw new Error("background.js must register one tabs.onUpdated and one tabs.onRemoved listener");
+  }
+
+  return {
+    listeners,
+    extensionId,
+    sendMessage: (message, tabId) => new Promise((resolve) => {
+      let settled = false;
+      const respond = (response) => {
+        if (!settled) {
+          settled = true;
+          resolve(response);
+        }
+      };
+      try {
+        const keepOpen = listeners.message[0](
+          message,
+          { id: extensionId, tab: { id: tabId } },
+          respond
+        );
+        if (keepOpen !== true && !settled) {
+          respond({ ok: false, error: "handler did not keep the message channel open" });
+        }
+      } catch (error) {
+        respond({ ok: false, error: `handler threw: ${error.message}` });
+      }
+    })
+  };
+}
+
+// Deferred fetch stub: the test decides when each request settles; a caller
+// abort rejects like a real fetch. Tracks concurrency for cap assertions.
+const makeDeferredFetch = () => {
+  const state = { calls: 0, inFlight: 0, maxInFlight: 0 };
+  const pending = [];
+  const fetchImpl = (url, options = {}) => {
+    state.calls += 1;
+    state.inFlight += 1;
+    state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
+    const entry = {};
+    entry.promise = new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (fn, value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        state.inFlight -= 1;
+        fn(value);
+      };
+      entry.resolve = (value) => settle(resolve, value);
+      entry.reject = (value) => settle(reject, value);
+    });
+    options.signal?.addEventListener("abort", () => {
+      const abortError = new Error("The operation was aborted");
+      abortError.name = "AbortError";
+      entry.reject(abortError);
+    });
+    pending.push(entry);
+    return entry.promise;
+  };
+  return { state, pending, fetchImpl };
+};
+
+async function checkTabConcurrencyAndNavigationCancel() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for tab-concurrency tests: ${error.message}`);
+    return;
+  }
+  const MAX = utils.MAX_INFLIGHT_TRANSLATE_BATCHES;
+
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  const vmOkBody = JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({ translations: ["你好"] }) } }]
+  });
+  const vmJsonResponse = (status, body, headers = {}) => ({
+    ok: status === 200,
+    status,
+    statusText: "",
+    headers: { get: (name) => headers[String(name).toLowerCase()] ?? null },
+    url: "https://api.deepseek.com/chat/completions",
+    text: async () => body
+  });
+  const vmStorage = {
+    provider: "deepseek",
+    deepseekApiKey: "sk-vm",
+    model: "deepseek-flash",
+    targetLanguage: "zh-CN",
+    displayMode: "bilingual"
+  };
+  const batchMessage = (texts) => ({
+    type: "TRANSLATE_BATCH",
+    texts,
+    runId: 1,
+    provider: "deepseek",
+    targetLanguage: "zh-CN",
+    model: "deepseek-flash"
+  });
+  const tick = async (rounds = 10) => {
+    for (let i = 0; i < rounds; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+  const withTimeout = (promise, label, ms = 2000) => Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => {
+      fail(`tab-concurrency (${label}): no settlement within ${ms}ms`);
+      resolve(undefined);
+    }, ms))
+  ]);
+
+  // (1) One tab, six batches (as if from two content-script instances):
+  // at most MAX run concurrently; the rest queue and drain as slots free.
+  let vmBg;
+  try {
+    const deferred = makeDeferredFetch();
+    vmBg = buildBackgroundVm({ storageData: vmStorage, fetchImpl: deferred.fetchImpl });
+    const responses = [];
+    for (let i = 0; i < 6; i += 1) {
+      responses.push(vmBg.sendMessage(batchMessage([`Hello ${i}`]), 11));
+    }
+    await tick();
+    assertEqual(deferred.state.calls, MAX, "tab cap: only MAX batches start per tab");
+    assertEqual(deferred.state.maxInFlight, MAX, "tab cap: concurrent fetches never exceed MAX per tab");
+    const firstWave = deferred.pending.splice(0);
+    assertEqual(firstWave.length, MAX, "tab cap: exactly MAX requests are in flight");
+    for (const entry of firstWave) {
+      entry.resolve(vmJsonResponse(200, vmOkBody));
+    }
+    await tick();
+    assertEqual(deferred.state.calls, 6, "tab cap: queued batches start once slots free");
+    assertEqual(deferred.state.maxInFlight, MAX, "tab cap: draining the queue never exceeds MAX concurrent fetches");
+    for (const entry of deferred.pending.splice(0)) {
+      entry.resolve(vmJsonResponse(200, vmOkBody));
+    }
+    const settled = await withTimeout(Promise.all(responses), "six batches settle");
+    if (!Array.isArray(settled) || settled.length !== 6 || settled.some((r) => r?.ok !== true)) {
+      fail(`tab cap: all six batches must resolve ok, got ${JSON.stringify(settled?.map((r) => r?.ok))}`);
+    }
+  } catch (error) {
+    fail(`tab cap: vm harness failed: ${error.message}`);
+  }
+
+  // (2) Whole-page navigation (onUpdated status loading) during the 503
+  // backoff cancels the tab's run: no further fetch may leave the worker.
+  try {
+    // Scale every sandbox timer to ≥50ms real: the ~1s backoff sleep then
+    // spans several tick() rounds, so the cancel below reliably lands while
+    // the run is between attempts.
+    const scaledSetTimeout = (fn, ms) => setTimeout(fn, Math.max(Math.min(ms ?? 0, 30000), 50));
+    let calls503 = 0;
+    const fetch503 = async () => {
+      calls503 += 1;
+      return vmJsonResponse(503, '{"error":{"message":"down"}}');
+    };
+    const vmNav = buildBackgroundVm({
+      storageData: vmStorage,
+      fetchImpl: fetch503,
+      setTimeoutImpl: scaledSetTimeout
+    });
+    const responsePromise = vmNav.sendMessage(batchMessage(["Hello nav"]), 12);
+    await tick();
+    assertEqual(calls503, 1, "nav cancel: first 503 attempt fired");
+    // The backoff sleep (~1s, scaled to 50ms) is in flight right now.
+    vmNav.listeners.tabsUpdated[0](12, { status: "loading" }, { id: 12 });
+    const response = await withTimeout(responsePromise, "nav cancel response");
+    if (response?.ok !== false || response?.code !== "RUN_CANCELLED") {
+      fail(`nav cancel: loading must cancel the tab's in-flight run with RUN_CANCELLED, got ${JSON.stringify(response)}`);
+    }
+    // Long enough for a (buggy) post-cancel retry to have fired after the
+    // scaled backoff elapsed.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assertEqual(calls503, 1, "nav cancel: no fetch after the tab navigated (retry/backoff cancelled)");
+  } catch (error) {
+    fail(`nav cancel: vm harness failed: ${error.message}`);
+  }
+
+  // (3) onRemoved aborts the in-flight fetch itself.
+  try {
+    const deferred = makeDeferredFetch();
+    const vmRemoved = buildBackgroundVm({ storageData: vmStorage, fetchImpl: deferred.fetchImpl });
+    const responsePromise = vmRemoved.sendMessage(batchMessage(["Hello gone"]), 13);
+    await tick();
+    assertEqual(deferred.state.calls, 1, "tab removed: batch was in flight");
+    vmRemoved.listeners.tabsRemoved[0](13);
+    const response = await withTimeout(responsePromise, "tab removed response");
+    if (response?.ok !== false || response?.code !== "RUN_CANCELLED") {
+      fail(`tab removed: closing the tab must cancel with RUN_CANCELLED, got ${JSON.stringify(response)}`);
+    }
+    assertEqual(deferred.state.calls, 1, "tab removed: aborted fetch is never retried");
+    assertEqual(deferred.state.inFlight, 0, "tab removed: aborted fetch settled");
+  } catch (error) {
+    fail(`tab removed: vm harness failed: ${error.message}`);
+  }
+
+  // (4) Hash-only URL changes are same-document: batches keep running.
+  try {
+    const deferred = makeDeferredFetch();
+    const vmHash = buildBackgroundVm({ storageData: vmStorage, fetchImpl: deferred.fetchImpl });
+    // Prime the tab's recorded url before any batch exists.
+    vmHash.listeners.tabsUpdated[0](14, { url: "https://x.com/home" }, { id: 14 });
+    await tick();
+    const responsePromise = vmHash.sendMessage(batchMessage(["Hello hash"]), 14);
+    await tick();
+    assertEqual(deferred.state.calls, 1, "hash nav: batch was in flight");
+    vmHash.listeners.tabsUpdated[0](14, { url: "https://x.com/home#feed" }, { id: 14 });
+    await tick();
+    assertEqual(deferred.state.calls, 1, "hash nav: same-document anchor jump keeps the batch running");
+    deferred.pending[0].resolve(vmJsonResponse(200, vmOkBody));
+    const response = await withTimeout(responsePromise, "hash nav response");
+    if (response?.ok !== true) {
+      fail(`hash nav: hash-only change must not cancel the batch, got ${JSON.stringify(response)}`);
+    }
+  } catch (error) {
+    fail(`hash nav: vm harness failed: ${error.message}`);
+  }
+
+  // (5) Real-file hung provider: the shipping worker wiring terminates the
+  // run within the total deadline (scaled timers), surfacing the timeout
+  // error after the bounded retry cycle.
+  try {
+    const scaledSetTimeout = (fn, ms) => setTimeout(fn, Math.min(ms ?? 0, 5));
+    let hangCalls = 0;
+    const hangFetch = (url, options = {}) => new Promise((resolve, reject) => {
+      hangCalls += 1;
+      options.signal?.addEventListener("abort", () => {
+        const abortError = new Error("The operation was aborted");
+        abortError.name = "AbortError";
+        reject(abortError);
+      });
+    });
+    const vmHung = buildBackgroundVm({
+      storageData: vmStorage,
+      fetchImpl: hangFetch,
+      setTimeoutImpl: scaledSetTimeout
+    });
+    const startedAt = Date.now();
+    const response = await withTimeout(vmHung.sendMessage(batchMessage(["Hello hung"]), 15), "hung provider response");
+    const elapsed = Date.now() - startedAt;
+    if (response?.ok !== false || response?.code !== "FETCH_TIMEOUT") {
+      fail(`hung provider: must surface FETCH_TIMEOUT through the real worker wiring, got ${JSON.stringify(response)}`);
+    }
+    const maxAttempts = 1 + utils.MAX_PROVIDER_RETRIES;
+    if (hangCalls > maxAttempts) {
+      fail(`hung provider: at most ${maxAttempts} attempts may fire, got ${hangCalls}`);
+    }
+    if (elapsed > 1000) {
+      fail(`hung provider: run must terminate within the deadline budget, took ${elapsed}ms`);
+    }
+  } catch (error) {
+    fail(`hung provider: vm harness failed: ${error.message}`);
+  }
+
+  // Statics: the gate and listeners exist in the shipping file.
+  const background = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"));
+  for (const needle of [
+    "withTabTranslateSlot",
+    "cancelTabTranslateBatches",
+    "releaseTabTranslateSlot",
+    "isWholeTabNavigationChange",
+    "stripUrlHash"
+  ]) {
+    if (!background.includes(needle)) {
+      fail(`background.js: per-tab slot manager must keep ${needle}`);
+    }
+  }
+  if (!/withTabTranslateSlot\(tabId,/.test(background)) {
+    fail("background.js: TRANSLATE_BATCH must run under withTabTranslateSlot");
+  }
+}
+
+// ---- P2-1: content.js translation reuse cache ----
+function checkTranslationReuseCache() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertNull = (actual, label) => {
+    if (actual !== null) {
+      fail(`${label}: expected null, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  const keySrc = extractContentFunction("translationCacheKey");
+  const getSrc = extractContentFunction("getCachedTranslation");
+  const setSrc = extractContentFunction("setCachedTranslation");
+  if (!keySrc || !getSrc || !setSrc) {
+    fail("content.js: cannot extract translationCacheKey/getCachedTranslation/setCachedTranslation for reuse-cache test");
+    return;
+  }
+
+  const cache = new Map();
+  const state = { displayMode: "bilingual" };
+  let api;
+  try {
+    api = new Function(
+      "state",
+      "translationCache",
+      "TRANSLATION_CACHE_LIMIT",
+      `${keySrc}\n${getSrc}\n${setSrc}\nreturn { translationCacheKey, getCachedTranslation, setCachedTranslation };`
+    )(state, cache, 500);
+  } catch (error) {
+    fail(`content.js: translation cache helpers are not runnable standalone: ${error.message}`);
+    return;
+  }
+
+  const settings = { provider: "deepseek", targetLanguage: "zh-CN", model: "deepseek-flash" };
+
+  assertNull(api.getCachedTranslation("Hello world", settings), "reuse cache: unknown text misses");
+  api.setCachedTranslation("Hello world", "你好，世界", settings);
+  assertEqual(api.getCachedTranslation("Hello world", settings), "你好，世界", "reuse cache: stored text hits");
+
+  // Run-setting changes must miss: a different provider/target/model would
+  // produce a different translation for the same source.
+  assertNull(api.getCachedTranslation("Hello world", { ...settings, model: "deepseek-v4-pro" }), "reuse cache: model change misses");
+  assertNull(api.getCachedTranslation("Hello world", { ...settings, provider: "kimi", model: "kimi-k2.6" }), "reuse cache: provider change misses");
+  assertNull(api.getCachedTranslation("Hello world", { ...settings, targetLanguage: "en" }), "reuse cache: target change misses");
+  state.displayMode = "translation-only";
+  assertNull(api.getCachedTranslation("Hello world", settings), "reuse cache: displayMode change misses");
+  state.displayMode = "bilingual";
+  assertEqual(api.getCachedTranslation("Hello world", settings), "你好，世界", "reuse cache: restored displayMode hits again");
+
+  // Empty / whitespace-only translations are never stored.
+  api.setCachedTranslation("Blank text", "   ", settings);
+  assertNull(api.getCachedTranslation("Blank text", settings), "reuse cache: whitespace-only translation is not stored");
+
+  // Bounded LRU: 500 entries max; a read refreshes recency so the oldest
+  // non-refreshed entry is the one evicted.
+  for (let i = 0; i < 500; i += 1) {
+    api.setCachedTranslation(`text-${i}`, `t${i}`, settings);
+  }
+  assertEqual(cache.size, 500, "reuse cache: bounded at the 500-entry limit");
+  assertEqual(api.getCachedTranslation("text-0", settings), "t0", "reuse cache: read returns the translation");
+  api.setCachedTranslation("text-500", "t500", settings);
+  assertEqual(cache.size, 500, "reuse cache: insertion past the limit evicts exactly one entry");
+  assertNull(api.getCachedTranslation("text-1", settings), "reuse cache: least-recently-used entry (text-1) evicted");
+  assertEqual(api.getCachedTranslation("text-0", settings), "t0", "reuse cache: refreshed entry (text-0) survives");
+  assertEqual(api.getCachedTranslation("text-500", settings), "t500", "reuse cache: newest entry present");
+
+  // Static wiring: cache-first before any request, store after apply,
+  // clear on session end.
+  const fallbackSrc = stripCommentsForScan(extractContentFunction("translateBatchWithFallback") || "");
+  const cacheReadAt = fallbackSrc.indexOf("getCachedTranslation(");
+  const requestAt = fallbackSrc.indexOf("requestSegmentTranslations(");
+  if (cacheReadAt < 0 || requestAt < 0 || cacheReadAt > requestAt) {
+    fail("content.js: translateBatchWithFallback must consult the reuse cache before sending TRANSLATE_BATCH");
+  }
+  const applySrc = stripCommentsForScan(extractContentFunction("applyTranslatedSegment") || "");
+  if (!/setCachedTranslation\(/.test(applySrc)) {
+    fail("content.js: applyTranslatedSegment must store validated translations in the reuse cache");
+  }
+  const restoreSrc = stripCommentsForScan(extractContentFunction("restoreOriginal") || "");
+  if (!/translationCache\.clear\(\)/.test(restoreSrc)) {
+    fail("content.js: restoreOriginal must clear the reuse cache (session end)");
+  }
+  const content = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "content.js"), "utf8"));
+  if (!/TRANSLATION_CACHE_LIMIT\s*=\s*500/.test(content)) {
+    fail("content.js: TRANSLATION_CACHE_LIMIT must stay a bounded 500");
+  }
+}
+
+// ---- P2-2: packaging ----
+async function checkPackaging() {
+  let mod;
+  try {
+    mod = await import(pathToFileURL(path.join(ROOT, "scripts", "pack.mjs")).href);
+  } catch (error) {
+    fail(`scripts/pack.mjs: cannot be imported: ${error.message}`);
+    return;
+  }
+  const {
+    collectExtensionFiles,
+    assertNoExcludedFiles,
+    pack,
+    listZipEntries,
+    readZipEntry,
+    EXCLUDED_PREFIXES,
+    EXCLUDED_NAMES
+  } = mod;
+
+  const manifest = readJson("manifest.json");
+  if (!manifest) {
+    return;
+  }
+
+  let collected;
+  try {
+    collected = collectExtensionFiles(ROOT);
+  } catch (error) {
+    fail(`pack file list: ${error.message}`);
+    return;
+  }
+  const { files, version } = collected;
+  if (version !== manifest.version) {
+    fail(`pack: zip version ${JSON.stringify(version)} must match manifest.version ${JSON.stringify(manifest.version)}`);
+  }
+
+  // The ship list must cover every runtime entry point.
+  const required = [
+    "manifest.json",
+    "background.js",
+    "shared.js",
+    "content.js",
+    "popup.html",
+    "popup.js",
+    "popup.css",
+    "icons/icon-16.png",
+    "icons/icon-32.png",
+    "icons/icon-48.png",
+    "icons/icon-128.png"
+  ];
+  for (const rel of required) {
+    if (!files.includes(rel)) {
+      fail(`pack: required file missing from the ship list: ${rel}`);
+    }
+  }
+
+  // Every shipped file exists and nothing excluded ships.
+  for (const rel of files) {
+    if (!fs.existsSync(path.join(ROOT, rel))) {
+      fail(`pack: shipped file missing on disk: ${rel}`);
+    }
+    if (EXCLUDED_PREFIXES.some((prefix) => rel.startsWith(prefix))) {
+      fail(`pack: excluded directory must not ship: ${rel}`);
+    }
+    if (EXCLUDED_NAMES.includes(rel) || path.basename(rel).startsWith(".env")) {
+      fail(`pack: excluded file must not ship: ${rel}`);
+    }
+  }
+  try {
+    assertNoExcludedFiles(files);
+  } catch (error) {
+    fail(`pack: exclusion assertion failed: ${error.message}`);
+  }
+  for (const never of ["scripts/ci-check.mjs", "scripts/pack.mjs", "README.md", "AGENTS.md", "docs/MERGE_GATES.md", "promo/store-listing-zh.md", ".gitignore"]) {
+    if (files.includes(never)) {
+      fail(`pack: non-extension file must never ship: ${never}`);
+    }
+  }
+
+  // Manifest-referenced files all exist — re-derive the direct references and
+  // check each one (collectExtensionFiles already throws, this is the
+  // ci-side assertion with a clear message).
+  const directRefs = [
+    manifest.background?.service_worker,
+    manifest.action?.default_popup,
+    ...Object.values(manifest.icons || {}),
+    ...Object.values(manifest.action?.default_icon || {})
+  ].filter(Boolean);
+  for (const rel of directRefs) {
+    if (!files.includes(rel)) {
+      fail(`pack: manifest-referenced file missing from the ship list: ${rel}`);
+    }
+  }
+
+  // Build the real zip and verify the container + payloads.
+  let packed;
+  try {
+    packed = pack(ROOT);
+  } catch (error) {
+    fail(`pack: build failed: ${error.message}`);
+    return;
+  }
+  if (!fs.existsSync(packed.outPath) || fs.statSync(packed.outPath).size === 0) {
+    fail(`pack: output zip missing or empty: ${packed.outPath}`);
+    return;
+  }
+  let entries;
+  try {
+    entries = listZipEntries(packed.outPath);
+  } catch (error) {
+    fail(`pack: zip container verification failed: ${error.message}`);
+    return;
+  }
+  const entryNames = entries.map((entry) => entry.name);
+  if (JSON.stringify([...entryNames].sort()) !== JSON.stringify([...files].sort())) {
+    fail(`pack: zip entries must equal the ship list, got ${JSON.stringify(entryNames)}`);
+    return;
+  }
+
+  // Payload integrity: CRC + inflate round-trip on a text and a binary entry.
+  try {
+    const manifestEntry = entries.find((entry) => entry.name === "manifest.json");
+    const manifestData = JSON.parse(readZipEntry(packed.outPath, manifestEntry).toString("utf8"));
+    if (manifestData.version !== manifest.version) {
+      fail("pack: zipped manifest.json must parse and carry the extension version");
+    }
+    const iconEntry = entries.find((entry) => entry.name === "icons/icon-128.png");
+    const iconData = readZipEntry(packed.outPath, iconEntry);
+    const diskData = fs.readFileSync(path.join(ROOT, "icons/icon-128.png"));
+    if (Buffer.compare(iconData, diskData) !== 0) {
+      fail("pack: zipped icon must byte-match the source file after inflate");
+    }
+  } catch (error) {
+    fail(`pack: zip payload verification failed: ${error.message}`);
+  }
+
+  // dist/ must be gitignored so builds never dirty the tree.
+  const gitignore = fs.readFileSync(path.join(ROOT, ".gitignore"), "utf8");
+  if (!/^dist\/$/m.test(gitignore)) {
+    fail(".gitignore: must ignore dist/ (build output)");
+  }
+}
+
 function checkVersionBump() {
   const manifest = readJson("manifest.json");
   if (manifest && manifest.version !== "1.4.2") {
@@ -2244,6 +3015,10 @@ async function main() {
   await checkModelMigrationAndRetryPolicy();
   await checkInflightCapAndRunCancellation();
   await checkSpaRefreshAndSelectionLifecycle();
+  await checkTotalDeadlineBudget();
+  await checkTabConcurrencyAndNavigationCancel();
+  checkTranslationReuseCache();
+  await checkPackaging();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -2253,7 +3028,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, inflight cap + run cancellation, SPA refresh + selection lifecycle");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, inflight cap + run cancellation, SPA refresh + selection lifecycle, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging");
   process.exit(0);
 }
 

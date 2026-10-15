@@ -76,6 +76,14 @@
    * @type {WeakMap<Element, { text: string, provider: string, targetLanguage: string, model: string }>}
    */
   const skippedEchoBlocks = new WeakMap();
+  // Bounded LRU of source→translation under the current run settings:
+  // virtualized lists remount tweets with identical text, and re-requesting
+  // the same source would only re-bill the provider. Keyed by text + provider
+  // + target + model + displayMode so any run-setting change misses; cleared
+  // when the session ends (restoreOriginal).
+  const TRANSLATION_CACHE_LIMIT = 500;
+  /** @type {Map<string, string>} */
+  const translationCache = new Map();
   // In-flight TRANSLATE_BATCH slot accounting, shared across ALL run
   // generations: a generation bump abandons the old run's queue, but its
   // provider requests (and worker-side retries) stay on the wire and stay
@@ -422,6 +430,9 @@
     activeRunSettings = null;
     deferredRunSettings = null;
     failedBlocks.clear();
+    // Session end: cached translations belong to the translated session, not
+    // to the restored page.
+    translationCache.clear();
 
     for (const record of blockRecords.values()) {
       teardownBlockRecord(record);
@@ -630,6 +641,42 @@
     return skipped.provider === runSettings.provider &&
       skipped.targetLanguage === runSettings.targetLanguage &&
       skipped.model === runSettings.model;
+  }
+
+  function translationCacheKey(text, runSettings) {
+    return [
+      runSettings.provider,
+      runSettings.targetLanguage,
+      runSettings.model,
+      state.displayMode,
+      text
+    ].join("\u0000");
+  }
+
+  function getCachedTranslation(text, runSettings) {
+    const key = translationCacheKey(text, runSettings);
+    if (!translationCache.has(key)) {
+      return null;
+    }
+    const translation = translationCache.get(key);
+    // Refresh recency: Map iterates in insertion order, so delete+set moves
+    // the entry to the back (most recently used).
+    translationCache.delete(key);
+    translationCache.set(key, translation);
+    return translation;
+  }
+
+  function setCachedTranslation(text, translation, runSettings) {
+    if (typeof translation !== "string" || !translation.trim()) {
+      return;
+    }
+    const key = translationCacheKey(text, runSettings);
+    translationCache.delete(key);
+    translationCache.set(key, translation);
+    if (translationCache.size > TRANSLATION_CACHE_LIMIT) {
+      const oldestKey = translationCache.keys().next().value;
+      translationCache.delete(oldestKey);
+    }
   }
 
   function collectBlocks(root) {
@@ -1411,6 +1458,9 @@
       companionOnly: Boolean(segment.companionOnly),
       nested: segment.nested || []
     });
+    // Store only real (validated, non-echo) translations — the cache must
+    // never resurrect an echo as an insertable "translation".
+    setCachedTranslation(segment.text, rendered, getRunSettings());
     if (failedBlocks.delete(segment.block)) {
       // Dynamic retry landed for a previously failed block — reclaim its
       // failure slot instead of counting the block as both failed and translated.
@@ -1423,6 +1473,23 @@
   }
 
   async function translateBatchWithFallback(batch, runId, runSettings = getRunSettings()) {
+    // Cache-first: virtualized-list remounts re-request identical text under
+    // identical run settings; a hit re-inserts the stored translation without
+    // a billable request. Misses (and blocks whose source changed since) fall
+    // through to the normal request path.
+    const uncached = [];
+    for (const segment of batch) {
+      const cached = runId === generation ? getCachedTranslation(segment.text, runSettings) : null;
+      if (cached != null && applyTranslatedSegment(segment, cached)) {
+        continue;
+      }
+      uncached.push(segment);
+    }
+    if (uncached.length === 0) {
+      return;
+    }
+    batch = uncached;
+
     // Oversized single block: split before the first request (413 may never recover otherwise).
     if (batch.length === 1 && batch[0].text.length > 5000 && runId === generation) {
       const segment = batch[0];
