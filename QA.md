@@ -39,7 +39,13 @@ PR: #___
 > feature flag, data repair).
 
 ```bash
-<ROLLBACK_COMMAND>
+# 插件发布在 Chrome 网上应用店，商店不支持一键回退，也不允许重传更低版本号。
+# 回滚做法：从上一个已知可用的提交（或 tag）重新打包，把版本号升到比线上更高的补丁号，再重新上传。
+GOOD=<上一个已知可用的 commit 或 tag，例如 0253a57>
+git worktree add /tmp/kt-rollback "$GOOD" && cd /tmp/kt-rollback
+# 把 manifest.json 的 version 改成线上版本 +1 个补丁号（如线上 1.4.2 -> 1.4.3）
+node scripts/pack.mjs   # 没有 pack.mjs 的旧提交：只把 manifest 引用到的文件打成 zip
+# 在 https://chrome.google.com/webstore/devconsole 上传 dist/*.zip 并提交审核；审核通过前，可先在商店里暂停分阶段发布或取消待审核版本
 ```
 
 ## 签署 / Sign-off
