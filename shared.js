@@ -141,13 +141,20 @@
     "quien", "fue", "ser", "mis", "sus", "nuestro"
   ]);
 
+  // English stopwords that double as ordinary function words in
+  // French/Spanish/German: "Me gusta bailar" / "On arrive demain matin"
+  // (fr/es "me"/"on"/"a"), "Was nun" (de "was"). They can never prove
+  // English on their own — only unambiguous hits (the/and/of…) count as
+  // evidence for the skip shortcut.
+  const AMBIGUOUS_ENGLISH_STOPWORDS = new Set(["a", "me", "on", "was", "in"]);
+
   // Lightweight English detector for Latin-script text: tokenize words, then
-  // score English function words against French/German/Spanish markers and
-  // accented letters. Deliberately conservative — any doubt must resolve to
-  // false so the caller keeps translating: short texts (≤3 words) need at
-  // least one English function word and zero foreign markers, longer texts
-  // need a 0.15 stopword ratio with foreign markers never outvoting English.
-  // Never treat "all Latin script" as English on its own.
+  // score unambiguous English function words against French/German/Spanish
+  // markers and accented letters. Deliberately conservative — any doubt must
+  // resolve to false so the caller keeps translating: any foreign function
+  // word vetoes the shortcut outright, short texts (≤3 words) need at least
+  // one unambiguous English function word, longer texts need a 0.15 strong
+  // stopword ratio. Never treat "all Latin script" as English on its own.
   function looksLikeEnglish(text) {
     if (typeof text !== "string") {
       return false;
@@ -161,7 +168,7 @@
     let foreignHits = 0;
     let nonAsciiWords = 0;
     for (const word of words) {
-      if (ENGLISH_STOPWORDS.has(word)) {
+      if (ENGLISH_STOPWORDS.has(word) && !AMBIGUOUS_ENGLISH_STOPWORDS.has(word)) {
         englishHits += 1;
       }
       if (NON_ENGLISH_STOPWORDS.has(word)) {
@@ -177,11 +184,14 @@
     if (nonAsciiWords > 0) {
       return false;
     }
-    if (foreignHits > 0 && foreignHits >= englishHits) {
+    // Foreign function words veto the shortcut even when outnumbered: a
+    // single le/die/el marker means the text is not English, and wrongly
+    // skipping would silently drop its translation.
+    if (foreignHits > 0) {
       return false;
     }
     if (words.length <= 3) {
-      return englishHits >= 1 && foreignHits === 0;
+      return englishHits >= 1;
     }
     return englishHits > 0 && englishHits / words.length >= 0.15;
   }

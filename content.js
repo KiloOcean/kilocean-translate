@@ -69,6 +69,20 @@
   let deferredRunSettings = null;
   /** Last seen URL for same-document SPA navigation detection. */
   let lastSeenUrl = location.href;
+  /**
+   * Blocks whose source the provider already echoed back unchanged under the
+   * current run settings — re-requesting them would only re-bill. Keyed by
+   * block element, invalidated by comparing text + run settings on read.
+   * @type {WeakMap<Element, { text: string, provider: string, targetLanguage: string, model: string }>}
+   */
+  const skippedEchoBlocks = new WeakMap();
+  // In-flight TRANSLATE_BATCH slot accounting, shared across ALL run
+  // generations: a generation bump abandons the old run's queue, but its
+  // provider requests (and worker-side retries) stay on the wire and stay
+  // billed, so the cap must survive SPA navigation / restore / restart and
+  // is never reset to zero by them.
+  let inflightTranslateBatches = 0;
+  const inflightTranslateWaiters = [];
 
   const state = {
     active: false,
@@ -276,12 +290,14 @@
       restoreOriginal({ silent: true });
     }
 
+    const abandonedRunId = generation;
     generation += 1;
     const runId = generation;
     // Detach from the cancelled run's queue tail: its in-flight network results
     // are already invalidated by the bump, so this run must not wait on them.
     // The stale chain keeps its own catch, so its late settle cannot reject here.
     workQueue = Promise.resolve();
+    cancelAbandonedRunBatches(abandonedRunId);
     deferredRunSettings = null;
     activeRunSettings = { provider, targetLanguage, model };
     Object.assign(state, {
@@ -396,10 +412,12 @@
   }
 
   function restoreOriginal(options = {}) {
+    const abandonedRunId = generation;
     generation += 1;
     // Drop the cancelled run's queue tail — a fresh startTranslation chained on
     // the old workQueue would otherwise wait on stale in-flight requests.
     workQueue = Promise.resolve();
+    cancelAbandonedRunBatches(abandonedRunId);
     stopObserving();
     activeRunSettings = null;
     deferredRunSettings = null;
@@ -436,8 +454,17 @@
     setInterval(checkSpaNavigation, 500);
   }
 
+  // URL identity for SPA navigation ignores the fragment: an in-page anchor
+  // jump (#feed → #about) keeps the same document view and must not abort the
+  // running translation session as if it were a navigation.
+  function spaNavigationUrl(href) {
+    const value = String(href || "");
+    const hashAt = value.indexOf("#");
+    return hashAt === -1 ? value : value.slice(0, hashAt);
+  }
+
   function checkSpaNavigation() {
-    if (location.href === lastSeenUrl) {
+    if (spaNavigationUrl(location.href) === spaNavigationUrl(lastSeenUrl)) {
       return;
     }
     lastSeenUrl = location.href;
@@ -456,10 +483,20 @@
     // queue tail means the next run cannot wait on the cancelled chain. The
     // session itself survives: still-connected blocks keep their translations
     // and the new view gets translated below, until the user clears/restores.
+    const abandonedRunId = generation;
     generation += 1;
+    cancelAbandonedRunBatches(abandonedRunId);
     workQueue = Promise.resolve();
     pendingRoots.clear();
-    pendingRefreshBlocks.clear();
+    // Keep refresh entries whose blocks survived the view swap (still
+    // connected): the scheduled flush re-validates each one against its
+    // recorded source text. Only blocks that left the DOM with the old view
+    // are dropped here.
+    for (const block of pendingRefreshBlocks) {
+      if (!block?.isConnected) {
+        pendingRefreshBlocks.delete(block);
+      }
+    }
     failedBlocks.clear();
     if (dynamicTimer) {
       clearTimeout(dynamicTimer);
@@ -564,14 +601,35 @@
   // Full gate for a candidate block text: translatable shape, not page chrome
   // (@handle / URL / counter / bare date), and not already in the target
   // language (re-translating those duplicates them: "Home Home", "宝玉宝玉").
-  function shouldTranslateBlockText(text, targetLanguage) {
+  function shouldTranslateBlockText(text, targetLanguage, block) {
     if (!Utils.isTranslatableText(text, targetLanguage)) {
       return false;
     }
     if (Utils.isSkippableText(text)) {
       return false;
     }
-    return !Utils.isAlreadyTargetLanguage(text, targetLanguage);
+    if (Utils.isAlreadyTargetLanguage(text, targetLanguage)) {
+      return false;
+    }
+    return !isSkippedEchoBlock(block, text);
+  }
+
+  // True when the provider already echoed this exact source back unchanged
+  // under the same run settings: re-requesting it would only re-bill for
+  // another echo. The cached skip self-invalidates by comparison — a changed
+  // source text or a changed provider/target/model run simply stops matching.
+  function isSkippedEchoBlock(block, text) {
+    if (!block) {
+      return false;
+    }
+    const skipped = skippedEchoBlocks.get(block);
+    if (!skipped || skipped.text !== text) {
+      return false;
+    }
+    const runSettings = getRunSettings();
+    return skipped.provider === runSettings.provider &&
+      skipped.targetLanguage === runSettings.targetLanguage &&
+      skipped.model === runSettings.model;
   }
 
   function collectBlocks(root) {
@@ -589,7 +647,7 @@
       // blocks are not re-walked per text node (quadratic discovery).
       seen.add(block);
       const fullText = extractBlockText(block);
-      if (!shouldTranslateBlockText(fullText, targetLanguage)) {
+      if (!shouldTranslateBlockText(fullText, targetLanguage, block)) {
         continue;
       }
       blocks.push(block);
@@ -612,7 +670,7 @@
         continue;
       }
       const ownText = extractBlockText(block, nested);
-      if (shouldTranslateBlockText(ownText, targetLanguage)) {
+      if (shouldTranslateBlockText(ownText, targetLanguage, block)) {
         withOwnText.push(block);
       }
     }
@@ -704,6 +762,15 @@
 
   function hasHiddenAncestor(el) {
     for (let cur = el; cur; cur = cur.parentElement) {
+      // Our own original wraps sit at display:none in translation-only mode —
+      // that is a display preference, not invisible content. Skipping them
+      // here would blind extractBlockText during refresh comparison (empty
+      // text ≠ recorded original → false "source changed" → re-bill), so the
+      // walk steps over them. Page-owned hidden ancestors still count, and
+      // discovery stays safe because recorded blocks are excluded earlier.
+      if (isOwnedOriginalWrap(cur)) {
+        continue;
+      }
       if (isHiddenElement(cur)) {
         return true;
       }
@@ -953,7 +1020,7 @@
     for (const block of candidates) {
       const nested = descendantsOf.get(block) || [];
       const text = extractBlockText(block, nested);
-      if (!shouldTranslateBlockText(text, runSettings.targetLanguage)) {
+      if (!shouldTranslateBlockText(text, runSettings.targetLanguage, block)) {
         continue;
       }
       segments.push({
@@ -1083,26 +1150,80 @@
     return adjustSplitAwayFromSurrogatePair(mid);
   }
 
-  async function requestSegmentTranslations(texts, runId, runSettings) {
-    const response = await chrome.runtime.sendMessage({
-      type: "TRANSLATE_BATCH",
-      texts,
-      provider: runSettings.provider || "deepseek",
-      targetLanguage: runSettings.targetLanguage,
-      model: runSettings.model
+  // Cap concurrent TRANSLATE_BATCH sends at MAX_INFLIGHT_TRANSLATE_BATCHES
+  // across ALL generations: abandoned generations keep their slots until
+  // their requests settle, so a fresh run after an SPA navigation queues
+  // behind the stale run's in-flight batches instead of stacking on top of
+  // them (which would breach the provider cap and earn 429s).
+  function acquireInflightTranslateSlot(runId) {
+    if (inflightTranslateBatches < Utils.MAX_INFLIGHT_TRANSLATE_BATCHES) {
+      inflightTranslateBatches += 1;
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      inflightTranslateWaiters.push(() => resolve(runId === generation));
     });
+  }
 
-    if (!response?.ok) {
-      const error = new Error(response?.error || "翻译请求失败");
-      error.canSplit = Boolean(response?.canSplit);
-      throw error;
+  function releaseInflightTranslateSlot() {
+    const next = inflightTranslateWaiters.shift();
+    if (next) {
+      // Hand the slot straight to the next waiter — the count stays put.
+      next();
+      return;
     }
+    inflightTranslateBatches = Math.max(0, inflightTranslateBatches - 1);
+  }
 
-    if (runId !== generation) {
-      return null;
+  // Tell the worker a run generation is abandoned (SPA navigation / restore /
+  // fresh start): its in-flight TRANSLATE_BATCHes and their worker-side
+  // backoff retries would only re-bill a generation whose results this side
+  // drops anyway. Best-effort — the worker may be waking up.
+  function cancelAbandonedRunBatches(runId) {
+    if (!Number.isInteger(runId)) {
+      return;
     }
+    try {
+      void chrome.runtime.sendMessage({
+        type: "CANCEL_TRANSLATE_BATCHES",
+        runId
+      }).catch(() => {});
+    } catch {
+      // Extension context may be gone during teardown.
+    }
+  }
 
-    return response.translations;
+  async function requestSegmentTranslations(texts, runId, runSettings) {
+    await acquireInflightTranslateSlot(runId);
+    try {
+      // Stale while queued behind full slots (navigation bumped the
+      // generation) — sending would only re-bill a dead run.
+      if (runId !== generation) {
+        return null;
+      }
+      const response = await chrome.runtime.sendMessage({
+        type: "TRANSLATE_BATCH",
+        texts,
+        runId,
+        provider: runSettings.provider || "deepseek",
+        targetLanguage: runSettings.targetLanguage,
+        model: runSettings.model
+      });
+
+      if (!response?.ok) {
+        const error = new Error(response?.error || "翻译请求失败");
+        error.canSplit = Boolean(response?.canSplit);
+        throw error;
+      }
+
+      if (runId !== generation) {
+        return null;
+      }
+
+      return response.translations;
+    } finally {
+      releaseInflightTranslateSlot();
+    }
   }
 
   function isWhitespaceDelimitedTarget(targetLanguage) {
@@ -1265,8 +1386,16 @@
     // Provider echoed the source back unchanged (text already reads as the
     // target language): inserting a block would only duplicate it on screen.
     // Count as skipped — reclaim any failure slot and drop the total slot —
-    // never as a failure.
+    // never as a failure. Cache the skip for this block + source text + run
+    // settings so a rescan does not re-request (and re-bill) the same echo.
     if (Utils.isSameTranslation(segment.text, rendered)) {
+      const runSettings = getRunSettings();
+      skippedEchoBlocks.set(segment.block, {
+        text: segment.text,
+        provider: runSettings.provider,
+        targetLanguage: runSettings.targetLanguage,
+        model: runSettings.model
+      });
       if (failedBlocks.delete(segment.block)) {
         if (state.failed > 0) {
           state.failed -= 1;
@@ -1541,7 +1670,8 @@
         wrap,
         wraps: createdWraps,
         companion,
-        layout
+        layout,
+        nested: options.nested || []
       };
       blockRecords.set(block, record);
       applyBlockDisplay(record);
@@ -1775,6 +1905,39 @@
       return null;
     }
     return host;
+  }
+
+  // Same source text but the SPA re-rendered the DOM around it: our own
+  // original wraps (and possibly the companion) left the tree with the old
+  // subtree. Rebuild the record's owned DOM from the cached translation —
+  // never via a fresh TRANSLATE_BATCH — so translation-only toggling and the
+  // visible translation survive equivalent-text re-renders without re-billing.
+  function repairBlockRecordDom(record) {
+    if (!record?.block?.isConnected) {
+      return;
+    }
+    const gen = beginApplyingDom();
+    try {
+      const wraps = record.wraps || [];
+      if (wraps.length === 0 || wraps.some((wrap) => !wrap?.isConnected)) {
+        const rebuilt = wrapTextNodesForToggle(record.block, record.nested || [], "span");
+        if (rebuilt.wraps.length > 0) {
+          record.wraps = rebuilt.wraps;
+          record.wrap = rebuilt.firstWrap;
+        }
+      }
+      if (record.companion && !record.companion.isConnected) {
+        if (record.layout === "after") {
+          // relocateAfterHostCompanion re-inserts the detached sibling after
+          // the host and manages its own applyingDom guard.
+          relocateAfterHostCompanion(record);
+        } else {
+          record.block.appendChild(record.companion);
+        }
+      }
+    } finally {
+      endApplyingDom(gen);
+    }
   }
 
   function relocateAfterHostCompanion(record) {
@@ -2043,10 +2206,17 @@
       // and the dynamic pass re-translates the expanded text in place (the
       // new translation replaces the old block; no duplicate companion).
       // Equivalent-text churn (SPA re-render of the same words) keeps the
-      // live translation: no teardown, no re-bill. No extra observer needed.
+      // live translation: no teardown, no re-bill — extractBlockText reads
+      // through our own translation-only display:none wraps, and if the
+      // re-render swapped out our owned DOM, repairBlockRecordDom rebuilds
+      // it from the cached translation instead of re-requesting.
       for (const block of pendingRefreshBlocks) {
         const record = blockRecords.get(block);
-        if (record && block.isConnected && extractBlockText(block) !== record.originalText) {
+        if (record && block.isConnected) {
+          if (extractBlockText(block) === record.originalText) {
+            repairBlockRecordDom(record);
+            continue;
+          }
           discardBlockRecord(block);
         }
         if (block?.isConnected && !blockRecords.has(block)) {
@@ -2316,11 +2486,17 @@
 
     // Invalidate in-flight storage awaits when the live selection actually
     // changed (keyboard mid-await). Unchanged Shift must not bump or an
-    // in-flight TRANSLATE_BATCH response would be discarded.
+    // in-flight TRANSLATE_BATCH response would be discarded. A collapse to
+    // empty (blank click) must not bump either: a confirmed request is
+    // already billed and its card outlives the selection — bumping here is
+    // what stranded the card at loading forever.
     const snapshot = gesture ? `${gesture.text}\0${gesture.rangeId}` : "";
     if (snapshot !== lastScheduledSelectionSnapshot) {
       lastScheduledSelectionSnapshot = snapshot;
-      selectionGeneration += 1;
+      if (snapshot) {
+        // Only a NEW non-empty selection may supersede in-flight work.
+        selectionGeneration += 1;
+      }
     }
     if (selectionTimer) {
       clearTimeout(selectionTimer);
@@ -2637,23 +2813,26 @@
       }
 
       // Revalidate the live Selection after the network await (same pattern as
-      // the storage await) — never publish a stale translation into a changed
-      // or collapsed selection. `gesture.text` / `gesture.rangeId` are what
-      // was sent.
+      // the storage await) — never publish a stale translation into a CHANGED
+      // selection. A merely collapsed/cleared selection (blank click after
+      // confirm) must NOT discard: the request was consented in the popup and
+      // is already billed, so its lifecycle belongs to the card, which stays
+      // open per the dismissal rules. `gesture.text` / `gesture.rangeId` are
+      // what was sent.
       const postNetworkSel = window.getSelection();
-      if (!postNetworkSel || postNetworkSel.isCollapsed || postNetworkSel.rangeCount === 0) {
-        lastSelectionKey = "";
-        hideSelectionPanel();
-        return { ok: false, error: "划词已收起，译文已丢弃" };
-      }
-      const postNetworkText = postNetworkSel.toString().replace(/\s+/gu, " ").trim();
-      const postNetworkRangeId = getSelectionRangeIdentity(postNetworkSel);
-      if (postNetworkText !== gesture.text || postNetworkRangeId !== gesture.rangeId) {
-        // Page script changed the range without a handled input event — clear
-        // the claimed key and hide the stuck loading panel (same as collapse).
-        lastSelectionKey = "";
-        hideSelectionPanel();
-        return { ok: false, error: "划词已变化，译文已丢弃" };
+      const selectionGone = !postNetworkSel || postNetworkSel.isCollapsed || postNetworkSel.rangeCount === 0;
+      if (!selectionGone) {
+        const postNetworkText = postNetworkSel.toString().replace(/\s+/gu, " ").trim();
+        const postNetworkRangeId = getSelectionRangeIdentity(postNetworkSel);
+        if (postNetworkText !== gesture.text || postNetworkRangeId !== gesture.rangeId) {
+          // Page script changed the range without a handled input event, or a
+          // genuinely new selection claimed the slot (its own bump already
+          // failed the requestId check above) — clear the claimed key and hide
+          // the panel.
+          lastSelectionKey = "";
+          hideSelectionPanel();
+          return { ok: false, error: "划词已变化，译文已丢弃" };
+        }
       }
 
       if (!response?.ok) {

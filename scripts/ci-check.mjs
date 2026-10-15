@@ -832,6 +832,22 @@ function checkEnglishProfileDetection() {
   assertFalse(looksLikeEnglish("Hola mundo"), "looksLikeEnglish: short Spanish");
   assertTrue(looksLikeEnglish("About me"), "looksLikeEnglish: short but clearly English");
 
+  // Ambiguous function words (me/was/on/a/in exist in French/Spanish/German
+  // too) must never prove English on their own, and any foreign marker word
+  // must veto the shortcut outright (earlier review P1).
+  assertFalse(looksLikeEnglish("Me gusta bailar"), "looksLikeEnglish: 'Me gusta bailar' is Spanish, ambiguous 'me' is not English evidence");
+  assertFalse(looksLikeEnglish("Was nun"), "looksLikeEnglish: 'Was nun' is German, ambiguous 'was' is not English evidence");
+  assertFalse(looksLikeEnglish("On arrive demain matin"), "looksLikeEnglish: 'On arrive demain matin' is French, ambiguous 'on' is not English evidence");
+  assertFalse(looksLikeEnglish("On a un plan"), "looksLikeEnglish: 'On a un plan' is French, ambiguous 'on'/'a' plus foreign 'un' must not skip");
+  assertFalse(looksLikeEnglish("In Berlin"), "looksLikeEnglish: 'In Berlin' — German-preposition 'in' alone is not English evidence");
+  assertFalse(looksLikeEnglish("The team is here but die Leute warten"), "looksLikeEnglish: a single foreign marker ('die') vetoes the skip even when English words outnumber it");
+  // Normal English keeps skipping: ambiguous words are simply ignored, the
+  // remaining unambiguous hits still carry the sentence.
+  assertTrue(looksLikeEnglish("The movie was great"), "looksLikeEnglish: English with ambiguous 'was' still detected");
+  assertTrue(looksLikeEnglish("I am so happy about this"), "looksLikeEnglish: English with ambiguous 'a'-word context still detected");
+  assertTrue(looksLikeEnglish("We are a small team of makers based in Berlin."), "looksLikeEnglish: English bio with ambiguous 'a'/'in' still detected");
+  assertTrue(looksLikeEnglish("Was it good?"), "looksLikeEnglish: short English question with ambiguous 'was' still detected");
+
   // isAlreadyTargetLanguage en behavior: English profile skips, everything
   // uncertain translates.
   assertTrue(
@@ -1160,6 +1176,7 @@ function buildBackgroundHarness(utils) {
     "getFriendlyApiError",
     "isProviderBusyResponse",
     "getProviderBusyMessage",
+    "isContentRunCancelled",
     "createError"
   ];
   const fnBodies = fnNames
@@ -1186,7 +1203,7 @@ function buildBackgroundHarness(utils) {
       "importScripts",
       `${busyMatch[0]}\n${source.slice(0, headEnd)}\n${fnBodies.join("\n\n")}\n` +
         "return { PROVIDERS, DEFAULT_SETTINGS, loadSettings, translateBatch, " +
-        "getFriendlyApiError, isProviderBusyResponse, getProviderBusyMessage, PROVIDER_BUSY_MESSAGE };"
+        "getFriendlyApiError, isProviderBusyResponse, getProviderBusyMessage, isContentRunCancelled, PROVIDER_BUSY_MESSAGE };"
     )(chromeStub, utils, () => {});
   };
 }
@@ -1444,17 +1461,28 @@ async function checkModelMigrationAndRetryPolicy() {
   });
 
   const WATCHDOG_MS = 3000;
-  const withWatchdog = (promise, label) => Promise.race([
-    promise,
-    new Promise((resolve) => {
-      setTimeout(() => {
-        fail(`translateBatch functional test (${label}): no settlement within ${WATCHDOG_MS}ms`);
-        resolve(undefined);
-      }, WATCHDOG_MS);
-    })
-  ]);
+  // The watchdog timer must die with the guarded promise: leaving it armed
+  // calls fail() 3s after an already-settled request and misreports success
+  // runs as timeouts. Clear it from the race promise's finally.
+  const withWatchdog = (promise, label) => {
+    let watchdog = null;
+    const guarded = Promise.resolve(promise).finally(() => {
+      if (watchdog !== null) {
+        clearTimeout(watchdog);
+      }
+    });
+    return Promise.race([
+      guarded,
+      new Promise((resolve) => {
+        watchdog = setTimeout(() => {
+          fail(`translateBatch functional test (${label}): no settlement within ${WATCHDOG_MS}ms`);
+          resolve(undefined);
+        }, WATCHDOG_MS);
+      })
+    ]);
+  };
 
-  const runTranslate = async (label, storage, handlers, timeoutMs = 1000) => {
+  const runTranslate = async (label, storage, handlers, timeoutMs = 1000, extraOptions = {}) => {
     let calls = 0;
     const delays = [];
     const queue = [...handlers];
@@ -1472,7 +1500,7 @@ async function checkModelMigrationAndRetryPolicy() {
           undefined,
           undefined,
           timeoutMs,
-          { sleep: async (ms) => { delays.push(ms); } }
+          { sleep: async (ms) => { delays.push(ms); }, ...extraOptions }
         ),
         label
       );
@@ -1597,6 +1625,85 @@ async function checkModelMigrationAndRetryPolicy() {
     assertInRange(timedOutThenOk.delays[0], 800, 1200, "translateBatch: timeout retry uses the ~1s backoff");
   }
 
+  // ---- Run cancellation: abandoned generations must stop billing ----
+  // Pure lookup: cancel marks "every run ≤ N from this tab is dead".
+  assertTrue(!h.isContentRunCancelled(new Map(), 1, 1), "isContentRunCancelled: empty map cancels nothing");
+  const cancelMap = new Map([[7, 5]]);
+  assertTrue(h.isContentRunCancelled(cancelMap, 7, 5), "isContentRunCancelled: run equal to cancelled generation is cancelled");
+  assertTrue(h.isContentRunCancelled(cancelMap, 7, 4), "isContentRunCancelled: older run is cancelled");
+  assertFalse(h.isContentRunCancelled(cancelMap, 7, 6), "isContentRunCancelled: newer run survives");
+  assertFalse(h.isContentRunCancelled(cancelMap, 8, 4), "isContentRunCancelled: other tab unaffected");
+  assertFalse(h.isContentRunCancelled(cancelMap, null, 4), "isContentRunCancelled: missing tab never cancels");
+  assertFalse(h.isContentRunCancelled(cancelMap, 7, null), "isContentRunCancelled: missing runId never cancels");
+
+  // Cancelled before the first attempt: zero provider calls, RUN_CANCELLED.
+  const preCancelled = await runTranslate(
+    "pre-cancelled",
+    deepseekStorage,
+    [() => jsonResponse(200, okBody)],
+    1000,
+    { isCancelled: () => true }
+  );
+  if (preCancelled.ok) {
+    fail("translateBatch: pre-cancelled run must reject");
+  } else {
+    assertEqual(preCancelled.calls, 0, "translateBatch: pre-cancelled run makes no provider call");
+    assertEqual(preCancelled.error.code, "RUN_CANCELLED", "translateBatch: cancelled run rejects with RUN_CANCELLED");
+  }
+
+  // Cancel lands during the 503 backoff sleep: exactly 1 call, no retry.
+  let cancelAfterFirstCall = false;
+  const cancelledMidBackoff = await runTranslate(
+    "cancel during backoff",
+    deepseekStorage,
+    [() => {
+      cancelAfterFirstCall = true;
+      return jsonResponse(503, '{"error":{"message":"down"}}');
+    }],
+    1000,
+    { isCancelled: () => cancelAfterFirstCall }
+  );
+  if (cancelledMidBackoff.ok) {
+    fail("translateBatch: backoff-cancelled run must reject");
+  } else {
+    assertEqual(cancelledMidBackoff.calls, 1, "translateBatch: cancellation during backoff stops before the retry");
+    assertEqual(cancelledMidBackoff.delays.length, 1, "translateBatch: backoff sleep happened but no further attempt followed");
+    assertEqual(cancelledMidBackoff.error.code, "RUN_CANCELLED", "translateBatch: backoff-cancelled run rejects with RUN_CANCELLED");
+  }
+
+  // Cancel lands during a timeout-retry sleep: the re-armed attempt never fires.
+  let cancelOnAbort = false;
+  const cancelledTimeoutRetry = await runTranslate(
+    "cancel during timeout backoff",
+    deepseekStorage,
+    [(url, options) => {
+      options.signal?.addEventListener("abort", () => {
+        cancelOnAbort = true;
+      });
+      return hangUntilAbort(url, options);
+    }],
+    25,
+    { isCancelled: () => cancelOnAbort }
+  );
+  if (cancelledTimeoutRetry.ok) {
+    fail("translateBatch: timeout-backoff-cancelled run must reject");
+  } else {
+    assertEqual(cancelledTimeoutRetry.calls, 1, "translateBatch: cancellation during timeout backoff stops before the retry");
+    assertEqual(cancelledTimeoutRetry.error.code, "RUN_CANCELLED", "translateBatch: timeout-backoff-cancelled run rejects with RUN_CANCELLED");
+  }
+
+  // Uncancelled runs keep retrying normally (isCancelled default is inert).
+  const neverCancelled = await runTranslate(
+    "503 then 200 without cancellation",
+    deepseekStorage,
+    [() => jsonResponse(503, "{}"), () => jsonResponse(200, okBody)]
+  );
+  if (!neverCancelled.ok) {
+    fail(`translateBatch: retry must work untouched without cancellation, got ${JSON.stringify(neverCancelled.error?.message)}`);
+  } else {
+    assertEqual(neverCancelled.calls, 2, "translateBatch: uncalled isCancelled keeps the retry loop intact");
+  }
+
   // ---- Whole-page translation concurrency cap ----
   assertTrue(
     MAX_INFLIGHT_TRANSLATE_BATCHES <= 3,
@@ -1609,6 +1716,400 @@ async function checkModelMigrationAndRetryPolicy() {
   }
   if (!/for \(const batch of batches\) \{[\s\S]{0,400}?await translateBatchWithFallback\(/.test(contentRaw)) {
     fail("content.js: batch loop must await translateBatchWithFallback sequentially (≤ MAX_INFLIGHT_TRANSLATE_BATCHES in flight)");
+  }
+}
+
+async function checkInflightCapAndRunCancellation() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for inflight-cap tests: ${error.message}`);
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // ---- Functional: the cross-generation in-flight slot limiter ----
+  const acquireSrc = extractContentFunction("acquireInflightTranslateSlot");
+  const releaseSrc = extractContentFunction("releaseInflightTranslateSlot");
+  if (!acquireSrc || !releaseSrc) {
+    fail("content.js: cannot extract acquire/releaseInflightTranslateSlot for inflight-cap test");
+    return;
+  }
+  let slots;
+  try {
+    slots = new Function("Utils", `
+      let generation = 1;
+      let inflightTranslateBatches = 0;
+      const inflightTranslateWaiters = [];
+      ${acquireSrc}
+      ${releaseSrc}
+      return {
+        acquire: acquireInflightTranslateSlot,
+        release: releaseInflightTranslateSlot,
+        bumpGeneration: () => { generation += 1; },
+        inflight: () => inflightTranslateBatches,
+        waiting: () => inflightTranslateWaiters.length
+      };
+    `)(utils);
+  } catch (error) {
+    fail(`content.js: slot limiter is not runnable standalone: ${error.message}`);
+    return;
+  }
+
+  // Up to MAX_INFLIGHT_TRANSLATE_BATCHES slots grant immediately.
+  assertTrue(await slots.acquire(1), "inflight cap: first slot granted");
+  assertTrue(await slots.acquire(1), "inflight cap: second slot granted");
+  assertTrue(await slots.acquire(1), "inflight cap: third slot granted");
+  assertEqual(slots.inflight(), utils.MAX_INFLIGHT_TRANSLATE_BATCHES, "inflight cap: cap reached");
+  // The next acquire queues instead of breaching the cap.
+  let fourthValue = null;
+  const fourth = slots.acquire(1).then((value) => { fourthValue = value; });
+  assertEqual(slots.waiting(), 1, "inflight cap: fourth acquire waits");
+  // Release hands the slot to the waiter without decrementing the count.
+  slots.release();
+  await fourth;
+  assertTrue(fourthValue, "inflight cap: waiter receives the handed-off slot");
+  assertEqual(slots.inflight(), utils.MAX_INFLIGHT_TRANSLATE_BATCHES, "inflight cap: hand-off keeps the count");
+  // A generation bump does not clear the count; a stale waiter resolves false
+  // (no request sent for a dead run) and the slot keeps flowing.
+  slots.bumpGeneration();
+  let fifthValue = null;
+  const fifth = slots.acquire(1).then((value) => { fifthValue = value; });
+  slots.release();
+  await fifth;
+  assertTrue(fifthValue === false, "inflight cap: stale-generation waiter resolves false (run abandoned)");
+  assertEqual(slots.inflight(), utils.MAX_INFLIGHT_TRANSLATE_BATCHES, "inflight cap: navigation bump never zeroes the count");
+  // Full drain returns to zero with no leaked waiters.
+  slots.release();
+  slots.release();
+  slots.release();
+  assertEqual(slots.inflight(), 0, "inflight cap: releasing every holder drains to zero");
+  assertEqual(slots.waiting(), 0, "inflight cap: no leaked waiters after drain");
+
+  // ---- Static: content.js wiring ----
+  const contentRaw = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
+  const content = stripCommentsForScan(contentRaw);
+  const requestSrc = extractContentFunction("requestSegmentTranslations");
+  if (!requestSrc) {
+    fail("content.js: cannot extract requestSegmentTranslations for inflight-cap test");
+    return;
+  }
+  if (!/acquireInflightTranslateSlot\(/.test(requestSrc) || !/releaseInflightTranslateSlot\(\)/.test(requestSrc)) {
+    fail("content.js: requestSegmentTranslations must hold an in-flight slot around every TRANSLATE_BATCH send");
+  }
+  if (!/type:\s*"TRANSLATE_BATCH"[\s\S]{0,200}runId/.test(requestSrc)) {
+    fail("content.js: TRANSLATE_BATCH payload must carry runId so the worker can match CANCEL_TRANSLATE_BATCHES");
+  }
+  if (!/CANCEL_TRANSLATE_BATCHES/.test(content)) {
+    fail("content.js: run abandonment must notify the worker via CANCEL_TRANSLATE_BATCHES");
+  }
+  for (const name of ["startTranslation", "restoreOriginal", "handleSpaNavigation"]) {
+    const src = extractContentFunction(name);
+    if (!src) {
+      fail(`content.js: cannot extract ${name} for inflight-cap test`);
+      continue;
+    }
+    if (!/cancelAbandonedRunBatches\(/.test(src)) {
+      fail(`content.js: ${name} bumps the generation — it must also cancel the abandoned run's batches`);
+    }
+    if (/inflightTranslateBatches/.test(stripCommentsForScan(src))) {
+      fail(`content.js: ${name} must not touch the in-flight slot counters (the cap is shared across generations)`);
+    }
+  }
+  const resets = (content.match(/inflightTranslateBatches\s*=\s*0/g) || []).length;
+  if (resets !== 1) {
+    fail(`content.js: inflightTranslateBatches may be zeroed only in its declaration, found ${resets} assignments`);
+  }
+
+  // ---- Static: background.js wiring ----
+  const background = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"));
+  if (!/CANCEL_TRANSLATE_BATCHES/.test(background)) {
+    fail("background.js: must handle CANCEL_TRANSLATE_BATCHES so abandoned runs stop billing");
+  }
+  if (!/isCancelled:\s*\(\)\s*=>\s*isContentRunCancelled\(/.test(background)) {
+    fail("background.js: TRANSLATE_BATCH must poll isContentRunCancelled so retries stop for abandoned runs");
+  }
+  if (!/RUN_CANCELLED/.test(background)) {
+    fail("background.js: cancelled runs must surface a RUN_CANCELLED error code");
+  }
+}
+
+async function checkSpaRefreshAndSelectionLifecycle() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertFalse = (actual, label) => {
+    if (actual !== false) {
+      fail(`${label}: expected false, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // ---- (4a) Hash-only URL changes are not SPA navigation ----
+  const spaUrlSrc = extractContentFunction("spaNavigationUrl");
+  const checkSrc = extractContentFunction("checkSpaNavigation");
+  if (!spaUrlSrc || !checkSrc) {
+    fail("content.js: cannot extract spaNavigationUrl / checkSpaNavigation for hash test");
+    return;
+  }
+  const location = { href: "https://x.com/home" };
+  let navigations = 0;
+  let checkSpaNavigation;
+  try {
+    checkSpaNavigation = new Function(
+      "location",
+      "handleSpaNavigation",
+      `let lastSeenUrl = location.href;\n${spaUrlSrc}\n${checkSrc}\nreturn checkSpaNavigation;`
+    )(location, () => { navigations += 1; });
+  } catch (error) {
+    fail(`content.js: checkSpaNavigation is not runnable standalone: ${error.message}`);
+    return;
+  }
+  location.href = "https://x.com/home#feed";
+  checkSpaNavigation();
+  assertEqual(navigations, 0, "SPA navigation: hash-only change must not navigate");
+  location.href = "https://x.com/home#about";
+  checkSpaNavigation();
+  assertEqual(navigations, 0, "SPA navigation: hash-to-hash change must not navigate");
+  location.href = "https://x.com/explore";
+  checkSpaNavigation();
+  assertEqual(navigations, 1, "SPA navigation: real path change navigates");
+  location.href = "https://x.com/explore#top";
+  checkSpaNavigation();
+  assertEqual(navigations, 1, "SPA navigation: hash appended to new path does not re-navigate");
+  location.href = "https://x.com/home";
+  checkSpaNavigation();
+  assertEqual(navigations, 2, "SPA navigation: returning to a previous path navigates");
+
+  // ---- (4b) Navigation keeps still-connected pendingRefreshBlocks ----
+  const navSrc = extractContentFunction("handleSpaNavigation");
+  if (!navSrc) {
+    fail("content.js: cannot extract handleSpaNavigation for refresh-pending test");
+    return;
+  }
+  if (/pendingRefreshBlocks\.clear\(\)/.test(navSrc)) {
+    fail("content.js: handleSpaNavigation must not clear pendingRefreshBlocks wholesale — keep connected blocks for the scheduled flush");
+  }
+  if (!/pendingRefreshBlocks/.test(navSrc) || !/isConnected/.test(navSrc)) {
+    fail("content.js: handleSpaNavigation must prune only disconnected pendingRefreshBlocks entries");
+  }
+
+  // ---- (5) Echo-skip cache: block + source text + run settings ----
+  const skippedSrc = extractContentFunction("isSkippedEchoBlock");
+  if (!skippedSrc) {
+    fail("content.js: cannot extract isSkippedEchoBlock for echo-cache test");
+    return;
+  }
+  const skippedEchoBlocks = new WeakMap();
+  let settings = { provider: "deepseek", targetLanguage: "en", model: "deepseek-flash" };
+  let isSkippedEchoBlock;
+  try {
+    isSkippedEchoBlock = new Function(
+      "skippedEchoBlocks",
+      "getRunSettings",
+      `${skippedSrc}\nreturn isSkippedEchoBlock;`
+    )(skippedEchoBlocks, () => settings);
+  } catch (error) {
+    fail(`content.js: isSkippedEchoBlock is not runnable standalone: ${error.message}`);
+    return;
+  }
+  const blockA = {};
+  assertFalse(isSkippedEchoBlock(blockA, "Hello world"), "echo cache: unknown block translates");
+  assertFalse(isSkippedEchoBlock(undefined, "Hello world"), "echo cache: missing block never skips");
+  skippedEchoBlocks.set(blockA, { text: "Hello world", ...settings });
+  assertTrue(isSkippedEchoBlock(blockA, "Hello world"), "echo cache: same block + text + settings skips");
+  assertFalse(isSkippedEchoBlock(blockA, "Hello world again"), "echo cache: changed source text invalidates the skip");
+  settings = { ...settings, model: "deepseek-v4-pro" };
+  assertFalse(isSkippedEchoBlock(blockA, "Hello world"), "echo cache: changed model invalidates the skip");
+  settings = { provider: "kimi", targetLanguage: "en", model: "kimi-k2.6" };
+  assertFalse(isSkippedEchoBlock(blockA, "Hello world"), "echo cache: changed provider/target invalidates the skip");
+
+  const contentRaw = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
+  const content = stripCommentsForScan(contentRaw);
+  const applySrc = stripCommentsForScan(extractContentFunction("applyTranslatedSegment") || "");
+  if (!/skippedEchoBlocks\.set\(/.test(applySrc)) {
+    fail("content.js: applyTranslatedSegment must record echo skips in skippedEchoBlocks (else every rescan re-bills)");
+  }
+  if (!/isSkippedEchoBlock\(/.test(stripCommentsForScan(extractContentFunction("shouldTranslateBlockText") || ""))) {
+    fail("content.js: shouldTranslateBlockText must consult the echo-skip cache");
+  }
+  if (!/shouldTranslateBlockText\(fullText, targetLanguage, block\)/.test(content) ||
+      !/shouldTranslateBlockText\(text, runSettings\.targetLanguage, block\)/.test(content)) {
+    fail("content.js: collectBlocks and translateBlocks must pass the block into shouldTranslateBlockText");
+  }
+
+  // ---- (6a) hasHiddenAncestor ignores our own display:none original wraps ----
+  const ownedSrc = extractContentFunction("isOwnedOriginalWrap");
+  const hiddenSrc = extractContentFunction("isHiddenElement");
+  const hasHiddenSrc = extractContentFunction("hasHiddenAncestor");
+  if (!ownedSrc || !hiddenSrc || !hasHiddenSrc) {
+    fail("content.js: cannot extract hidden-ancestor helpers for refresh-compare test");
+    return;
+  }
+  let hasHiddenAncestor;
+  try {
+    hasHiddenAncestor = new Function(
+      "getComputedStyle",
+      `${ownedSrc}\n${hiddenSrc}\n${hasHiddenSrc}\nreturn hasHiddenAncestor;`
+    )((el) => ({ display: el.__display, visibility: el.__visibility || "visible" }));
+  } catch (error) {
+    fail(`content.js: hasHiddenAncestor is not runnable standalone: ${error.message}`);
+    return;
+  }
+  const plain = { __display: "block", parentElement: null, hasAttribute: () => false };
+  const wrap = { __display: "none", parentElement: plain, hasAttribute: (name) => name === "data-kilocean-original-wrap" };
+  const hiddenSpan = { __display: "none", parentElement: plain, hasAttribute: () => false };
+  const visibleWrapInHiddenSection = {
+    __display: "contents",
+    parentElement: { __display: "none", parentElement: null, hasAttribute: () => false },
+    hasAttribute: (name) => name === "data-kilocean-original-wrap"
+  };
+  assertFalse(
+    hasHiddenAncestor({ parentElement: wrap }),
+    "refresh compare: translation-only hidden original wrap must not blind the text"
+  );
+  assertTrue(
+    hasHiddenAncestor({ parentElement: hiddenSpan }),
+    "refresh compare: page-owned hidden span still hides its text"
+  );
+  assertTrue(
+    hasHiddenAncestor({ parentElement: visibleWrapInHiddenSection }),
+    "refresh compare: page-hidden ancestor above the wrap still hides its text"
+  );
+  assertFalse(
+    hasHiddenAncestor({ parentElement: { __display: "block", parentElement: null, hasAttribute: () => false } }),
+    "refresh compare: fully visible chain stays visible"
+  );
+
+  // ---- (6b) repairBlockRecordDom rebuilds owned DOM without re-billing ----
+  const repairSrc = extractContentFunction("repairBlockRecordDom");
+  if (!repairSrc) {
+    fail("content.js: cannot extract repairBlockRecordDom for rebuild test");
+    return;
+  }
+  let wrapCalls = 0;
+  let relocateCalls = 0;
+  let repairBlockRecordDom;
+  try {
+    repairBlockRecordDom = new Function(
+      "beginApplyingDom",
+      "endApplyingDom",
+      "wrapTextNodesForToggle",
+      "relocateAfterHostCompanion",
+      `${repairSrc}\nreturn repairBlockRecordDom;`
+    )(
+      () => 0,
+      () => {},
+      () => {
+        wrapCalls += 1;
+        return { firstWrap: { rebuilt: 1 }, wraps: [{ rebuilt: 1 }, { rebuilt: 2 }] };
+      },
+      (record) => {
+        relocateCalls += 1;
+        record.relocated = true;
+      }
+    );
+  } catch (error) {
+    fail(`content.js: repairBlockRecordDom is not runnable standalone: ${error.message}`);
+    return;
+  }
+  const makeBlock = () => {
+    const block = {
+      isConnected: true,
+      appended: null,
+      appendChild(node) {
+        this.appended = node;
+      }
+    };
+    return block;
+  };
+  const swappedRecord = {
+    block: makeBlock(),
+    wraps: [{ isConnected: true }, { isConnected: false }],
+    companion: { isConnected: false },
+    layout: "companion",
+    nested: []
+  };
+  repairBlockRecordDom(swappedRecord);
+  assertEqual(wrapCalls, 1, "repair: swapped wraps are rebuilt via wrapTextNodesForToggle");
+  assertEqual(swappedRecord.wraps.length, 2, "repair: record references the rebuilt wraps");
+  assertEqual(swappedRecord.block.appended, swappedRecord.companion, "repair: detached companion is re-inserted from the cache");
+  assertEqual(relocateCalls, 0, "repair: non-after layouts re-insert into the block");
+  const intactRecord = {
+    block: makeBlock(),
+    wraps: [{ isConnected: true }],
+    companion: { isConnected: true },
+    layout: "flow",
+    nested: []
+  };
+  repairBlockRecordDom(intactRecord);
+  assertEqual(wrapCalls, 1, "repair: intact wraps are left alone");
+  assertEqual(intactRecord.block.appended, null, "repair: connected companion is not re-inserted");
+  const afterRecord = {
+    block: makeBlock(),
+    wraps: [{ isConnected: true }],
+    companion: { isConnected: false },
+    layout: "after",
+    nested: []
+  };
+  repairBlockRecordDom(afterRecord);
+  assertEqual(relocateCalls, 1, "repair: after-host companions relocate back after the host");
+  assertEqual(afterRecord.block.appended, null, "repair: after-host companions are not appended into the block");
+  assertTrue(afterRecord.relocated === true, "repair: relocation received the record");
+  if (/requestSegmentTranslations|translateBatchWithFallback/.test(repairSrc)) {
+    fail("content.js: repairBlockRecordDom must never issue a new translation request");
+  }
+
+  // scheduleDynamicTranslation: unchanged source → repair; changed → discard.
+  const schedSrc = extractContentFunction("scheduleDynamicTranslation");
+  if (!schedSrc) {
+    fail("content.js: cannot extract scheduleDynamicTranslation for refresh test");
+    return;
+  }
+  const schedOrder = stripCommentsForScan(schedSrc);
+  const repairAt = schedOrder.indexOf("repairBlockRecordDom(");
+  const compareAt = schedOrder.indexOf("extractBlockText(block) === record.originalText");
+  const discardAt = schedOrder.indexOf("discardBlockRecord(");
+  if (repairAt < 0 || compareAt < 0 || discardAt < 0 || compareAt > repairAt || compareAt > discardAt) {
+    fail("content.js: refresh flush must compare extractBlockText to the recorded original first, then repair (unchanged) or discard (changed)");
+  }
+
+  // ---- (7) Confirmed selection survives a collapse (blank click) ----
+  const maybeSrc = stripCommentsForScan(extractContentFunction("onSelectionMaybeTranslate") || "");
+  if (!/if \(snapshot\)\s*\{\s*selectionGeneration \+= 1/.test(maybeSrc)) {
+    fail("content.js: only a NEW non-empty selection may bump selectionGeneration (collapse must not strand the confirmed card at loading)");
+  }
+  const sendSrc = stripCommentsForScan(extractContentFunction("sendSelectionTranslation") || "");
+  if (/收起，译文已丢弃/.test(sendSrc)) {
+    fail("content.js: a collapsed selection after confirm must not discard the billed translation");
+  }
+  if (!/selectionGone/.test(sendSrc) || !/postNetworkText !== gesture\.text/.test(sendSrc)) {
+    fail("content.js: post-network revalidation must guard text/range changes behind a non-collapsed selection");
+  }
+  if (!/requestId !== selectionGeneration/.test(sendSrc)) {
+    fail("content.js: close/new-selection race protection (requestId vs generation) must stay");
+  }
+  const hideSrc = stripCommentsForScan(extractContentFunction("hideSelectionPanel") || "");
+  if (!/selectionGeneration \+= 1/.test(hideSrc)) {
+    fail("content.js: hiding the panel must keep bumping selectionGeneration (explicit close still cancels)");
   }
 }
 
@@ -1741,6 +2242,8 @@ async function main() {
   checkSpaNavigationAndSelectionStatics();
   await checkFetchTimeoutCoverage();
   await checkModelMigrationAndRetryPolicy();
+  await checkInflightCapAndRunCancellation();
+  await checkSpaRefreshAndSelectionLifecycle();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -1750,7 +2253,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, inflight cap + run cancellation, SPA refresh + selection lifecycle");
   process.exit(0);
 }
 

@@ -94,6 +94,22 @@ async function loadSettings() {
 /** @type {Map<number, { text: string, rangeId: string, createdAt: number }>} */
 const pendingSelections = new Map();
 
+/** @type {Map<number, number>} tabId → highest cancelled content run generation. */
+const cancelledContentRuns = new Map();
+
+// True when the content script abandoned this run (SPA navigation / restore /
+// restart bumped its generation past `runId`): further attempts — including
+// backoff retries — would only re-bill a generation whose results the content
+// script will drop anyway. Kept as a pure lookup so tests can drive it with
+// their own map.
+function isContentRunCancelled(cancelledRuns, tabId, runId) {
+  if (tabId == null || !Number.isInteger(runId)) {
+    return false;
+  }
+  const cancelledUpTo = cancelledRuns.get(tabId);
+  return Number.isInteger(cancelledUpTo) && runId <= cancelledUpTo;
+}
+
 const SELECTION_SEND_MIN_INTERVAL_MS = 1000;
 const SELECTION_SEND_WINDOW_MS = 10000;
 const SELECTION_SEND_WINDOW_LIMIT = 8;
@@ -106,6 +122,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void clearPendingSelection(tabId);
+  cancelledContentRuns.delete(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -122,7 +139,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "TRANSLATE_BATCH") {
-    translateBatch(message.texts, message.targetLanguage, message.model, message.provider)
+    // runId (content-script run generation) lets a later CANCEL_TRANSLATE_BATCHES
+    // stop this request's remaining retry attempts — no orphan retries billing
+    // an abandoned generation.
+    const tabId = Number.isInteger(sender.tab?.id) ? sender.tab.id : null;
+    const runId = Number.isInteger(message.runId) ? message.runId : null;
+    translateBatch(message.texts, message.targetLanguage, message.model, message.provider, undefined, {
+      isCancelled: () => isContentRunCancelled(cancelledContentRuns, tabId, runId)
+    })
       .then((translations) => sendResponse({ ok: true, translations }))
       .catch((error) => sendResponse({
         ok: false,
@@ -131,6 +155,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         canSplit: Boolean(error.canSplit)
       }));
     return true;
+  }
+
+  if (message?.type === "CANCEL_TRANSLATE_BATCHES") {
+    const tabId = Number.isInteger(sender.tab?.id) ? sender.tab.id : null;
+    const runId = Number(message.runId);
+    if (tabId != null && Number.isInteger(runId)) {
+      // Semantics: every run with generation ≤ runId from this tab is dead.
+      cancelledContentRuns.set(tabId, Math.max(cancelledContentRuns.get(tabId) ?? 0, runId));
+    }
+    sendResponse({ ok: true });
+    return false;
   }
 
   // Selection path only — worker-side consent already happened in the popup;
@@ -322,7 +357,12 @@ async function translateBatch(
   pinnedProvider,
   timeoutMs = DeepSeekTranslatorUtils.FETCH_TIMEOUT_MS.translation,
   // Injectable so tests run the retry loop without wall-clock delays.
-  { sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}
+  // isCancelled is polled before every attempt and after every backoff sleep
+  // so an abandoned run stops billing immediately.
+  {
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    isCancelled = () => false
+  } = {}
 ) {
   if (!Array.isArray(texts) || texts.length === 0 || texts.length > 24) {
     throw createError("翻译批次格式不正确", "INVALID_BATCH");
@@ -388,6 +428,9 @@ async function translateBatch(
   let responseText = "";
   for (let attempt = 0; ; attempt += 1) {
     const canRetry = attempt < maxAttempts - 1;
+    if (isCancelled()) {
+      throw createError("翻译已取消", "RUN_CANCELLED");
+    }
     try {
       const attemptResponse = await DeepSeekTranslatorUtils.fetchWithTimeout(providerConfig.apiUrl, {
         method: "POST",
@@ -420,11 +463,17 @@ async function translateBatch(
         // Timeouts are transient like 5xx: re-arm the same deadline and try
         // again (no Retry-After exists for an aborted request).
         await sleep(DeepSeekTranslatorUtils.computeRetryDelay(attempt));
-        continue;
+      } else {
+        const wrapped = createError(`无法连接 ${providerConfig.label}：${error.message}`, "NETWORK_ERROR");
+        wrapped.canSplit = false;
+        throw wrapped;
       }
-      const wrapped = createError(`无法连接 ${providerConfig.label}：${error.message}`, "NETWORK_ERROR");
-      wrapped.canSplit = false;
-      throw wrapped;
+    }
+    // A retryable failure just slept out its backoff (status or timeout
+    // retry): cancellation usually lands during that sleep, so re-check
+    // before the next billable attempt instead of retrying a dead run.
+    if (isCancelled()) {
+      throw createError("翻译已取消", "RUN_CANCELLED");
     }
   }
 
