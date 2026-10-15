@@ -63,7 +63,10 @@ permissions:
   issues: read
 
 concurrency:
-  group: codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || github.run_id }}
+  # pull_request_target runs get their own group: only they attach the
+  # required check to the PR head, so an issue_comment / review event must
+  # never cancel an in-flight target run (it would leave the check cancelled).
+  group: codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || github.run_id }}-${{ github.event_name == 'pull_request_target' && 'target' || 'aux' }}
   cancel-in-progress: true
 
 jobs:

@@ -58,6 +58,8 @@ Codex 线程分级（共享实现）：显式 P0/P1 阻断；未标注线程仅�
 | Required check: **`ci / Build & Test`** | CI job 名（`.github/workflows/ci.yml`） |
 | Required check: **`copilot-pull-request-reviewer`** | Copilot 官方审查 check（配额耗尽时可临时人工豁免，见上） |
 | Required check: **`codex / Codex Review Gate`** | **job / check-run 名**（`.github/workflows/codex-gate.yml`），不是 workflow 展示名 |
+| Required check: **`ci / Secret Scan`** | gitleaks（`ci.yml` 调用 devflow-gates） |
+| Required check: **`qa / QA Gate`** | QA label `qa-passed`（`qa-gate.yml`，见 `QA.md`） |
 | **Require conversation resolution before merging** | 未解决行内线程挡住 Merge（无严重度例外；见下方「原生保护」） |
 
 **Copilot 的 required check 不覆盖 Codex。** Codex（`chatgpt-codex-connector[bot]`）从不注册 `copilot-pull-request-reviewer`。
@@ -90,7 +92,7 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 - **不要**在 Gate 里 checkout PR 代码（那才是经典 RCE）；仅改 trigger 为 `pull_request_target` 且 API-only 是刻意的信任边界。
 - **`pull_request_target` 事件**：job conclusion 把 check 名 `codex / Codex Review Gate` 挂到 PR（branch protection / Auto Merge 认这个）。
 - **`issue_comment` / `pull_request_review` / `pull_request_review_comment` / `workflow_dispatch`**：仍会跑评估并在 Actions UI 显示 run，但**不会**再往 head SHA 单独 `checks.create`。要刷新 required check：对上一次 **`pull_request_target` 来源**的 Gate job 点 **Re-run**（或再 push / synchronize）。
-- Auto Merge 已监听 `workflow_run`（workflow 名 `codex / Codex Review Gate`）；Gate **不必**自己 dispatch Auto Merge。
+- Auto Merge 已监听 `workflow_run`（workflow 名 `Codex Review Gate`；`codex / Codex Review Gate` 只是 check 名）；Gate **不必**自己 dispatch Auto Merge。
 - **`ai-review.yml`**：`pull_request` 上只请求 Copilot；**不**把 provider API secrets 注入 PR 控制的 job。
 
 点 Resolve 不会自动重跑。清完线程后：Actions 里对 **pull_request_target 来源**的 `codex / Codex Review Gate` 点 **Re-run**（重新挂 check）。Gate 已绿时也可对 Auto Merge 做 `workflow_dispatch`。

@@ -76,7 +76,7 @@
 
 ## 🔒 必需检查：Build & Test
 
-CI 作业名是 **ci / Build & Test**。个人私有仓库请用**经典 branch protection**（Ruleset 可能显示 Active 但不 enforce），并要求 `copilot-pull-request-reviewer` + `codex / Codex Review Gate` + 会话已解决。见 [`MERGE_GATES.md`](MERGE_GATES.md)。
+CI 作业名是 **ci / Build & Test**。个人私有仓库请用**经典 branch protection**（Ruleset 可能显示 Active 但不 enforce），并要求 `ci / Build & Test` + `ci / Secret Scan` + `codex / Codex Review Gate` + `qa / QA Gate`（+ `copilot-pull-request-reviewer`，配额耗尽时可豁免）+ 会话已解决。见 [`MERGE_GATES.md`](MERGE_GATES.md)。
 
 | 步骤 | 命令 | 说明 |
 |------|------|------|
