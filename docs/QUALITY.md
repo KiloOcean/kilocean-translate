@@ -98,8 +98,10 @@ Branch name pattern: main
    ✅ Require branches to be up to date
    Required checks:
      - ci / Build & Test
+     - ci / Secret Scan
      - copilot-pull-request-reviewer
      - codex / Codex Review Gate
+     - qa / QA Gate
 ✅ Require conversation resolution before merging
 ```
 
