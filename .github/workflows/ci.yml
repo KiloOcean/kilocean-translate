@@ -1,48 +1,31 @@
+# Example caller for the reusable CI — copy to YOUR_REPO/.github/workflows/ci.yml
+# and adjust the inputs. Trigger on `pull_request` (NOT pull_request_target):
+# "Build & Test" executes the PR's code and must not see secrets.
+#
+# Required-check names produced by this example (job id `ci`, no `name:`):
+#   - "ci / Build & Test"
+#   - "ci / Secret Scan"
+# If you rename the job id (or add a `name:`), the check names change to
+# "<your job name> / <called job name>" — update branch protection AND
+# auto-merge.yml's required_checks to match.
+
 name: CI
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
 
 jobs:
-  build-and-test:
-    name: Build & Test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Run extension CI checks
-        id: ci-check
-        run: node scripts/ci-check.mjs
-
-      - name: Job Summary
-        if: always()
-        run: |
-          echo "## CI Results 📊" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.ci-check.outcome }}" = "success" ]; then
-            echo "| Extension CI (\`scripts/ci-check.mjs\`) | ✅ |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| Extension CI (\`scripts/ci-check.mjs\`) | ❌ |" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Branch:** \`${{ github.head_ref || github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Checks: manifest / permissions whitelist / JS syntax / static security bans." >> $GITHUB_STEP_SUMMARY
+  ci:
+    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@2f2d3ebc3bd300d0da389574954effb94eb244c5  # devflow-gates main @ 2f2d3eb (pinned; bump deliberately)
+    with:
+      node_version: '20'          # '' skips setup-node
+      python_version: ''          # '' skips setup-python
+      setup_command: ''     # '' skips the setup step
+      test_command: 'node scripts/ci-check.mjs'    # required
+      working_directory: '.'      # e.g. 'web' for a monorepo subdir
