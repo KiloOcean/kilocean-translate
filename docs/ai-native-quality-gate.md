@@ -37,8 +37,9 @@ CI 绿灯是**必要但不充分**条件。**禁止**仅凭 `ci / Build & Test` 
 
 | 文件 | 角色 |
 |------|------|
-| `.github/workflows/ci.yml` | **ci / Build & Test** |
+| `.github/workflows/ci.yml` | **ci / Build & Test**、**ci / Secret Scan** |
 | `.github/workflows/codex-gate.yml` | **codex / Codex Review Gate** |
+| `.github/workflows/qa-gate.yml` | **qa / QA Gate**（label `qa-passed`） |
 | `.github/workflows/ai-review.yml` | 请求 Copilot；可选 Custom LLM |
 | `.github/workflows/auto-merge.yml` | 全绿 squash（永不只靠 Build） |
 | `scripts/ci-check.mjs` | `node scripts/ci-check.mjs` |

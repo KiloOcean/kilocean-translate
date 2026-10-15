@@ -45,7 +45,7 @@ Chrome / Edge 扩展：用你自己的 DeepSeek 或 Kimi（Moonshot）API Key，
 
 合并前请阅读：
 
-- [Merge gates](docs/MERGE_GATES.md) — codex / Codex Review Gate + conversation resolution + Build；禁止只靠 Build 合入；Copilot 配额耗尽可人工豁免 Copilot
+- [Merge gates](docs/MERGE_GATES.md) — ci / Build & Test + ci / Secret Scan + codex / Codex Review Gate + qa / QA Gate + conversation resolution；禁止只靠 Build 合入；Copilot 配额耗尽可人工豁免 Copilot
 - [Quality](docs/QUALITY.md) — CI / AI review 配置
 - [AI-Native Quality Gate](docs/ai-native-quality-gate.md) — 自测清单
 

@@ -109,7 +109,7 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 
 1. PR 打开、非 draft、base 为 `main`、无 `no-auto-merge` / `skip-codex-gate`
 2. 没有 `no-auto-merge` label
-3. head SHA 上有成功的 **`ci / Build & Test` check run**（fail closed；不用 legacy combined status）
+3. head SHA 上有成功的 **`ci / Build & Test`**、**`ci / Secret Scan`**、**`qa / QA Gate`** check run（`required_checks`；fail closed；不用 legacy combined status）
 4. 相关 check 已完成且未失败（忽略 Custom LLM Review、Auto Merge 自己）。同名 check 只看最新 `created_at`
 5. head 上 **`copilot-pull-request-reviewer`** `conclusion: success`（skipped / neutral → 不合）。**Soft-path：** 官方 check 缺失但 head 已有 Copilot `APPROVED`/`COMMENTED` → 视为满足；仍无 head review → fail-closed
 6. head 上 **`codex / Codex Review Gate`** `conclusion: success`（缺失 / skipped / neutral → 不合）
@@ -174,8 +174,9 @@ GitHub branch protection **没有**严重度 / soft-path 过滤器：
 | 文件 | 角色 |
 |------|------|
 | `.github/workflows/auto-merge.yml` | 自动 squash 判定 |
-| `.github/workflows/ci.yml` | `ci / Build & Test` → `node scripts/ci-check.mjs` |
+| `.github/workflows/ci.yml` | `ci / Build & Test` → `node scripts/ci-check.mjs`；`ci / Secret Scan` → gitleaks |
 | `.github/workflows/codex-gate.yml` | `codex / Codex Review Gate` |
+| `.github/workflows/qa-gate.yml` | `qa / QA Gate`（label `qa-passed`，见 `QA.md`） |
 | `.github/workflows/ai-review.yml` | 请求 Copilot；Custom LLM 可选 |
 | `docs/QUALITY.md` | 本地/CI 质量检查 |
 | `docs/ai-native-quality-gate.md` | 自测清单 + 门禁摘要 |
