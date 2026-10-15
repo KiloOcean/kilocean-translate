@@ -6,21 +6,35 @@ This page is the source of truth for merge policy.
 
 ---
 
+
+## Check names after devflow-gates migration
+
+本仓库的 CI / Codex / QA / Auto Merge 改为调用 `qianhaoq/devflow-gates` 的 reusable workflow（固定到 commit `78cd3bd`）。Check 名变为 `<caller job> / <called job>`，branch protection 与 `auto-merge.yml` 的 `required_checks` 必须使用以下名字：
+
+- `ci / Build & Test`
+- `ci / Secret Scan`
+- `codex / Codex Review Gate`
+- `qa / QA Gate`（label `qa-passed`，见 `QA.md`）
+
+旧的裸名 `Build & Test` / `Codex Review Gate` 在合入后不再产生，若仍为 required 会让所有 PR 永久挂起。
+
+Codex 线程分级（共享实现）：显式 P0/P1 阻断；未标注线程仅在含安全/正确性关键词时阻断，否则按 P2 处理；P2 可回复 `P2: defer — <理由>` 后 Resolve。线程 Resolve 不会触发 Actions：由每 15 分钟的 Gate Refresh 重跑，或 `workflow_dispatch` 填 PR 号。
+
 ## 硬门槛 | Hard gates（不可省略）
 
-自动合入或人工合入进 `main` 时，下列门槛**必须**满足。**禁止**仅凭 `Build & Test` 绿灯合入。
+自动合入或人工合入进 `main` 时，下列门槛**必须**满足。**禁止**仅凭 `ci / Build & Test` 绿灯合入。
 
 | 门槛 | 说明 |
 |------|------|
-| **Build & Test** | `scripts/ci-check.mjs`（manifest / 权限 / 语法 / 静态安全禁令） |
-| **Codex Review Gate** | Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex **P0/P1（或未标注）** 行内线程（纯 P2 不挡） |
+| **ci / Build & Test** | `scripts/ci-check.mjs`（manifest / 权限 / 语法 / 静态安全禁令） |
+| **codex / Codex Review Gate** | Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex **P0/P1（或未标注）** 行内线程（纯 P2 不挡） |
 | **Conversation resolution** | 非 Codex 线程须 resolve；Codex 仅 P0/P1（或未标注）须 resolve（纯 P2 可 open） |
 
 ### Copilot 配额耗尽时 | When Copilot quota is dead
 
 - Copilot review **可以**临时豁免（人工合入）。
 - **仍然禁止**只靠 Build 绿灯合入。
-- **Codex Review Gate + conversation resolution** 仍是硬门槛。
+- **codex / Codex Review Gate + conversation resolution** 仍是硬门槛。
 - Auto-merge：**Soft-path** — 若官方 `copilot-pull-request-reviewer` check 缺失，但 head 已有 Copilot `APPROVED`/`COMMENTED` review，则视为 Copilot 门槛满足；仍无 head review → fail-closed。不要放宽成 "Build only"。
 
 ---
@@ -41,9 +55,9 @@ This page is the source of truth for merge policy.
 | 设置 | 为什么 |
 |------|--------|
 | **Require status checks to pass before merging** | 没有绿勾不能合 |
-| Required check: **`Build & Test`** | CI job 名（`.github/workflows/ci.yml`） |
+| Required check: **`ci / Build & Test`** | CI job 名（`.github/workflows/ci.yml`） |
 | Required check: **`copilot-pull-request-reviewer`** | Copilot 官方审查 check（配额耗尽时可临时人工豁免，见上） |
-| Required check: **`Codex Review Gate`** | **job / check-run 名**（`.github/workflows/codex-gate.yml`），不是 workflow 展示名 |
+| Required check: **`codex / Codex Review Gate`** | **job / check-run 名**（`.github/workflows/codex-gate.yml`），不是 workflow 展示名 |
 | **Require conversation resolution before merging** | 未解决行内线程挡住 Merge（无严重度例外；见下方「原生保护」） |
 
 **Copilot 的 required check 不覆盖 Codex。** Codex（`chatgpt-codex-connector[bot]`）从不注册 `copilot-pull-request-reviewer`。
@@ -54,7 +68,7 @@ This page is the source of truth for merge policy.
 
 ## Codex Review Gate
 
-Codex 只发 issue comment（`<!-- codex-pull-request-review-summary -->`）和行内 threads，**不是**原生 required check。`.github/workflows/codex-gate.yml` 的 **job 名必须是 `Codex Review Gate`**。
+Codex 只发 issue comment（`<!-- codex-pull-request-review-summary -->`）和行内 threads，**不是**原生 required check。`.github/workflows/codex-gate.yml` 的 **job 名必须是 `codex / Codex Review Gate`**。
 
 | 情况 | 结果 |
 |------|------|
@@ -74,12 +88,12 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 - Gate 使用 **`pull_request_target`**（外加 comment / review / dispatch），因此 **workflow YAML 始终来自 base/default 分支**，不受 PR head 篡改。
 - Job **只**跑 `actions/github-script` + GitHub API：**禁止** `actions/checkout` PR head、**禁止**执行任何 PR 控制的 shell/代码。这是安全的：评估输入只有 API 读到的 PR/评论/线程状态，没有密钥、没有 PR 树执行面。
 - **不要**在 Gate 里 checkout PR 代码（那才是经典 RCE）；仅改 trigger 为 `pull_request_target` 且 API-only 是刻意的信任边界。
-- **`pull_request_target` 事件**：job conclusion 把 check 名 `Codex Review Gate` 挂到 PR（branch protection / Auto Merge 认这个）。
+- **`pull_request_target` 事件**：job conclusion 把 check 名 `codex / Codex Review Gate` 挂到 PR（branch protection / Auto Merge 认这个）。
 - **`issue_comment` / `pull_request_review` / `pull_request_review_comment` / `workflow_dispatch`**：仍会跑评估并在 Actions UI 显示 run，但**不会**再往 head SHA 单独 `checks.create`。要刷新 required check：对上一次 **`pull_request_target` 来源**的 Gate job 点 **Re-run**（或再 push / synchronize）。
-- Auto Merge 已监听 `workflow_run`（workflow 名 `Codex Review Gate`）；Gate **不必**自己 dispatch Auto Merge。
+- Auto Merge 已监听 `workflow_run`（workflow 名 `codex / Codex Review Gate`）；Gate **不必**自己 dispatch Auto Merge。
 - **`ai-review.yml`**：`pull_request` 上只请求 Copilot；**不**把 provider API secrets 注入 PR 控制的 job。
 
-点 Resolve 不会自动重跑。清完线程后：Actions 里对 **pull_request_target 来源**的 `Codex Review Gate` 点 **Re-run**（重新挂 check）。Gate 已绿时也可对 Auto Merge 做 `workflow_dispatch`。
+点 Resolve 不会自动重跑。清完线程后：Actions 里对 **pull_request_target 来源**的 `codex / Codex Review Gate` 点 **Re-run**（重新挂 check）。Gate 已绿时也可对 Auto Merge 做 `workflow_dispatch`。
 
 **前置：** org/repo 需安装 ChatGPT Codex connector（或等价 Codex GitHub App）。
 
@@ -91,10 +105,10 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 
 1. PR 打开、非 draft、base 为 `main`、无 `no-auto-merge` / `skip-codex-gate`
 2. 没有 `no-auto-merge` label
-3. head SHA 上有成功的 **`Build & Test` check run**（fail closed；不用 legacy combined status）
+3. head SHA 上有成功的 **`ci / Build & Test` check run**（fail closed；不用 legacy combined status）
 4. 相关 check 已完成且未失败（忽略 Custom LLM Review、Auto Merge 自己）。同名 check 只看最新 `created_at`
 5. head 上 **`copilot-pull-request-reviewer`** `conclusion: success`（skipped / neutral → 不合）。**Soft-path：** 官方 check 缺失但 head 已有 Copilot `APPROVED`/`COMMENTED` → 视为满足；仍无 head review → fail-closed
-6. head 上 **`Codex Review Gate`** `conclusion: success`（缺失 / skipped / neutral → 不合）
+6. head 上 **`codex / Codex Review Gate`** `conclusion: success`（缺失 / skipped / neutral → 不合）
 7. 该 head SHA 上已有 Copilot review，且**不是** `CHANGES_REQUESTED`
    - **`APPROVED` 或 `COMMENTED` 均可。不要求原生 `APPROVED`。**
    - 没有 Copilot review → 不合
@@ -105,7 +119,7 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 
 `workflow_run` 只从 **default branch** 上的工作流定义运行。本文件合入 `main` 之后，后续 PR 才吃到新门槛。
 
-线程 Resolve 后 GitHub **不会**再触发 auto-merge：先 **Re-run** 一次 `pull_request` 来源的 `Codex Review Gate`（刷新 head 上的 required check），或在 Gate 已绿时对 **Auto Merge** 跑 `workflow_dispatch`。
+线程 Resolve 后 GitHub **不会**再触发 auto-merge：先 **Re-run** 一次 `pull_request` 来源的 `codex / Codex Review Gate`（刷新 head 上的 required check），或在 Gate 已绿时对 **Auto Merge** 跑 `workflow_dispatch`。
 
 ---
 
@@ -127,7 +141,7 @@ GitHub branch protection **没有**严重度 / soft-path 过滤器：
 
 ## 评审严重度 | Review severity (P0 / P1 / P2)
 
-合入前 review 意见按严重度分级。**Codex Review Gate 只阻断未解决的 P0/P1（以及未标注严重度的线程；未标注默认按高优先级 fail-closed）**。P2 可保持 open，或回复 rationale 后 Resolve（无需改代码）；P0/P1 必须先改代码再 Resolve。
+合入前 review 意见按严重度分级。**codex / Codex Review Gate 只阻断未解决的 P0/P1（以及未标注严重度的线程；未标注默认按高优先级 fail-closed）**。P2 可保持 open，或回复 rationale 后 Resolve（无需改代码）；P0/P1 必须先改代码再 Resolve。
 
 | 级别 | 含义 | 合入前要求 |
 |------|------|------------|
@@ -156,8 +170,8 @@ GitHub branch protection **没有**严重度 / soft-path 过滤器：
 | 文件 | 角色 |
 |------|------|
 | `.github/workflows/auto-merge.yml` | 自动 squash 判定 |
-| `.github/workflows/ci.yml` | `Build & Test` → `node scripts/ci-check.mjs` |
-| `.github/workflows/codex-gate.yml` | `Codex Review Gate` |
+| `.github/workflows/ci.yml` | `ci / Build & Test` → `node scripts/ci-check.mjs` |
+| `.github/workflows/codex-gate.yml` | `codex / Codex Review Gate` |
 | `.github/workflows/ai-review.yml` | 请求 Copilot；Custom LLM 可选 |
 | `docs/QUALITY.md` | 本地/CI 质量检查 |
 | `docs/ai-native-quality-gate.md` | 自测清单 + 门禁摘要 |

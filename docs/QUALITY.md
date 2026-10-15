@@ -8,9 +8,9 @@
 
 | 检查 | 类型 | 合并要求 | 说明 |
 |------|------|---------|------|
-| **Build & Test** | CI | ✅ 必需 | `node scripts/ci-check.mjs` |
+| **ci / Build & Test** | CI | ✅ 必需 | `node scripts/ci-check.mjs` |
 | **copilot-pull-request-reviewer** | AI check | ✅ 默认必需（配额死可人工豁免；禁止只靠 Build） | 只覆盖 Copilot，**不覆盖 Codex**。check-run `conclusion` 必须是 `success`（不是 review state）。Copilot **review** 可以是 `COMMENTED`，不要求 `APPROVED` |
-| **Codex Review Gate** | AI check | ✅ 硬门槛 | **job 名**必须是 `Codex Review Gate`（不要只认 workflow 展示名） |
+| **codex / Codex Review Gate** | AI check | ✅ 硬门槛 | **job 名**必须是 `codex / Codex Review Gate`（不要只认 workflow 展示名） |
 | **会话已解决** | 讨论 | ✅ 硬门槛 | 未解决的 Copilot / Codex / 人类行内线程挡住合并 |
 | **Custom LLM Review** | AI | ⏭️ 可选 | DeepSeek/OpenAI/xAI（需 API 密钥）；不阻塞合并 |
 
@@ -76,7 +76,7 @@
 
 ## 🔒 必需检查：Build & Test
 
-CI 作业名是 **Build & Test**。个人私有仓库请用**经典 branch protection**（Ruleset 可能显示 Active 但不 enforce），并要求 `copilot-pull-request-reviewer` + `Codex Review Gate` + 会话已解决。见 [`MERGE_GATES.md`](MERGE_GATES.md)。
+CI 作业名是 **ci / Build & Test**。个人私有仓库请用**经典 branch protection**（Ruleset 可能显示 Active 但不 enforce），并要求 `copilot-pull-request-reviewer` + `codex / Codex Review Gate` + 会话已解决。见 [`MERGE_GATES.md`](MERGE_GATES.md)。
 
 | 步骤 | 命令 | 说明 |
 |------|------|------|
@@ -97,9 +97,9 @@ Branch name pattern: main
 ✅ Require status checks to pass before merging
    ✅ Require branches to be up to date
    Required checks:
-     - Build & Test
+     - ci / Build & Test
      - copilot-pull-request-reviewer
-     - Codex Review Gate
+     - codex / Codex Review Gate
 ✅ Require conversation resolution before merging
 ```
 
@@ -107,10 +107,10 @@ Branch name pattern: main
 
 ### 说明
 
-- `Build & Test`、`copilot-pull-request-reviewer`、`Codex Review Gate` 都应设为必需 check
+- `ci / Build & Test`、`copilot-pull-request-reviewer`、`codex / Codex Review Gate` 都应设为必需 check
 - Copilot check **不覆盖** Codex；Codex 靠 `codex-gate.yml` + conversation resolution
 - Custom LLM Review 与 `ai-review.yml` 的 “Copilot Review”（只负责请求审查）不要设为必需
-- auto-merge：**不要求** Copilot 原生 `APPROVED`。head 上必须有 Copilot review 且不是 `CHANGES_REQUESTED`（`APPROVED`/`COMMENTED` 均可），线程必须全部 resolve，且必须有成功的 **Build & Test check run**（没有 check run 不合）。
+- auto-merge：**不要求** Copilot 原生 `APPROVED`。head 上必须有 Copilot review 且不是 `CHANGES_REQUESTED`（`APPROVED`/`COMMENTED` 均可），线程必须全部 resolve，且必须有成功的 **ci / Build & Test check run**（没有 check run 不合）。
 
 ---
 
@@ -155,4 +155,4 @@ node scripts/ci-check.mjs
 
 ### Copilot quota dead
 
-Manual merge still requires Codex Review Gate green + conversation resolution + Build green. Never merge on Build alone.
+Manual merge still requires codex / Codex Review Gate green + conversation resolution + Build green. Never merge on Build alone.

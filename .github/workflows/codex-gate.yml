@@ -31,6 +31,12 @@
 # by the newer event. Schedule runs fall back to a unique run_id group
 # (nothing to cancel).
 
+# PERMISSIONS: GitHub validates the permissions of EVERY job in a called
+# workflow against the calling job's ceiling, even jobs skipped by `if`.
+# The reusable file contains both the evaluator (issues: read) and the
+# refresh job (actions: write), so both caller jobs grant the union. The
+# callee still narrows each job's own token (evaluator stays read-only).
+#
 name: Codex Review Gate
 
 on:
@@ -63,7 +69,12 @@ concurrency:
 jobs:
   codex:
     if: github.event_name != 'schedule'
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@78cd3bdb29b70389fddf6dd061272ee9c7b7fd55  # devflow-gates main @ 78cd3bd (pinned; bump deliberately)
     with:
       wait_minutes: 20
 
@@ -74,5 +85,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@main
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@78cd3bdb29b70389fddf6dd061272ee9c7b7fd55  # devflow-gates main @ 78cd3bd (pinned; bump deliberately)

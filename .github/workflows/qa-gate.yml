@@ -27,6 +27,12 @@
 # by the newer event. Schedule runs fall back to a unique run_id group
 # (nothing to cancel).
 
+# PERMISSIONS: GitHub validates the permissions of EVERY job in a called
+# workflow against the calling job's ceiling, even jobs skipped by `if`.
+# The reusable file contains both the evaluator (pull-requests/issues: write) and the
+# refresh job (actions: write), so both caller jobs grant the union. The
+# callee still narrows each job's own token.
+#
 name: QA Gate
 
 on:
@@ -53,7 +59,12 @@ concurrency:
 jobs:
   qa:
     if: github.event_name != 'schedule'
-    uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@78cd3bdb29b70389fddf6dd061272ee9c7b7fd55  # devflow-gates main @ 78cd3bd (pinned; bump deliberately)
     with:
       qa_label: 'qa-passed'
 
@@ -63,6 +74,7 @@ jobs:
     if: github.event_name == 'schedule'
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
+      issues: write
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@main
+    uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@78cd3bdb29b70389fddf6dd061272ee9c7b7fd55  # devflow-gates main @ 78cd3bd (pinned; bump deliberately)

@@ -1,13 +1,13 @@
 # AI-Native Quality Gate · 质量门禁
 
-CI 绿灯是**必要但不充分**条件。**禁止**仅凭 `Build & Test` 合入。
+CI 绿灯是**必要但不充分**条件。**禁止**仅凭 `ci / Build & Test` 合入。
 
 完整策略：[`MERGE_GATES.md`](MERGE_GATES.md) · [`QUALITY.md`](QUALITY.md) · [`AGENTS.md`](../AGENTS.md)
 
 ## 硬门槛（合并前必须）
 
-1. **Build & Test**（`node scripts/ci-check.mjs`）
-2. **Codex Review Gate**：Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex 行内线程
+1. **ci / Build & Test**（`node scripts/ci-check.mjs`）
+2. **codex / Codex Review Gate**：Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex 行内线程
 3. **Conversation resolution**：所有 review threads 已 resolve
 4. **自测清单**勾选（见下）
 5. **权限克制**：`activeTab` / `scripting` / `storage`；host 仅翻译 API（`api.deepseek.com`，以及可选的 `api.moonshot.cn`）
@@ -35,8 +35,8 @@ CI 绿灯是**必要但不充分**条件。**禁止**仅凭 `Build & Test` 合�
 
 | 文件 | 角色 |
 |------|------|
-| `.github/workflows/ci.yml` | **Build & Test** |
-| `.github/workflows/codex-gate.yml` | **Codex Review Gate** |
+| `.github/workflows/ci.yml` | **ci / Build & Test** |
+| `.github/workflows/codex-gate.yml` | **codex / Codex Review Gate** |
 | `.github/workflows/ai-review.yml` | 请求 Copilot；可选 Custom LLM |
 | `.github/workflows/auto-merge.yml` | 全绿 squash（永不只靠 Build） |
 | `scripts/ci-check.mjs` | `node scripts/ci-check.mjs` |

@@ -54,14 +54,15 @@ concurrency:
 
 jobs:
   auto-merge:
-    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@main
+    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@78cd3bdb29b70389fddf6dd061272ee9c7b7fd55  # devflow-gates main @ 78cd3bd (pinned; bump deliberately)
     with:
       # Exact check-run names = "<caller job name> / <called job name>"
-      # from YOUR ci.yml / codex-gate.yml / qa-gate.yml callers. Add
-      # "ci / Secret Scan" if you also want the secret scan required.
+      # from YOUR ci.yml / codex-gate.yml / qa-gate.yml callers. "ci / Secret Scan"
+      # is required so a red gitleaks run can never be auto-merged.
       required_checks: |
         ci / Build & Test
         codex / Codex Review Gate
+        ci / Secret Scan
         qa / QA Gate
       merge_method: squash
-      require_copilot: false
+      require_copilot: true   # soft-path: official check may be missing; head Copilot review required, CHANGES_REQUESTED vetoes
