@@ -7,10 +7,12 @@ CI 绿灯是**必要但不充分**条件。**禁止**仅凭 `ci / Build & Test` 
 ## 硬门槛（合并前必须）
 
 1. **ci / Build & Test**（`node scripts/ci-check.mjs`）
-2. **codex / Codex Review Gate**：Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex 行内线程
-3. **Conversation resolution**：所有 review threads 已 resolve
-4. **自测清单**勾选（见下）
-5. **权限克制**：`activeTab` / `scripting` / `storage`；host 仅翻译 API（`api.deepseek.com`，以及可选的 `api.moonshot.cn`）
+2. **ci / Secret Scan**：密钥扫描成功
+3. **codex / Codex Review Gate**：Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex **P0/P1（或未标注）** 行内线程（纯 P2 不挡）
+4. **qa / QA Gate**：PR 带 `qa-passed` label（见 `QA.md`）
+5. **Conversation resolution**：阻断性 review threads 已 resolve
+6. **自测清单**勾选（见下）
+7. **权限克制**：`activeTab` / `scripting` / `storage`；host 仅翻译 API（`api.deepseek.com`，以及可选的 `api.moonshot.cn`）
 
 ### Copilot
 

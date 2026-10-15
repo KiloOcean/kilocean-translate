@@ -27,14 +27,16 @@ Codex 线程分级（共享实现）：显式 P0/P1 阻断；未标注线程一�
 | 门槛 | 说明 |
 |------|------|
 | **ci / Build & Test** | `scripts/ci-check.mjs`（manifest / 权限 / 语法 / 静态安全禁令） |
+| **ci / Secret Scan** | 密钥扫描必须成功（缺失或失败均阻断） |
 | **codex / Codex Review Gate** | Summary 覆盖当前 head SHA，且 **0** 个未解决 Codex **P0/P1（或未标注）** 行内线程（纯 P2 不挡） |
+| **qa / QA Gate** | PR 带 `qa-passed` label（见 `QA.md`；每次 push 自动撤销，需重新签核） |
 | **Conversation resolution** | 非 Codex 线程须 resolve；Codex 仅 P0/P1（或未标注）须 resolve（纯 P2 可 open） |
 
 ### Copilot 配额耗尽时 | When Copilot quota is dead
 
 - Copilot review **可以**临时豁免（人工合入）。
 - **仍然禁止**只靠 Build 绿灯合入。
-- **codex / Codex Review Gate + conversation resolution** 仍是硬门槛。
+- **ci / Secret Scan + codex / Codex Review Gate + qa / QA Gate + conversation resolution** 仍是硬门槛。
 - Auto-merge：**Soft-path** — 若官方 `copilot-pull-request-reviewer` check 缺失，但 head 已有 Copilot `APPROVED`/`COMMENTED` review，则视为 Copilot 门槛满足；仍无 head review → fail-closed。不要放宽成 "Build only"。
 
 ---
