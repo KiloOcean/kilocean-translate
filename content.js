@@ -79,7 +79,7 @@
     error: "",
     provider: "deepseek",
     targetLanguage: "zh-CN",
-    model: "deepseek-v4-flash",
+    model: "deepseek-flash",
     displayMode: Utils.DISPLAY_MODES.bilingual
   };
 
@@ -102,7 +102,9 @@
       state.targetLanguage = stored.targetLanguage;
     }
     if (stored.model) {
-      state.model = stored.model;
+      // Map legacy deepseek-v4-flash → deepseek-flash on read; background's
+      // loadSettings persists the rename.
+      state.model = Utils.migrateModelName(stored.model);
     }
     applyDocumentDisplayMode(state.displayMode);
     refreshAllBlockDisplays();
@@ -132,10 +134,10 @@
       if (state.active) {
         deferredRunSettings = {
           ...(deferredRunSettings || {}),
-          model: changes.model.newValue
+          model: Utils.migrateModelName(changes.model.newValue)
         };
       } else {
-        state.model = changes.model.newValue;
+        state.model = Utils.migrateModelName(changes.model.newValue);
       }
     }
     if (changes.provider?.newValue) {
@@ -249,7 +251,7 @@
   async function startTranslation(options) {
     const provider = options.provider === "kimi" ? "kimi" : "deepseek";
     const targetLanguage = options.targetLanguage || "zh-CN";
-    const model = options.model || "deepseek-v4-flash";
+    const model = Utils.migrateModelName(options.model) || "deepseek-flash";
     let displayMode = Utils.normalizeDisplayMode(
       options.displayMode || state.displayMode || Utils.DISPLAY_MODES.bilingual
     );
@@ -986,6 +988,10 @@
 
     const batches = Utils.chunkSegments(segments, 5000, 24);
 
+    // Concurrency cap: at most Utils.MAX_INFLIGHT_TRANSLATE_BATCHES batches
+    // may be in flight. The sequential loop below (one await per batch) keeps
+    // a run at 1, safely under the cap — never parallelize past it or the
+    // provider starts answering with 429s.
     for (const batch of batches) {
       if (runId !== generation) {
         return;
@@ -2578,7 +2584,7 @@
       // Keep selection provider/target/model local — never clobber pinned page-run state.
       const provider = stored.provider === "kimi" ? "kimi" : "deepseek";
       const targetLanguage = stored.targetLanguage || state.targetLanguage;
-      const model = stored.model || state.model;
+      const model = Utils.migrateModelName(stored.model) || state.model;
 
       if (!Utils.isTranslatableText(gesture.text, targetLanguage)) {
         // Range changed to non-translatable text — drop stale dedupe key.

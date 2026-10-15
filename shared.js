@@ -31,6 +31,28 @@
   });
   const FETCH_TIMEOUT_MESSAGE = "请求超时，请检查网络或稍后重试";
 
+  // DeepSeek chat models: the API renamed deepseek-v4-flash → deepseek-flash
+  // (DeepSeek-V4.1-Flash, see selftest/deepseek-connectivity-2026-10-15.md).
+  // Saved settings may still hold the legacy name; migrateModelName maps it
+  // on read so existing users keep their fast-model choice.
+  const DEEPSEEK_MODEL_IDS = Object.freeze(["deepseek-flash", "deepseek-v4-pro"]);
+  const DEEPSEEK_DEFAULT_MODEL = "deepseek-flash";
+  const LEGACY_MODEL_ALIASES = Object.freeze({
+    "deepseek-v4-flash": "deepseek-flash"
+  });
+
+  // Whole-page translation keeps at most this many TRANSLATE_BATCH requests
+  // in flight (content.js sends them sequentially, i.e. one at a time). The
+  // cap exists so any future parallelism cannot stampede the provider into
+  // 429s.
+  const MAX_INFLIGHT_TRANSLATE_BATCHES = 3;
+
+  // Map legacy saved model names (deepseek-v4-flash → deepseek-flash) to
+  // their current IDs; unknown values pass through untouched.
+  function migrateModelName(model) {
+    return LEGACY_MODEL_ALIASES[model] || model;
+  }
+
   // On X (Twitter) hosts the translator only touches tweet bodies and profile
   // bios; sidebar / trends / follow rows / footer chrome must stay untouched.
   const X_TRANSLATABLE_SELECTOR = '[data-testid="tweetText"], [data-testid="UserDescription"]';
@@ -460,6 +482,58 @@
       (error.isTimeout === true || error.code === "FETCH_TIMEOUT");
   }
 
+  // Bounded retry policy for provider requests: 429 / 5xx / timeout get at
+  // most MAX_PROVIDER_RETRIES extra attempts with ~1s / ~3s backoff (±20%
+  // jitter). Other 4xx never change outcome on retry and fail fast. A
+  // Retry-After header (delay-seconds or HTTP date) overrides the backoff.
+  const MAX_PROVIDER_RETRIES = 2;
+  const RETRY_BASE_DELAYS_MS = Object.freeze([1000, 3000]);
+  const RETRY_JITTER_RATIO = 0.2;
+  const RETRY_AFTER_CAP_MS = 10000;
+
+  // True for statuses worth another attempt: rate limiting and server-side
+  // trouble. Client errors (400/401/403/404 …) retry identically and only
+  // re-bill the user, so they must never re-enter the loop.
+  function isRetryableStatus(status) {
+    return status === 429 || (status >= 500 && status <= 599);
+  }
+
+  // Retry-After → milliseconds. Accepts delay-seconds ("2") or an HTTP date;
+  // returns null when absent or unparseable so callers fall back to backoff.
+  // Dates in the past clamp to 0; both forms cap at RETRY_AFTER_CAP_MS so a
+  // huge value cannot pin the worker.
+  function parseRetryAfterMs(headerValue, now = Date.now()) {
+    if (typeof headerValue !== "string" || headerValue.trim() === "") {
+      return null;
+    }
+    const value = headerValue.trim();
+    if (/^\d+$/.test(value)) {
+      return Math.min(Number(value) * 1000, RETRY_AFTER_CAP_MS);
+    }
+    const at = Date.parse(value);
+    if (Number.isNaN(at)) {
+      return null;
+    }
+    return Math.min(Math.max(at - now, 0), RETRY_AFTER_CAP_MS);
+  }
+
+  // Pure delay computation so tests run the retry loop without sleeping.
+  // `attempt` is the 0-based failed attempt: 0 → ~1s before retry 1, 1 → ~3s
+  // before retry 2 (later attempts clamp to the last base). rand injects the
+  // ±20% jitter; a parseable Retry-After is honored exactly, without jitter —
+  // waiting less than the server asked would only earn another 429.
+  function computeRetryDelay(attempt, retryAfterHeader, rand = Math.random, now = Date.now()) {
+    const retryAfterMs = parseRetryAfterMs(retryAfterHeader, now);
+    if (retryAfterMs !== null) {
+      return retryAfterMs;
+    }
+    const base = RETRY_BASE_DELAYS_MS[
+      Math.min(Math.max(attempt, 0), RETRY_BASE_DELAYS_MS.length - 1)
+    ];
+    const jitter = 1 + (rand() * 2 - 1) * RETRY_JITTER_RATIO;
+    return Math.round(base * jitter);
+  }
+
   // fetch() under an AbortController deadline. The signal guards the whole
   // request lifecycle, headers AND body: the returned wrapper keeps the timer
   // armed until text()/json() settles (cleared in finally), so a response
@@ -519,6 +593,16 @@
     X_TRANSLATABLE_SELECTOR,
     FETCH_TIMEOUT_MS,
     FETCH_TIMEOUT_MESSAGE,
+    DEEPSEEK_MODEL_IDS,
+    DEEPSEEK_DEFAULT_MODEL,
+    MAX_INFLIGHT_TRANSLATE_BATCHES,
+    migrateModelName,
+    MAX_PROVIDER_RETRIES,
+    RETRY_BASE_DELAYS_MS,
+    RETRY_AFTER_CAP_MS,
+    isRetryableStatus,
+    parseRetryAfterMs,
+    computeRetryDelay,
     normalizeDisplayMode,
     getTargetLanguageName,
     isTranslatableText,

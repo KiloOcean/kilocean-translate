@@ -1141,6 +1141,477 @@ async function checkFetchTimeoutCoverage() {
   }
 }
 
+// Build a sandboxed instance of background.js's real provider/request code
+// (consts + loadSettings + translateBatch + friendly-error helpers) against
+// an injected chrome.storage stub, so functional tests run the shipping
+// implementation without a service worker.
+function buildBackgroundHarness(utils) {
+  const source = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
+  const headEnd = source.indexOf("/** @type {Map");
+  const busyMatch = source.match(/^const PROVIDER_BUSY_MESSAGE = "(?:[^"\\]|\\.)*";$/m);
+  // Async-aware extractor: extractTopLevelFunction would drop the `async`
+  // modifier on translateBatch and leave its awaits invalid.
+  const extractFn = (name) => {
+    const match = source.match(new RegExp(`(?:async\\s+)?function ${name}\\([\\s\\S]*?\\n\\}`));
+    return match ? match[0] : null;
+  };
+  const fnNames = [
+    "translateBatch",
+    "getFriendlyApiError",
+    "isProviderBusyResponse",
+    "getProviderBusyMessage",
+    "createError"
+  ];
+  const fnBodies = fnNames
+    .map(extractFn)
+    .filter(Boolean);
+  if (headEnd < 0 || !busyMatch || fnBodies.length !== fnNames.length) {
+    return null;
+  }
+
+  return (storageData) => {
+    const chromeStub = {
+      storage: {
+        local: {
+          get: async (defaults) => ({ ...defaults, ...storageData }),
+          set: async (updates) => {
+            Object.assign(storageData, updates);
+          }
+        }
+      }
+    };
+    return new Function(
+      "chrome",
+      "DeepSeekTranslatorUtils",
+      "importScripts",
+      `${busyMatch[0]}\n${source.slice(0, headEnd)}\n${fnBodies.join("\n\n")}\n` +
+        "return { PROVIDERS, DEFAULT_SETTINGS, loadSettings, translateBatch, " +
+        "getFriendlyApiError, isProviderBusyResponse, getProviderBusyMessage, PROVIDER_BUSY_MESSAGE };"
+    )(chromeStub, utils, () => {});
+  };
+}
+
+async function checkModelMigrationAndRetryPolicy() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for model/retry tests: ${error.message}`);
+    return;
+  }
+
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertFalse = (actual, label) => {
+    if (actual !== false) {
+      fail(`${label}: expected false, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertInRange = (actual, min, max, label) => {
+    if (typeof actual !== "number" || actual < min || actual > max) {
+      fail(`${label}: expected a number within [${min}, ${max}], got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // ---- DeepSeek model defaults / options / migration (1.4.3 rename) ----
+  const {
+    DEEPSEEK_MODEL_IDS,
+    DEEPSEEK_DEFAULT_MODEL,
+    migrateModelName,
+    MAX_PROVIDER_RETRIES,
+    RETRY_BASE_DELAYS_MS,
+    computeRetryDelay,
+    isRetryableStatus,
+    MAX_INFLIGHT_TRANSLATE_BATCHES
+  } = utils;
+
+  assertEqual(DEEPSEEK_MODEL_IDS, ["deepseek-flash", "deepseek-v4-pro"], "DeepSeek model options");
+  assertEqual(DEEPSEEK_DEFAULT_MODEL, "deepseek-flash", "DeepSeek default model");
+  assertEqual(migrateModelName("deepseek-v4-flash"), "deepseek-flash", "migrateModelName: legacy flash name");
+  assertEqual(migrateModelName("deepseek-v4-pro"), "deepseek-v4-pro", "migrateModelName: current name passes through");
+  assertEqual(migrateModelName("kimi-k2.6"), "kimi-k2.6", "migrateModelName: non-DeepSeek model passes through");
+  assertEqual(migrateModelName(undefined), undefined, "migrateModelName: missing value passes through");
+
+  // The legacy name may live on only inside shared.js's alias map (comments
+  // documenting the rename are fine — scan code only).
+  const sharedRaw = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
+  if ((stripCommentsForScan(sharedRaw).match(/deepseek-v4-flash/g) || []).length !== 1) {
+    fail("shared.js: deepseek-v4-flash may appear in code only once (the LEGACY_MODEL_ALIASES entry)");
+  }
+  for (const rel of ["background.js", "content.js", "popup.js", "popup.html"]) {
+    const raw = fs.readFileSync(path.join(ROOT, rel), "utf8");
+    if (stripCommentsForScan(raw).includes("deepseek-v4-flash")) {
+      fail(`${rel}: legacy model name deepseek-v4-flash must not appear in code (migrate on read instead)`);
+    }
+  }
+
+  const harness = buildBackgroundHarness(utils);
+  if (!harness) {
+    fail("background.js: cannot build harness for model/retry functional tests");
+    return;
+  }
+
+  // background provider table + defaults mirror shared.js exactly.
+  const emptyHarness = harness({});
+  assertEqual(
+    emptyHarness.PROVIDERS.deepseek.models,
+    ["deepseek-flash", "deepseek-v4-pro"],
+    "background PROVIDERS.deepseek.models"
+  );
+  assertEqual(emptyHarness.PROVIDERS.deepseek.defaultModel, "deepseek-flash", "background PROVIDERS.deepseek.defaultModel");
+  assertEqual(emptyHarness.DEFAULT_SETTINGS.model, "deepseek-flash", "background DEFAULT_SETTINGS.model");
+
+  // loadSettings maps a saved legacy name AND persists the migration.
+  const migratedStorage = {
+    provider: "deepseek",
+    deepseekApiKey: "sk-migration",
+    model: "deepseek-v4-flash",
+    targetLanguage: "zh-CN",
+    displayMode: "bilingual"
+  };
+  const migratedSettings = await harness(migratedStorage).loadSettings();
+  assertEqual(migratedSettings.model, "deepseek-flash", "loadSettings: legacy saved model migrates on read");
+  assertEqual(migratedStorage.model, "deepseek-flash", "loadSettings: migrated model persists to chrome.storage");
+  const stableStorage = { provider: "deepseek", deepseekApiKey: "sk-x", model: "deepseek-v4-pro" };
+  await harness(stableStorage).loadSettings();
+  assertEqual(stableStorage.model, "deepseek-v4-pro", "loadSettings: current model names are not rewritten");
+
+  // popup migrateSettings maps the legacy name on read (persist via _didMigrate save).
+  const popupSource = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
+  const popupHead = popupSource.slice(0, popupSource.indexOf("const elements ="));
+  const popupMigrateSrc = extractTopLevelFunction("popup.js", "migrateSettings");
+  if (!popupHead || !popupMigrateSrc) {
+    fail("popup.js: cannot extract migrateSettings for model-migration test");
+    return;
+  }
+  let popupMigrate;
+  try {
+    popupMigrate = new Function(`${popupHead}\n${popupMigrateSrc}\nreturn migrateSettings;`)();
+  } catch (error) {
+    fail(`popup.js: migrateSettings is not runnable standalone: ${error.message}`);
+    return;
+  }
+  assertEqual(
+    popupMigrate({ model: "deepseek-v4-flash" }).model,
+    "deepseek-flash",
+    "popup migrateSettings: legacy model maps on read"
+  );
+  assertTrue(
+    popupMigrate({ model: "deepseek-v4-flash" })._didMigrate === true,
+    "popup migrateSettings: model migration flags _didMigrate so it persists"
+  );
+  assertEqual(popupMigrate({}).model, "deepseek-flash", "popup migrateSettings: default is deepseek-flash");
+  assertFalse(
+    popupMigrate({ model: "deepseek-v4-pro" })._didMigrate === true,
+    "popup migrateSettings: current model does not flag _didMigrate"
+  );
+
+  // popup.html static options + popup.js PROVIDER_META agree with shared.js.
+  const popupHtml = fs.readFileSync(path.join(ROOT, "popup.html"), "utf8");
+  const htmlValues = [...popupHtml.matchAll(/<option value="(deepseek-[^"]+)">/g)].map((m) => m[1]);
+  assertEqual(htmlValues, ["deepseek-flash", "deepseek-v4-pro"], "popup.html DeepSeek model options");
+  let popupMeta;
+  try {
+    popupMeta = new Function(`${popupHead}\nreturn PROVIDER_META;`)();
+  } catch {
+    popupMeta = null;
+  }
+  if (!popupMeta) {
+    fail("popup.js: cannot extract PROVIDER_META for model-options test");
+    return;
+  }
+  assertEqual(
+    popupMeta.deepseek.models.map((m) => m.value),
+    ["deepseek-flash", "deepseek-v4-pro"],
+    "popup PROVIDER_META.deepseek model values"
+  );
+  assertEqual(popupMeta.deepseek.defaultModel, "deepseek-flash", "popup PROVIDER_META.deepseek.defaultModel");
+
+  // ---- Friendly busy errors (500/502/503 / "too busy" body) ----
+  const h = harness({});
+  const busyDeepseek = `${h.PROVIDER_BUSY_MESSAGE} 状态：https://status.deepseek.com`;
+  assertEqual(
+    h.PROVIDER_BUSY_MESSAGE,
+    "服务商繁忙或故障，请稍后重试，或在设置里切换到另一服务商",
+    "PROVIDER_BUSY_MESSAGE exact text"
+  );
+  assertTrue(h.isProviderBusyResponse(500, ""), "isProviderBusyResponse: 500");
+  assertTrue(h.isProviderBusyResponse(502, ""), "isProviderBusyResponse: 502");
+  assertTrue(h.isProviderBusyResponse(503, ""), "isProviderBusyResponse: 503");
+  assertFalse(h.isProviderBusyResponse(504, ""), "isProviderBusyResponse: 504 is not the busy message");
+  assertFalse(h.isProviderBusyResponse(400, ""), "isProviderBusyResponse: 400 alone");
+  assertTrue(
+    h.isProviderBusyResponse(400, '{"error":{"message":"The server is too busy"}}'),
+    "isProviderBusyResponse: 'too busy' body"
+  );
+  assertTrue(
+    h.isProviderBusyResponse(429, "SERVER IS TOO BUSY"),
+    "isProviderBusyResponse: 'too busy' match is case-insensitive"
+  );
+  assertEqual(h.getProviderBusyMessage("deepseek"), busyDeepseek, "getProviderBusyMessage: DeepSeek appends status link");
+  assertEqual(h.getProviderBusyMessage("kimi"), h.PROVIDER_BUSY_MESSAGE, "getProviderBusyMessage: other providers get no link");
+
+  // Popup must surface the busy message verbatim (toFriendlyPageError pass-through).
+  const friendlySrc = extractTopLevelFunction("popup.js", "toFriendlyPageError");
+  if (!friendlySrc) {
+    fail("popup.js: cannot extract toFriendlyPageError for busy-message test");
+    return;
+  }
+  let toFriendlyPageError;
+  try {
+    toFriendlyPageError = new Function(`${friendlySrc}\nreturn toFriendlyPageError;`)();
+  } catch (error) {
+    fail(`popup.js: toFriendlyPageError is not runnable standalone: ${error.message}`);
+    return;
+  }
+  if (toFriendlyPageError({ message: busyDeepseek }) !== busyDeepseek) {
+    fail("popup.js: toFriendlyPageError must not mangle the provider-busy message");
+  }
+  if (toFriendlyPageError({ message: h.PROVIDER_BUSY_MESSAGE }) !== h.PROVIDER_BUSY_MESSAGE) {
+    fail("popup.js: toFriendlyPageError must not mangle the plain provider-busy message");
+  }
+
+  // ---- Retry policy: isRetryableStatus / computeRetryDelay ----
+  for (const status of [429, 500, 502, 503, 504]) {
+    assertTrue(isRetryableStatus(status), `isRetryableStatus: ${status} retries`);
+  }
+  for (const status of [400, 401, 403, 404]) {
+    assertFalse(isRetryableStatus(status), `isRetryableStatus: ${status} fails fast`);
+  }
+
+  assertEqual(MAX_PROVIDER_RETRIES, 2, "retry policy: max 2 retries");
+  assertEqual(RETRY_BASE_DELAYS_MS, [1000, 3000], "retry policy: backoff bases 1s / 3s");
+  // Jittered ranges: attempt 0 → [800, 1200], attempt 1 → [2400, 3600].
+  assertInRange(computeRetryDelay(0, null, () => 0), 800, 800.001, "computeRetryDelay: attempt 0 min");
+  assertEqual(computeRetryDelay(0, null, () => 0.5), 1000, "computeRetryDelay: attempt 0 mid");
+  assertInRange(computeRetryDelay(0, null, () => 1), 1200, 1200.001, "computeRetryDelay: attempt 0 max");
+  assertInRange(computeRetryDelay(1, null, () => 0), 2400, 2400.001, "computeRetryDelay: attempt 1 min");
+  assertEqual(computeRetryDelay(1, null, () => 0.5), 3000, "computeRetryDelay: attempt 1 mid");
+  assertInRange(computeRetryDelay(1, null, () => 1), 3600, 3600.001, "computeRetryDelay: attempt 1 max");
+  assertEqual(computeRetryDelay(9, null, () => 0.5), 3000, "computeRetryDelay: later attempts clamp to last base");
+  // Retry-After (delay-seconds) is honored exactly, without jitter, capped at 10s.
+  assertEqual(computeRetryDelay(0, "2", () => 1), 2000, "computeRetryDelay: Retry-After seconds honored exactly");
+  assertEqual(computeRetryDelay(0, "30", () => 0), 10000, "computeRetryDelay: Retry-After capped at 10s");
+  // Retry-After as an HTTP date: future deltas honored, past clamped to 0.
+  const nowMs = Date.parse("2026-10-15T00:00:00Z");
+  assertEqual(
+    computeRetryDelay(0, new Date(nowMs + 5000).toUTCString(), () => 1, nowMs),
+    5000,
+    "computeRetryDelay: Retry-After HTTP date honored"
+  );
+  assertEqual(
+    computeRetryDelay(0, new Date(nowMs - 5000).toUTCString(), () => 1, nowMs),
+    0,
+    "computeRetryDelay: past Retry-After date clamps to 0"
+  );
+  assertEqual(
+    computeRetryDelay(0, new Date(nowMs + 60000).toUTCString(), () => 1, nowMs),
+    10000,
+    "computeRetryDelay: Retry-After HTTP date capped at 10s"
+  );
+  // Absent / unparseable header falls back to the jittered backoff.
+  assertEqual(computeRetryDelay(0, "", () => 0.5), 1000, "computeRetryDelay: empty header falls back to backoff");
+  assertEqual(computeRetryDelay(0, "soon", () => 0.5), 1000, "computeRetryDelay: unparseable header falls back to backoff");
+  assertEqual(computeRetryDelay(0, undefined, () => 0.5), 1000, "computeRetryDelay: missing header falls back to backoff");
+
+  // ---- Functional retry loop (real translateBatch, fake fetch, zero sleep) ----
+  const okBody = JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({ translations: ["你好"] }) } }]
+  });
+  const jsonResponse = (status, body, headers = {}) => ({
+    ok: status === 200,
+    status,
+    statusText: "",
+    headers: { get: (name) => headers[String(name).toLowerCase()] ?? null },
+    url: "https://api.deepseek.com/chat/completions",
+    text: async () => body
+  });
+  const hangUntilAbort = (url, options = {}) => new Promise((resolve, reject) => {
+    options.signal?.addEventListener("abort", () => {
+      const abortError = new Error("The operation was aborted");
+      abortError.name = "AbortError";
+      reject(abortError);
+    });
+  });
+
+  const WATCHDOG_MS = 3000;
+  const withWatchdog = (promise, label) => Promise.race([
+    promise,
+    new Promise((resolve) => {
+      setTimeout(() => {
+        fail(`translateBatch functional test (${label}): no settlement within ${WATCHDOG_MS}ms`);
+        resolve(undefined);
+      }, WATCHDOG_MS);
+    })
+  ]);
+
+  const runTranslate = async (label, storage, handlers, timeoutMs = 1000) => {
+    let calls = 0;
+    const delays = [];
+    const queue = [...handlers];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      calls += 1;
+      const handler = queue.length > 1 ? queue.shift() : queue[0];
+      return handler(url, options);
+    };
+    try {
+      const result = await withWatchdog(
+        harness({ ...storage }).translateBatch(
+          ["Hello"],
+          "zh-CN",
+          undefined,
+          undefined,
+          timeoutMs,
+          { sleep: async (ms) => { delays.push(ms); } }
+        ),
+        label
+      );
+      return { ok: true, result, calls, delays };
+    } catch (error) {
+      return { ok: false, error, calls, delays };
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  };
+
+  const deepseekStorage = {
+    provider: "deepseek",
+    deepseekApiKey: "sk-test",
+    kimiApiKey: "sk-kimi",
+    model: "deepseek-flash",
+    targetLanguage: "zh-CN",
+    displayMode: "bilingual"
+  };
+
+  // 503, 503, then success → 3 calls total, success, backoff delays in range.
+  const recovered = await runTranslate(
+    "503x2 then 200",
+    deepseekStorage,
+    [
+      () => jsonResponse(503, '{"error":{"message":"upstream"}}'),
+      () => jsonResponse(503, '{"error":{"message":"upstream"}}'),
+      () => jsonResponse(200, okBody)
+    ]
+  );
+  if (!recovered.ok) {
+    fail(`translateBatch: 503x2 then 200 must succeed, got ${JSON.stringify(recovered.error?.message)}`);
+  } else {
+    assertEqual(recovered.result, ["你好"], "translateBatch: 503x2 then 200 returns translations");
+    assertEqual(recovered.calls, 3, "translateBatch: 503x2 then 200 makes exactly 3 calls");
+    assertEqual(recovered.delays.length, 2, "translateBatch: 503x2 then 200 sleeps twice");
+    assertInRange(recovered.delays[0], 800, 1200, "translateBatch: first backoff delay ~1s ±20%");
+    assertInRange(recovered.delays[1], 2400, 3600, "translateBatch: second backoff delay ~3s ±20%");
+  }
+
+  // 401 fails fast: exactly 1 call, friendly key message, no sleep.
+  const unauthorized = await runTranslate(
+    "401 no retry",
+    deepseekStorage,
+    [() => jsonResponse(401, '{"error":{"message":"bad key"}}')]
+  );
+  if (unauthorized.ok) {
+    fail("translateBatch: 401 must reject");
+  } else {
+    assertEqual(unauthorized.calls, 1, "translateBatch: 401 makes exactly 1 call (never retried)");
+    assertEqual(unauthorized.error.message, "API Key 无效，请检查后重试", "translateBatch: 401 friendly message");
+    assertEqual(unauthorized.delays.length, 0, "translateBatch: 401 never sleeps");
+  }
+
+  // Always 503 (DeepSeek) → 3 calls then the busy message with status link.
+  const alwaysBusy = await runTranslate(
+    "always 503 deepseek",
+    deepseekStorage,
+    [() => jsonResponse(503, '{"error":{"message":"down"}}')]
+  );
+  if (alwaysBusy.ok) {
+    fail("translateBatch: always-503 must reject");
+  } else {
+    assertEqual(alwaysBusy.calls, 3, "translateBatch: always-503 stops after 3 calls (max 2 retries)");
+    assertEqual(alwaysBusy.error.message, busyDeepseek, "translateBatch: always-503 surfaces the DeepSeek busy message with status link");
+  }
+
+  // Always 503 on Kimi → plain busy message, no DeepSeek status link.
+  const kimiBusy = await runTranslate(
+    "always 503 kimi",
+    { ...deepseekStorage, provider: "kimi", model: "kimi-k2.6" },
+    [() => jsonResponse(503, '{"error":{"message":"down"}}')]
+  );
+  if (kimiBusy.ok) {
+    fail("translateBatch: kimi always-503 must reject");
+  } else {
+    assertEqual(kimiBusy.error.message, h.PROVIDER_BUSY_MESSAGE, "translateBatch: kimi busy message carries no DeepSeek status link");
+  }
+
+  // 400 whose body says "too busy" → friendly busy message, no retry.
+  const busyBody = await runTranslate(
+    "400 too-busy body",
+    deepseekStorage,
+    [() => jsonResponse(400, '{"error":{"message":"The server is too busy, retry later"}}')]
+  );
+  if (busyBody.ok) {
+    fail("translateBatch: 400 too-busy must reject");
+  } else {
+    assertEqual(busyBody.calls, 1, "translateBatch: 400 is never retried even when the body says too busy");
+    assertEqual(busyBody.error.message, busyDeepseek, "translateBatch: too-busy body surfaces the busy message");
+  }
+
+  // 429 with Retry-After: 1 → exact 1000ms delay (no jitter), then 503 backoff.
+  const rateLimited = await runTranslate(
+    "429 Retry-After then 200",
+    deepseekStorage,
+    [
+      () => jsonResponse(429, '{"error":{"message":"rate"}}', { "retry-after": "1" }),
+      () => jsonResponse(503, "{}"),
+      () => jsonResponse(200, okBody)
+    ]
+  );
+  if (!rateLimited.ok) {
+    fail(`translateBatch: 429→503→200 must succeed, got ${JSON.stringify(rateLimited.error?.message)}`);
+  } else {
+    assertEqual(rateLimited.calls, 3, "translateBatch: 429→503→200 makes 3 calls");
+    assertEqual(rateLimited.delays[0], 1000, "translateBatch: Retry-After: 1 honored as exactly 1000ms");
+    assertInRange(rateLimited.delays[1], 2400, 3600, "translateBatch: second delay after 503 uses ~3s backoff");
+  }
+
+  // Timeout is retried: first attempt hangs, second succeeds (short deadline).
+  const timedOutThenOk = await runTranslate(
+    "timeout then 200",
+    deepseekStorage,
+    [hangUntilAbort, () => jsonResponse(200, okBody)],
+    25
+  );
+  if (!timedOutThenOk.ok) {
+    fail(`translateBatch: timeout-then-200 must succeed, got ${JSON.stringify(timedOutThenOk.error?.message)}`);
+  } else {
+    assertEqual(timedOutThenOk.calls, 2, "translateBatch: a timed-out attempt is retried once");
+    assertInRange(timedOutThenOk.delays[0], 800, 1200, "translateBatch: timeout retry uses the ~1s backoff");
+  }
+
+  // ---- Whole-page translation concurrency cap ----
+  assertTrue(
+    MAX_INFLIGHT_TRANSLATE_BATCHES <= 3,
+    `concurrency cap: MAX_INFLIGHT_TRANSLATE_BATCHES must be <= 3, got ${JSON.stringify(MAX_INFLIGHT_TRANSLATE_BATCHES)}`
+  );
+  const contentRaw = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
+  const contentScan = stripCommentsForScan(contentRaw);
+  if (/Promise\.all/.test(contentScan)) {
+    fail("content.js: TRANSLATE_BATCH requests must not be fired with Promise.all (unbounded batch concurrency)");
+  }
+  if (!/for \(const batch of batches\) \{[\s\S]{0,400}?await translateBatchWithFallback\(/.test(contentRaw)) {
+    fail("content.js: batch loop must await translateBatchWithFallback sequentially (≤ MAX_INFLIGHT_TRANSLATE_BATCHES in flight)");
+  }
+}
+
 function checkVersionBump() {
   const manifest = readJson("manifest.json");
   if (manifest && manifest.version !== "1.4.2") {
@@ -1269,6 +1740,7 @@ async function main() {
   checkVersionBump();
   checkSpaNavigationAndSelectionStatics();
   await checkFetchTimeoutCoverage();
+  await checkModelMigrationAndRetryPolicy();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -1278,7 +1750,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy");
   process.exit(0);
 }
 

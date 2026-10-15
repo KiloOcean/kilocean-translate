@@ -5,8 +5,10 @@ const PROVIDERS = Object.freeze({
     id: "deepseek",
     label: "DeepSeek",
     apiUrl: "https://api.deepseek.com/chat/completions",
-    models: Object.freeze(["deepseek-v4-flash", "deepseek-v4-pro"]),
-    defaultModel: "deepseek-v4-flash",
+    // Single source of truth lives in shared.js (deepseek-v4-flash was
+    // renamed to deepseek-flash; legacy saved names migrate on read).
+    models: DeepSeekTranslatorUtils.DEEPSEEK_MODEL_IDS,
+    defaultModel: DeepSeekTranslatorUtils.DEEPSEEK_DEFAULT_MODEL,
     keyField: "deepseekApiKey"
   }),
   kimi: Object.freeze({
@@ -27,7 +29,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   // Mirror of the active provider's key: content.js's selection gate still
   // reads this legacy single-key field (and <=1.3.x keys migrate from it).
   apiKey: "",
-  model: "deepseek-v4-flash",
+  model: "deepseek-flash",
   targetLanguage: "zh-CN",
   displayMode: "bilingual"
 });
@@ -54,16 +56,28 @@ async function loadSettings() {
   }
   const activeKey = provider === "kimi" ? kimiApiKey : deepseekApiKey;
   // Keep `apiKey` mirroring the active provider's key (content.js's selection
-  // gate reads it) and persist the migrated DeepSeek key. Write only on drift.
+  // gate reads it), persist the migrated DeepSeek key, and persist the
+  // migrated model name. Write only on drift.
+  const updates = {};
   if (
     String(stored.apiKey || "").trim() !== activeKey ||
     String(stored.deepseekApiKey || "").trim() !== deepseekApiKey
   ) {
-    await chrome.storage.local.set({ deepseekApiKey, apiKey: activeKey });
+    updates.deepseekApiKey = deepseekApiKey;
+    updates.apiKey = activeKey;
   }
   const providerConfig = getProviderConfig(provider);
-  const model = providerConfig.models.includes(stored.model)
-    ? stored.model
+  // deepseek-v4-flash → deepseek-flash rename: map the saved name on read;
+  // persisting it below means the popup can never re-save the legacy value.
+  const storedModel = DeepSeekTranslatorUtils.migrateModelName(stored.model);
+  if (stored.model !== storedModel) {
+    updates.model = storedModel;
+  }
+  if (Object.keys(updates).length > 0) {
+    await chrome.storage.local.set(updates);
+  }
+  const model = providerConfig.models.includes(storedModel)
+    ? storedModel
     : providerConfig.defaultModel;
   return {
     provider,
@@ -306,7 +320,9 @@ async function translateBatch(
   targetLanguage,
   requestedModel,
   pinnedProvider,
-  timeoutMs = DeepSeekTranslatorUtils.FETCH_TIMEOUT_MS.translation
+  timeoutMs = DeepSeekTranslatorUtils.FETCH_TIMEOUT_MS.translation,
+  // Injectable so tests run the retry loop without wall-clock delays.
+  { sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}
 ) {
   if (!Array.isArray(texts) || texts.length === 0 || texts.length > 24) {
     throw createError("翻译批次格式不正确", "INVALID_BATCH");
@@ -320,8 +336,10 @@ async function translateBatch(
     throw createError(`请先在扩展中填写 ${providerConfig.label} API Key`, "MISSING_API_KEY");
   }
 
-  const model = providerConfig.models.includes(requestedModel)
-    ? requestedModel
+  // A stale content script may still send the legacy model name; map it.
+  const requested = DeepSeekTranslatorUtils.migrateModelName(requestedModel);
+  const model = providerConfig.models.includes(requested)
+    ? requested
     : (providerConfig.models.includes(settings.model) ? settings.model : providerConfig.defaultModel);
   const safeTargetLanguage = ALLOWED_TARGET_LANGUAGES.has(targetLanguage)
     ? targetLanguage
@@ -360,30 +378,56 @@ async function translateBatch(
     body.thinking = { type: "disabled" };
   }
 
+  // AbortController deadline per attempt (a hung provider request must fail
+  // with a clear Chinese timeout error instead of pinning the popup at
+  // "正在翻译" forever), plus bounded retry: 429 / 5xx / timeout get a second
+  // and third attempt with backoff (Retry-After honored). Every other 4xx —
+  // and any non-timeout network error — surfaces immediately.
+  const maxAttempts = 1 + DeepSeekTranslatorUtils.MAX_PROVIDER_RETRIES;
   let response;
-  try {
-    // AbortController deadline: a hung provider request must fail with a clear
-    // Chinese timeout error instead of pinning the popup at "正在翻译" forever.
-    response = await DeepSeekTranslatorUtils.fetchWithTimeout(providerConfig.apiUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    }, timeoutMs);
-  } catch (error) {
-    if (DeepSeekTranslatorUtils.isTimeoutError(error)) {
-      // Surface the verbatim timeout message — wrapping it in 无法连接 would
-      // only obscure the cause.
-      throw error;
+  let responseText = "";
+  for (let attempt = 0; ; attempt += 1) {
+    const canRetry = attempt < maxAttempts - 1;
+    try {
+      const attemptResponse = await DeepSeekTranslatorUtils.fetchWithTimeout(providerConfig.apiUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      }, timeoutMs);
+      responseText = await attemptResponse.text();
+      if (
+        attemptResponse.ok ||
+        !canRetry ||
+        !DeepSeekTranslatorUtils.isRetryableStatus(attemptResponse.status)
+      ) {
+        response = attemptResponse;
+        break;
+      }
+      await sleep(DeepSeekTranslatorUtils.computeRetryDelay(
+        attempt,
+        attemptResponse.headers?.get?.("Retry-After")
+      ));
+    } catch (error) {
+      if (DeepSeekTranslatorUtils.isTimeoutError(error)) {
+        if (!canRetry) {
+          // Surface the verbatim timeout message — wrapping it in 无法连接
+          // would only obscure the cause.
+          throw error;
+        }
+        // Timeouts are transient like 5xx: re-arm the same deadline and try
+        // again (no Retry-After exists for an aborted request).
+        await sleep(DeepSeekTranslatorUtils.computeRetryDelay(attempt));
+        continue;
+      }
+      const wrapped = createError(`无法连接 ${providerConfig.label}：${error.message}`, "NETWORK_ERROR");
+      wrapped.canSplit = false;
+      throw wrapped;
     }
-    const wrapped = createError(`无法连接 ${providerConfig.label}：${error.message}`, "NETWORK_ERROR");
-    wrapped.canSplit = false;
-    throw wrapped;
   }
 
-  const responseText = await response.text();
   let data;
   try {
     data = responseText ? JSON.parse(responseText) : {};
@@ -393,7 +437,9 @@ async function translateBatch(
 
   if (!response.ok) {
     const apiMessage = data?.error?.message || `HTTP ${response.status}`;
-    const friendlyMessage = getFriendlyApiError(response.status, apiMessage, providerConfig.label);
+    const friendlyMessage = isProviderBusyResponse(response.status, responseText)
+      ? getProviderBusyMessage(provider)
+      : getFriendlyApiError(response.status, apiMessage, providerConfig.label);
     const apiError = createError(friendlyMessage, `API_${response.status}`);
     apiError.canSplit = response.status === 413;
     throw apiError;
@@ -426,6 +472,24 @@ function getFriendlyApiError(status, apiMessage, providerLabel = "API") {
     return `${providerLabel} 请求过于频繁，请稍后重试`;
   }
   return `${providerLabel} API 请求失败：${apiMessage}`;
+}
+
+// 500/502/503 or a "too busy" body means the provider itself is overloaded
+// (see selftest/deepseek-connectivity-2026-10-15.md) — no key or payload fix
+// applies, so point the user at retrying later or switching providers.
+const PROVIDER_BUSY_MESSAGE = "服务商繁忙或故障，请稍后重试，或在设置里切换到另一服务商";
+
+function isProviderBusyResponse(status, responseText) {
+  if (status === 500 || status === 502 || status === 503) {
+    return true;
+  }
+  return typeof responseText === "string" && responseText.toLowerCase().includes("too busy");
+}
+
+function getProviderBusyMessage(providerId) {
+  return providerId === "deepseek"
+    ? `${PROVIDER_BUSY_MESSAGE} 状态：https://status.deepseek.com`
+    : PROVIDER_BUSY_MESSAGE;
 }
 
 function createError(message, code) {
