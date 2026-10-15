@@ -69,6 +69,92 @@
     return true;
   }
 
+  // High-frequency English function words. Ordinary English prose (tweets,
+  // bios) always carries several of these, while French/German/Spanish
+  // sentences carry none of them (their function words live in the set below).
+  const ENGLISH_STOPWORDS = new Set([
+    "the", "and", "is", "to", "of", "a", "in", "for", "you", "that", "it",
+    "with", "on", "this", "are", "be", "i", "my", "we", "as", "at", "by",
+    "an", "or", "from", "about", "not", "but", "have", "has", "was", "were",
+    "all", "can", "will", "would", "your", "their", "our", "me", "he", "she",
+    "they", "them", "his", "her", "its", "if", "so", "what", "when", "who",
+    "do", "does", "did", "been", "being", "am", "just", "more", "also",
+    "than", "then", "there", "here", "out", "up", "down", "over", "into",
+    "now", "like", "get", "make", "want", "know", "think", "see", "how",
+    "which", "because", "while", "where", "should", "could", "after", "before"
+  ]);
+
+  // Function words of the other big Latin-script languages. A couple of hits
+  // mark the text as not English even when an English-looking word sneaks in
+  // ("die" in German, "son" in Spanish): precision wins over recall, because
+  // wrongly skipping French/German/Spanish would silently drop their
+  // translation, while wrongly translating an English block only echoes it.
+  const NON_ENGLISH_STOPWORDS = new Set([
+    // French
+    "le", "la", "les", "des", "de", "une", "un", "du", "et", "est", "dans",
+    "pour", "que", "qui", "pas", "avec", "sur", "je", "tu", "il", "elle",
+    "nous", "vous", "ils", "mais", "plus", "tout", "très", "aussi", "comme",
+    "être", "avoir", "ce", "cette", "ces", "au", "aux", "ne", "où", "notre",
+    "votre",
+    // German
+    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen", "und",
+    "ist", "sind", "war", "wir", "ihr", "nicht", "mit", "für", "auf", "von",
+    "zu", "bei", "aus", "nach", "auch", "wird", "werden", "hat", "habe",
+    "sich", "oder", "aber", "wenn", "nur", "noch", "schon", "über", "unter",
+    "durch", "um", "im", "als", "ich", "mich", "dich", "euch", "uns",
+    // Spanish
+    "el", "los", "las", "una", "unos", "unas", "en", "del", "es", "son",
+    "por", "con", "pero", "muy", "ya", "sobre", "entre", "cuando", "como",
+    "porque", "más", "yo", "tú", "él", "ella", "usted", "nosotros", "ellos",
+    "si", "esta", "está", "están", "hay", "tiene", "desde", "hasta", "donde",
+    "quien", "fue", "ser", "mis", "sus", "nuestro"
+  ]);
+
+  // Lightweight English detector for Latin-script text: tokenize words, then
+  // score English function words against French/German/Spanish markers and
+  // accented letters. Deliberately conservative — any doubt must resolve to
+  // false so the caller keeps translating: short texts (≤3 words) need at
+  // least one English function word and zero foreign markers, longer texts
+  // need a 0.15 stopword ratio with foreign markers never outvoting English.
+  // Never treat "all Latin script" as English on its own.
+  function looksLikeEnglish(text) {
+    if (typeof text !== "string") {
+      return false;
+    }
+    const words = text.toLowerCase().match(/\p{L}+/gu);
+    if (!words || words.length === 0) {
+      return false;
+    }
+
+    let englishHits = 0;
+    let foreignHits = 0;
+    let nonAsciiWords = 0;
+    for (const word of words) {
+      if (ENGLISH_STOPWORDS.has(word)) {
+        englishHits += 1;
+      }
+      if (NON_ENGLISH_STOPWORDS.has(word)) {
+        foreignHits += 1;
+      }
+      // Tokens are letters only, so any non a-z character is a non-ASCII
+      // letter: café / über / señor / 中文 — strong not-English evidence.
+      if (!/^[a-z]+$/.test(word)) {
+        nonAsciiWords += 1;
+      }
+    }
+
+    if (nonAsciiWords > 0) {
+      return false;
+    }
+    if (foreignHits > 0 && foreignHits >= englishHits) {
+      return false;
+    }
+    if (words.length <= 3) {
+      return englishHits >= 1 && foreignHits === 0;
+    }
+    return englishHits > 0 && englishHits / words.length >= 0.15;
+  }
+
   // True when the text already looks like the run's target language, so
   // translating it again would only duplicate it on screen ("宝玉宝玉").
   // Strict rule: the shortcut applies only when the text carries NO
@@ -78,9 +164,10 @@
   // hold. Digits, punctuation and symbols never vote. A target-script
   // minority inside foreign prose ("한국어 Привет", "かな test",
   // "中文 Привет мир") always fails open to translation: a low ratio alone
-  // must never drop a mixed block. Latin-script targets (en, fr, es, de, …)
-  // never take the shortcut at all — a shared script proves nothing about
-  // the language.
+  // must never drop a mixed block. Latin-script targets never shortcut on
+  // script alone — a shared script proves nothing about the language; only
+  // English gets a word-profile shortcut (looksLikeEnglish), and only when
+  // the profile is confident.
   function isAlreadyTargetLanguage(text, targetLang) {
     if (typeof text !== "string") {
       return false;
@@ -124,9 +211,33 @@
       // Hangul + hanja only; the 0.3 hangul floor drops hanja-only text.
       return hangul + han === letters && hangul / letters >= 0.3;
     }
-    // Latin-script targets (en, fr, es, de, …): a shared script cannot prove
-    // the target language — be conservative and always translate.
+    if (code === "en" || code.startsWith("en-")) {
+      // Latin script alone proves nothing (French/Spanish/German must keep
+      // translating) — only a confident English word profile may skip.
+      return looksLikeEnglish(trimmed);
+    }
+    // Other Latin-script targets (fr, es, de, …): a shared script cannot
+    // prove the target language — be conservative and always translate.
     return false;
+  }
+
+  // True when the provider echoed the source back unchanged: inserting that
+  // as a "translation" would only duplicate the block on screen. Compares
+  // after normalization — trim, collapse whitespace runs, case-fold, strip
+  // trailing punctuation — so "Hello world." vs "hello world" counts as the
+  // same text.
+  function isSameTranslation(source, output) {
+    if (typeof source !== "string" || typeof output !== "string") {
+      return false;
+    }
+    const normalize = (value) => value
+      .toLowerCase()
+      .replace(/\s+/gu, " ")
+      .replace(/[\p{P}\p{S}]+$/gu, "")
+      .trim();
+    const left = normalize(source);
+    const right = normalize(output);
+    return left !== "" && left === right;
   }
 
   // True for page chrome that must never be translated: @handles, bare URLs,
@@ -330,6 +441,8 @@
     getTargetLanguageName,
     isTranslatableText,
     isAlreadyTargetLanguage,
+    looksLikeEnglish,
+    isSameTranslation,
     isSkippableText,
     isXHost,
     preserveWhitespace,

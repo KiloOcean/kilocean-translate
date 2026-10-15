@@ -67,6 +67,8 @@
   let activeRunSettings = null;
   /** @type {{ provider?: string, targetLanguage?: string, model?: string } | null} */
   let deferredRunSettings = null;
+  /** Last seen URL for same-document SPA navigation detection. */
+  let lastSeenUrl = location.href;
 
   const state = {
     active: false,
@@ -84,6 +86,7 @@
   ensureTranslatorStyles();
   applyDocumentDisplayMode(state.displayMode);
   setupSelectionTranslate();
+  setupSpaNavigationWatch();
 
   chrome.storage.local.get({
     displayMode: Utils.DISPLAY_MODES.bilingual,
@@ -418,6 +421,61 @@
     if (!options.silent) {
       showToast("已恢复原文", "info");
     }
+  }
+
+  function setupSpaNavigationWatch() {
+    // X (and other SPAs) navigate via history.pushState without reloading the
+    // document, so this content script stays alive across views. Page script
+    // may patch history methods, so polling location.href is the only signal
+    // we can trust; popstate merely accelerates back/forward detection.
+    window.addEventListener("popstate", () => {
+      checkSpaNavigation();
+    }, true);
+    setInterval(checkSpaNavigation, 500);
+  }
+
+  function checkSpaNavigation() {
+    if (location.href === lastSeenUrl) {
+      return;
+    }
+    lastSeenUrl = location.href;
+    handleSpaNavigation();
+  }
+
+  function handleSpaNavigation() {
+    if (!state.active) {
+      // Fresh documents/tabs start inactive — no auto-translate there. This
+      // handler only continues a session the user started in this tab.
+      return;
+    }
+    // Same-tab in-app navigation: abort the old view's in-flight run. Bumping
+    // the generation marks every late response stale, so aborted segments are
+    // ignored (never counted as failures, never toasted), and detaching the
+    // queue tail means the next run cannot wait on the cancelled chain. The
+    // session itself survives: still-connected blocks keep their translations
+    // and the new view gets translated below, until the user clears/restores.
+    generation += 1;
+    workQueue = Promise.resolve();
+    pendingRoots.clear();
+    pendingRefreshBlocks.clear();
+    failedBlocks.clear();
+    if (dynamicTimer) {
+      clearTimeout(dynamicTimer);
+      dynamicTimer = null;
+    }
+    // Drop records that left the DOM with the old view; route-shared chrome
+    // that is still connected keeps its translation — no re-billing.
+    pruneDetachedBlockRecords();
+    state.translated = blockRecords.size;
+    state.total = blockRecords.size;
+    state.failed = 0;
+    state.error = "";
+    state.phase = "translating";
+    notifyPopupStatus();
+    // Re-discover once the SPA swap settles; the dynamic path reuses the
+    // pinned run settings and every runId race-token check.
+    pendingRoots.add(document.body || document.documentElement);
+    scheduleDynamicTranslation();
   }
 
   function teardownBlockRecord(record) {
@@ -1198,6 +1256,22 @@
       return false;
     }
 
+    // Provider echoed the source back unchanged (text already reads as the
+    // target language): inserting a block would only duplicate it on screen.
+    // Count as skipped — reclaim any failure slot and drop the total slot —
+    // never as a failure.
+    if (Utils.isSameTranslation(segment.text, rendered)) {
+      if (failedBlocks.delete(segment.block)) {
+        if (state.failed > 0) {
+          state.failed -= 1;
+        }
+      }
+      if (state.total > 0) {
+        state.total -= 1;
+      }
+      return true;
+    }
+
     applyBlockTranslation(segment.block, segment.text, rendered, {
       companionOnly: Boolean(segment.companionOnly),
       nested: segment.nested || []
@@ -1957,14 +2031,19 @@
       pruneDetachedBlockRecords();
 
       // X "Show more" expands a recorded tweetText in place: that content
-      // mutation lands in pendingRefreshBlocks, discardBlockRecord below
-      // removes the stale translation block + wraps, and the dynamic pass
-      // re-translates the full text in place. No extra observer needed.
+      // mutation lands in pendingRefreshBlocks, and only a real source-text
+      // change (current text vs. the recorded original) tears the block down
+      // — discardBlockRecord removes the stale companion translation + wraps
+      // and the dynamic pass re-translates the expanded text in place (the
+      // new translation replaces the old block; no duplicate companion).
+      // Equivalent-text churn (SPA re-render of the same words) keeps the
+      // live translation: no teardown, no re-bill. No extra observer needed.
       for (const block of pendingRefreshBlocks) {
-        if (blockRecords.has(block)) {
+        const record = blockRecords.get(block);
+        if (record && block.isConnected && extractBlockText(block) !== record.originalText) {
           discardBlockRecord(block);
         }
-        if (block?.isConnected) {
+        if (block?.isConnected && !blockRecords.has(block)) {
           pendingRoots.add(block);
         }
       }
@@ -2031,7 +2110,7 @@
     base.setAttribute("href", document.baseURI || location.href);
     const generator = document.createElement("meta");
     generator.setAttribute("name", "generator");
-    generator.setAttribute("content", "千浩翻译 · Kilocean Translate 1.3.0");
+    generator.setAttribute("content", "千浩翻译 · Kilocean Translate 1.4.2");
     const source = document.createElement("meta");
     source.setAttribute("name", "deepseek-translator-source");
     source.setAttribute("content", location.href);
@@ -2182,12 +2261,12 @@
     // also run when the host was already removed (dismissed earlier), or a
     // stale key from the previous request dead-ends the next identical drag
     // with 该选中文本已翻译.
-    // ×/Escape still go through hideSelectionPanel with the key retained.
+    // The card itself stays open on a blank-page/outside press: only ×,
+    // Escape, or a new selection replacing it may close it. Billing safety is
+    // unchanged — the popup confirm revalidates the live Selection against
+    // the previewed gesture before anything is billed.
     if (event.isTrusted !== false) {
       lastSelectionKey = "";
-    }
-    if (host) {
-      hideSelectionPanel();
     }
   }
 
@@ -2242,11 +2321,11 @@
       selectionTimer = null;
     }
     if (!gesture) {
-      // Collapsed / empty / oversized at gesture time — clean up synchronously
-      // and never schedule a handler that could bill a selection a page
-      // injects after the delay.
+      // Collapsed / empty / oversized at gesture time — never schedule a
+      // handler that could bill a selection a page injects after the delay.
+      // The card stays open (only ×/Escape/a new selection closes it); just
+      // reset the dedupe key so re-selecting the same range bills again.
       lastSelectionKey = "";
-      hideSelectionPanel();
       return;
     }
     selectionTimer = setTimeout(() => {
@@ -2344,9 +2423,10 @@
 
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-      // Real selection change (collapse / clear) — allow the same words again later.
+      // Real selection change (collapse / clear) — allow the same words again
+      // later. The card stays open per the dismissal rules (×/Escape/new
+      // selection); nothing new is previewed for the collapsed selection.
       lastSelectionKey = "";
-      hideSelectionPanel();
       return;
     }
 
@@ -2358,13 +2438,12 @@
     // trusted gesture: text swapped in by page script during the debounce must
     // never reach the preview (or the later TRANSLATE_BATCH). Any rejection
     // clears the prior key so reselecting a previously translated range is not
-    // silently no-op'd by stale dedupe.
+    // silently no-op'd by stale dedupe. The card itself keeps its last state.
     if (
       selection.toString().replace(/\s+/gu, " ").trim() !== gesture.text ||
       getSelectionRangeIdentity(selection) !== gesture.rangeId
     ) {
       lastSelectionKey = "";
-      hideSelectionPanel();
       return;
     }
 

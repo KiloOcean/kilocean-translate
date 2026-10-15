@@ -786,6 +786,193 @@ function checkXMutationScopeGate() {
   assertTrue(offX(el()), "X mutation scope: non-X host keeps every root queueable");
 }
 
+function checkEnglishProfileDetection() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for English-profile tests: ${error.message}`);
+    return;
+  }
+  const { looksLikeEnglish, isAlreadyTargetLanguage, isSameTranslation } = utils;
+  if (typeof looksLikeEnglish !== "function") {
+    fail("shared.js: looksLikeEnglish export missing");
+    return;
+  }
+  if (typeof isSameTranslation !== "function") {
+    fail("shared.js: isSameTranslation export missing");
+    return;
+  }
+
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertFalse = (actual, label) => {
+    if (actual !== false) {
+      fail(`${label}: expected false, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  // English bio sentences must be detected (target-en duplication fix).
+  assertTrue(looksLikeEnglish("I build tools for the web and write about design."), "looksLikeEnglish: English bio sentence");
+  assertTrue(looksLikeEnglish("Building tools for developers who care about speed and privacy."), "looksLikeEnglish: English bio sentence 2");
+  assertTrue(looksLikeEnglish("We are a small team of makers based in Berlin."), "looksLikeEnglish: English bio sentence 3");
+
+  // French / German / Spanish sentences must never be detected as English —
+  // they have to keep translating for en targets (earlier review P1).
+  assertFalse(looksLikeEnglish("Je m'appelle Marie et j'aime la lecture et la musique."), "looksLikeEnglish: French sentence");
+  assertFalse(looksLikeEnglish("Ich arbeite als Softwareentwickler und trinke gern Kaffee."), "looksLikeEnglish: German sentence");
+  assertFalse(looksLikeEnglish("Me gusta trabajar en proyectos libres y aprender cosas nuevas."), "looksLikeEnglish: Spanish sentence");
+  assertFalse(looksLikeEnglish("Das ist ein deutscher Satz mit vielen Wörtern."), "looksLikeEnglish: accented German sentence");
+  // Short / ambiguous text stays conservative: translate unless clearly English.
+  assertFalse(looksLikeEnglish("Home"), "looksLikeEnglish: single noun without function words");
+  assertFalse(looksLikeEnglish("Hola mundo"), "looksLikeEnglish: short Spanish");
+  assertTrue(looksLikeEnglish("About me"), "looksLikeEnglish: short but clearly English");
+
+  // isAlreadyTargetLanguage en behavior: English profile skips, everything
+  // uncertain translates.
+  assertTrue(
+    isAlreadyTargetLanguage("I build tools for the web and write about design.", "en"),
+    "isAlreadyTargetLanguage: English bio skips for en"
+  );
+  assertTrue(
+    isAlreadyTargetLanguage("Building tools for developers who care about speed and privacy.", "en-US"),
+    "isAlreadyTargetLanguage: English bio skips for en-* code"
+  );
+  assertFalse(
+    isAlreadyTargetLanguage("Je m'appelle Marie et j'aime la lecture et la musique.", "en"),
+    "isAlreadyTargetLanguage: French bio translates for en"
+  );
+  assertFalse(
+    isAlreadyTargetLanguage("Ich arbeite als Softwareentwickler und trinke gern Kaffee.", "en"),
+    "isAlreadyTargetLanguage: German bio translates for en"
+  );
+  assertFalse(
+    isAlreadyTargetLanguage("Me gusta trabajar en proyectos libres y aprender cosas nuevas.", "en"),
+    "isAlreadyTargetLanguage: Spanish bio translates for en"
+  );
+  assertFalse(isAlreadyTargetLanguage("Software engineer", "en"), "isAlreadyTargetLanguage: stopword-less short text stays conservative for en");
+
+  // isSameTranslation: provider echoes must be recognized after normalization.
+  assertTrue(isSameTranslation("Hello world.", "hello world"), "isSameTranslation: case + trailing punctuation");
+  assertTrue(isSameTranslation("Hello   WORLD", "hello world…"), "isSameTranslation: whitespace collapse + ellipsis");
+  assertTrue(isSameTranslation("甲\n\n乙", "甲\n 乙"), "isSameTranslation: newline collapse");
+  assertTrue(isSameTranslation("你好，世界", "你好，世界。"), "isSameTranslation: CJK trailing punctuation");
+  assertFalse(isSameTranslation("Hello", "Bonjour"), "isSameTranslation: different text");
+  assertFalse(isSameTranslation("", ""), "isSameTranslation: empty never counts as same");
+  assertFalse(isSameTranslation("Hello", ""), "isSameTranslation: empty output never counts as same");
+}
+
+function checkVersionBump() {
+  const manifest = readJson("manifest.json");
+  if (manifest && manifest.version !== "1.4.2") {
+    fail(`manifest.version must be 1.4.2 for this release, got ${JSON.stringify(manifest.version)}`);
+  }
+
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  if (!readme.includes("1.4.2")) {
+    fail("README.md: version hint must mention 1.4.2");
+  }
+
+  const content = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
+  if (!content.includes("Kilocean Translate 1.4.2")) {
+    fail("content.js: export generator meta must carry the extension version 1.4.2");
+  }
+}
+
+function checkSpaNavigationAndSelectionStatics() {
+  const raw = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
+  const source = stripCommentsForScan(raw);
+
+  // Selection card persistence: a blank-page/outside press must not dismiss
+  // the card — only ×, Escape, or a new selection replacing it may close it.
+  const mousedownSrc = extractContentFunction("onSelectionMouseDown");
+  if (!mousedownSrc) {
+    fail("content.js: cannot extract onSelectionMouseDown for selection-card test");
+    return;
+  }
+  if (/hideSelectionPanel\s*\(/.test(stripCommentsForScan(mousedownSrc))) {
+    fail("content.js: onSelectionMouseDown must not hide the selection card (only ×/Escape/new selection close it)");
+  }
+  if (!/lastSelectionKey\s*=\s*""/.test(stripCommentsForScan(mousedownSrc))) {
+    fail("content.js: onSelectionMouseDown must still reset lastSelectionKey for fresh gestures");
+  }
+
+  const maybeSrc = extractContentFunction("onSelectionMaybeTranslate");
+  if (!maybeSrc) {
+    fail("content.js: cannot extract onSelectionMaybeTranslate for selection-card test");
+    return;
+  }
+  if (/hideSelectionPanel\s*\(/.test(stripCommentsForScan(maybeSrc))) {
+    fail("content.js: collapsed/empty gesture must keep the selection card open (no hideSelectionPanel in onSelectionMaybeTranslate)");
+  }
+
+  // Dismissal surfaces stay intact: × button and Escape still hide the card.
+  if (!/key === "Escape"[\s\S]{0,120}hideSelectionPanel\(\)/.test(source)) {
+    fail("content.js: Escape must still hide the selection card");
+  }
+  if (!/querySelector\("\.close"\)[\s\S]{0,240}hideSelectionPanel\(\)/.test(source)) {
+    fail("content.js: × close button must still hide the selection card");
+  }
+
+  // SPA URL-change handling exists (polling location.href, popstate assist).
+  const watchSrc = extractContentFunction("setupSpaNavigationWatch");
+  if (!watchSrc) {
+    fail("content.js: setupSpaNavigationWatch missing (SPA URL change detection)");
+    return;
+  }
+  if (!/popstate|setInterval/.test(watchSrc)) {
+    fail("content.js: setupSpaNavigationWatch must poll location.href (optionally assisted by popstate)");
+  }
+  const checkSrc = extractContentFunction("checkSpaNavigation");
+  if (!checkSrc || !/location\.href/.test(checkSrc) || !/handleSpaNavigation\(\)/.test(checkSrc)) {
+    fail("content.js: checkSpaNavigation must compare location.href and route to handleSpaNavigation");
+    return;
+  }
+
+  // Navigating away mid-translation aborts the old run without counting the
+  // aborted requests as failures.
+  const navSrc = extractContentFunction("handleSpaNavigation");
+  if (!navSrc) {
+    fail("content.js: handleSpaNavigation missing (SPA navigation abort + persistence)");
+    return;
+  }
+  for (const needle of ["generation += 1", "workQueue = Promise.resolve()", "scheduleDynamicTranslation"]) {
+    if (!navSrc.includes(needle)) {
+      fail(`content.js: handleSpaNavigation must contain ${needle} (abort old run, keep session translating)`);
+    }
+  }
+  if (!/state\.active/.test(navSrc)) {
+    fail("content.js: handleSpaNavigation must be a no-op for inactive sessions (no auto-translate on fresh tabs/sites)");
+  }
+  const fallbackSrc = stripCommentsForScan(extractContentFunction("translateBatchWithFallback") || "");
+  const staleGuards = (fallbackSrc.match(/runId !== generation/g) || []).length;
+  if (staleGuards < 3) {
+    fail("content.js: translateBatchWithFallback must keep stale-run guards so aborted requests are never counted as failures");
+  }
+
+  // X "Show more": a recorded block whose source text changed must have its
+  // companion translation replaced (discard + re-queue), not duplicated —
+  // and equivalent-text churn must not re-bill.
+  const schedSrc = extractContentFunction("scheduleDynamicTranslation");
+  if (!schedSrc) {
+    fail("content.js: cannot extract scheduleDynamicTranslation for show-more test");
+    return;
+  }
+  if (!/originalText/.test(schedSrc) || !/discardBlockRecord/.test(schedSrc)) {
+    fail("content.js: scheduleDynamicTranslation must compare recorded originalText, then discard + re-queue changed blocks (Show more re-translation)");
+  }
+
+  // Same-translation skip at block insertion (no duplicate block when the
+  // provider echoes the source).
+  if (!/Utils\.isSameTranslation/.test(source)) {
+    fail("content.js: block insertion must skip translations equal to their source via Utils.isSameTranslation");
+  }
+}
+
 function main() {
   console.log("kilocean-translate ci-check");
   console.log(`root: ${ROOT}`);
@@ -803,6 +990,9 @@ function main() {
   checkJoinRawTextNodesNormalize();
   checkXLayoutHeuristics();
   checkXMutationScopeGate();
+  checkEnglishProfileDetection();
+  checkVersionBump();
+  checkSpaNavigationAndSelectionStatics();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -812,7 +1002,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics");
   process.exit(0);
 }
 
