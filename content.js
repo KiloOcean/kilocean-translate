@@ -34,10 +34,16 @@
   // Generic sites keep the full-page behavior.
   const IS_X_HOST = Utils.isXHost(location.hostname);
 
-  /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, wraps: HTMLElement[], companion: HTMLElement, layout: string}>} */
+  /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, wraps: HTMLElement[], companion: HTMLElement, layout: string, nested: Element[]}>} */
   const blockRecords = new Map();
   const pendingRoots = new Set();
   const pendingRefreshBlocks = new Set();
+  // Extension-created original wraps. The data-kilocean-original-wrap
+  // attribute alone is page-settable — any site can plant it on its own
+  // hidden span and step our hidden-content walk over it — so ownership is
+  // recorded here at creation time and only members of this set count as
+  // ours (hasHiddenAncestor bypass, refresh triggers, mutation ownership).
+  const ownedOriginalWraps = new WeakSet();
   /** Blocks holding a failure slot in state.failed — a retry replaces the slot. */
   const failedBlocks = new Set();
 
@@ -1605,8 +1611,9 @@
       if (!textNode?.isConnected || textNode.parentElement == null) {
         continue;
       }
-      if (textNode.parentElement.hasAttribute?.("data-kilocean-original-wrap")) {
-        // Already wrapped by us (e.g. prior pass) — do not adopt page-owned same-class nodes.
+      if (isOwnedOriginalWrap(textNode.parentElement)) {
+        // Already wrapped by us (e.g. prior pass). Page-owned nodes merely
+        // carrying the attribute are not ours and still get wrapped.
         continue;
       }
       if (!/\S/u.test(textNode.data || "")) {
@@ -1615,6 +1622,9 @@
       const wrap = document.createElement(wrapTag === "div" ? "span" : wrapTag);
       wrap.className = "kilocean-original-wrap";
       wrap.setAttribute("data-kilocean-original-wrap", "true");
+      // The attribute stays for the CSS display toggle; real ownership is
+      // the WeakSet — page-planted same-attribute nodes are never ours.
+      ownedOriginalWraps.add(wrap);
       // Not UI-marked: SPA edits to owned original text must still refresh.
       textNode.parentNode.insertBefore(wrap, textNode);
       wrap.appendChild(textNode);
@@ -1898,11 +1908,19 @@
   }
 
   function isOwnedOriginalWrap(el) {
-    return Boolean(el?.hasAttribute?.("data-kilocean-original-wrap"));
+    // Ownership is WeakSet membership, never the attribute: the page can set
+    // data-kilocean-original-wrap on its own nodes (hidden-content bypass),
+    // but only wraps created by wrapTextNodesForToggle ever enter the set.
+    return ownedOriginalWraps.has(el);
   }
 
   function isInsideOriginalWrap(el) {
-    return Boolean(el?.closest?.("[data-kilocean-original-wrap]"));
+    for (let cur = el; cur; cur = cur.parentElement) {
+      if (isOwnedOriginalWrap(cur)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function isExtensionOwnedNode(node) {
@@ -2300,10 +2318,14 @@
       // through our own translation-only display:none wraps, and if the
       // re-render swapped out our owned DOM, repairBlockRecordDom rebuilds
       // it from the cached translation instead of re-requesting.
+      // The comparison must extract exactly the way record.originalText was
+      // captured: excluding record.nested (separately-translated descendant
+      // blocks). Including their text would flag every ancestor-of-translated
+      // block as "source changed" and tear it down for a pointless re-bill.
       for (const block of pendingRefreshBlocks) {
         const record = blockRecords.get(block);
         if (record && block.isConnected) {
-          if (extractBlockText(block) === record.originalText) {
+          if (extractBlockText(block, record.nested || []) === record.originalText) {
             repairBlockRecordDom(record);
             continue;
           }

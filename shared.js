@@ -175,10 +175,13 @@
   // score unambiguous English function words against French/German/Spanish/
   // Italian markers and accented letters. Deliberately conservative — any
   // doubt must resolve to false so the caller keeps translating: any foreign
-  // function word vetoes the shortcut outright, short texts (≤3 words) need
-  // at least two distinct English function words with one of them
-  // unambiguous, longer texts need a 0.15 strong stopword ratio. Never treat
-  // "all Latin script" as English on its own.
+  // function word or accented letter vetoes the shortcut outright, short
+  // texts (< 8 words) need overwhelming evidence (at least three distinct
+  // unambiguous English function words at a high ratio — adding every
+  // Dutch/Afrikaans marker to the foreign list is whack-a-mole, and "Dit is
+  // nie moontlik nie" reads English-ish to any such list), longer texts need
+  // a 0.15 strong stopword ratio. Never treat "all Latin script" as English
+  // on its own.
   function looksLikeEnglish(text) {
     if (typeof text !== "string") {
       return false;
@@ -191,11 +194,9 @@
     let englishHits = 0;
     let foreignHits = 0;
     let nonAsciiWords = 0;
-    const distinctEnglishWords = new Set();
     const distinctUnambiguousWords = new Set();
     for (const word of words) {
       if (ENGLISH_STOPWORDS.has(word)) {
-        distinctEnglishWords.add(word);
         if (!AMBIGUOUS_ENGLISH_STOPWORDS.has(word)) {
           englishHits += 1;
           distinctUnambiguousWords.add(word);
@@ -220,12 +221,18 @@
     if (foreignHits > 0) {
       return false;
     }
-    if (words.length <= 3) {
-      // One English-looking function word proves nothing about a short text:
-      // it may be a shared Romance/English token ("I problemi sociali",
-      // "Me gusta bailar"). Require two distinct English function words, at
-      // least one of them unambiguous.
-      return distinctEnglishWords.size >= 2 && distinctUnambiguousWords.size >= 1;
+    if (words.length < 8) {
+      // Short texts skip only on overwhelming evidence. One or two English
+      // function words prove nothing: the same tokens carry Afrikaans
+      // ("Dit is nie moontlik nie") and Dutch ("Dit is een goed idee")
+      // sentences that no foreign-marker list fully covers. Demand three or
+      // more DISTINCT unambiguous function words at a high ratio; a false
+      // negative merely echoes an English block, a false positive silently
+      // drops a foreign translation.
+      return (
+        distinctUnambiguousWords.size >= 3 &&
+        englishHits / words.length >= 0.4
+      );
     }
     return englishHits > 0 && englishHits / words.length >= 0.15;
   }

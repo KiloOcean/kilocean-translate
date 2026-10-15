@@ -843,7 +843,20 @@ function checkEnglishProfileDetection() {
   // Short / ambiguous text stays conservative: translate unless clearly English.
   assertFalse(looksLikeEnglish("Home"), "looksLikeEnglish: single noun without function words");
   assertFalse(looksLikeEnglish("Hola mundo"), "looksLikeEnglish: short Spanish");
-  assertTrue(looksLikeEnglish("About me"), "looksLikeEnglish: short but clearly English");
+  // Deliberate false negative: "About me" is English but carries only one
+  // unambiguous function word — short text (< 8 words) skips only on
+  // overwhelming evidence (>= 3 distinct unambiguous function words), so it
+  // keeps translating rather than risking a foreign-text skip.
+  assertFalse(looksLikeEnglish("About me"), "looksLikeEnglish: short English without 3 distinct unambiguous words translates (accepted false negative)");
+
+  // Short foreign text that shares English tokens must never be skipped:
+  // Dutch/Afrikaans sentences carry "is" and no listed foreign marker, so
+  // the word-list cannot save us — only the overwhelming-evidence bar can
+  // (P1 review: avoid word-list whack-a-mole).
+  assertFalse(looksLikeEnglish("Dit is nie moontlik nie"), "looksLikeEnglish: 'Dit is nie moontlik nie' is Afrikaans — 'is' alone is not English evidence");
+  assertFalse(looksLikeEnglish("Dit is een goed idee"), "looksLikeEnglish: 'Dit is een goed idee' is Dutch — 'is' alone is not English evidence");
+  assertFalse(looksLikeEnglish("Es una buena idea"), "looksLikeEnglish: 'Es una buena idea' is Spanish — markers veto the skip");
+  assertFalse(looksLikeEnglish("Het is een mooie dag"), "looksLikeEnglish: 'Het is een mooie dag' is Dutch — 'is' alone is not English evidence");
 
   // Ambiguous function words (me/was/on/a/in exist in French/Spanish/German
   // too) must never prove English on their own, and any foreign marker word
@@ -855,11 +868,14 @@ function checkEnglishProfileDetection() {
   assertFalse(looksLikeEnglish("In Berlin"), "looksLikeEnglish: 'In Berlin' — German-preposition 'in' alone is not English evidence");
   assertFalse(looksLikeEnglish("The team is here but die Leute warten"), "looksLikeEnglish: a single foreign marker ('die') vetoes the skip even when English words outnumber it");
   // Normal English keeps skipping: ambiguous words are simply ignored, the
-  // remaining unambiguous hits still carry the sentence.
-  assertTrue(looksLikeEnglish("The movie was great"), "looksLikeEnglish: English with ambiguous 'was' still detected");
+  // remaining unambiguous hits still carry the sentence. Short English needs
+  // the overwhelming bar (>= 3 distinct unambiguous words at a high ratio).
+  assertFalse(looksLikeEnglish("The movie was great"), "looksLikeEnglish: 4-word English without 3 distinct unambiguous words translates (accepted false negative)");
+  assertTrue(looksLikeEnglish("It is what it is"), "looksLikeEnglish: short English with overwhelming evidence still detected");
+  assertTrue(looksLikeEnglish("This is not a test"), "looksLikeEnglish: short English with 3 distinct unambiguous words still detected");
   assertTrue(looksLikeEnglish("I am so happy about this"), "looksLikeEnglish: English with ambiguous 'a'-word context still detected");
   assertTrue(looksLikeEnglish("We are a small team of makers based in Berlin."), "looksLikeEnglish: English bio with ambiguous 'a'/'in' still detected");
-  assertTrue(looksLikeEnglish("Was it good?"), "looksLikeEnglish: short English question with ambiguous 'was' still detected");
+  assertFalse(looksLikeEnglish("Was it good?"), "looksLikeEnglish: 3-word English without 3 distinct unambiguous words translates (accepted false negative)");
 
   // isAlreadyTargetLanguage en behavior: English profile skips, everything
   // uncertain translates.
@@ -886,6 +902,18 @@ function checkEnglishProfileDetection() {
   assertFalse(
     isAlreadyTargetLanguage("I problemi sociali", "en"),
     "isAlreadyTargetLanguage: Italian translates for en (article 'I' is not the pronoun)"
+  );
+  assertFalse(
+    isAlreadyTargetLanguage("Dit is nie moontlik nie", "en"),
+    "isAlreadyTargetLanguage: Afrikaans translates for en (shared 'is' is not English evidence)"
+  );
+  assertFalse(
+    isAlreadyTargetLanguage("Dit is een goed idee", "en"),
+    "isAlreadyTargetLanguage: Dutch translates for en (shared 'is' is not English evidence)"
+  );
+  assertFalse(
+    isAlreadyTargetLanguage("Es una buena idea", "en"),
+    "isAlreadyTargetLanguage: Spanish translates for en"
   );
   assertFalse(isAlreadyTargetLanguage("Software engineer", "en"), "isAlreadyTargetLanguage: stopword-less short text stays conservative for en");
 
@@ -2003,11 +2031,19 @@ async function checkSpaRefreshAndSelectionLifecycle() {
     return;
   }
   let hasHiddenAncestor;
+  // Ownership is the module-level ownedOriginalWraps WeakSet, injected here
+  // exactly like the shipping code reads it: fake wraps must be registered
+  // members, a page-owned same-attribute node must NOT be.
+  const ownedOriginalWraps = new WeakSet();
   try {
     hasHiddenAncestor = new Function(
       "getComputedStyle",
+      "ownedOriginalWraps",
       `${ownedSrc}\n${hiddenSrc}\n${hasHiddenSrc}\nreturn hasHiddenAncestor;`
-    )((el) => ({ display: el.__display, visibility: el.__visibility || "visible" }));
+    )(
+      (el) => ({ display: el.__display, visibility: el.__visibility || "visible" }),
+      ownedOriginalWraps
+    );
   } catch (error) {
     fail(`content.js: hasHiddenAncestor is not runnable standalone: ${error.message}`);
     return;
@@ -2020,6 +2056,15 @@ async function checkSpaRefreshAndSelectionLifecycle() {
     parentElement: { __display: "none", parentElement: null, hasAttribute: () => false },
     hasAttribute: (name) => name === "data-kilocean-original-wrap"
   };
+  // Only extension-created wraps enter the set (wrapTextNodesForToggle does
+  // this at creation); page-owned nodes never do.
+  ownedOriginalWraps.add(wrap);
+  ownedOriginalWraps.add(visibleWrapInHiddenSection);
+  const pageSpoofedHiddenWrap = {
+    __display: "none",
+    parentElement: plain,
+    hasAttribute: (name) => name === "data-kilocean-original-wrap"
+  };
   assertFalse(
     hasHiddenAncestor({ parentElement: wrap }),
     "refresh compare: translation-only hidden original wrap must not blind the text"
@@ -2029,6 +2074,10 @@ async function checkSpaRefreshAndSelectionLifecycle() {
     "refresh compare: page-owned hidden span still hides its text"
   );
   assertTrue(
+    hasHiddenAncestor({ parentElement: pageSpoofedHiddenWrap }),
+    "refresh compare: page-owned hidden span carrying data-kilocean-original-wrap is not ours — its text stays uncollected (no hidden-content bypass)"
+  );
+  assertTrue(
     hasHiddenAncestor({ parentElement: visibleWrapInHiddenSection }),
     "refresh compare: page-hidden ancestor above the wrap still hides its text"
   );
@@ -2036,6 +2085,14 @@ async function checkSpaRefreshAndSelectionLifecycle() {
     hasHiddenAncestor({ parentElement: { __display: "block", parentElement: null, hasAttribute: () => false } }),
     "refresh compare: fully visible chain stays visible"
   );
+  // Ownership must be WeakSet-based, not attribute-based: the shipping code
+  // registers created wraps and checks membership only.
+  if (!/ownedOriginalWraps\.add\(wrap\)/.test(content)) {
+    fail("content.js: wrapTextNodesForToggle must register every created wrap in the ownedOriginalWraps WeakSet");
+  }
+  if (!/ownedOriginalWraps\.has\(el\)/.test(stripCommentsForScan(ownedSrc))) {
+    fail("content.js: isOwnedOriginalWrap must decide ownership via the ownedOriginalWraps WeakSet, not the page-settable attribute");
+  }
 
   // ---- (6b) repairBlockRecordDom rebuilds owned DOM without re-billing ----
   const repairSrc = extractContentFunction("repairBlockRecordDom");
@@ -2206,11 +2263,67 @@ async function checkSpaRefreshAndSelectionLifecycle() {
   }
   const schedOrder = stripCommentsForScan(schedSrc);
   const repairAt = schedOrder.indexOf("repairBlockRecordDom(");
-  const compareAt = schedOrder.indexOf("extractBlockText(block) === record.originalText");
+  // The comparison must extract the way record.originalText was captured:
+  // with record.nested (separately-translated descendants) excluded.
+  const compareAt = schedOrder.indexOf(
+    "extractBlockText(block, record.nested || []) === record.originalText"
+  );
+  const bareCompareAt = schedOrder.indexOf("extractBlockText(block) === record.originalText");
   const discardAt = schedOrder.indexOf("discardBlockRecord(");
   if (repairAt < 0 || compareAt < 0 || discardAt < 0 || compareAt > repairAt || compareAt > discardAt) {
-    fail("content.js: refresh flush must compare extractBlockText to the recorded original first, then repair (unchanged) or discard (changed)");
+    fail("content.js: refresh flush must compare extractBlockText (excluding record.nested) to the recorded original first, then repair (unchanged) or discard (changed)");
   }
+  if (bareCompareAt >= 0) {
+    fail("content.js: refresh flush must not compare the bare-block text — a translated nested descendant would then always look like a source change (teardown + re-bill)");
+  }
+
+  // Functional: an ancestor with direct text plus a translated descendant
+  // must not misdetect a source change. Runs the shipping extractBlockText
+  // with collectRawTextNodes/joinRawTextNodes injected (the standalone
+  // harness has no document); the nested block owns one text node exactly
+  // like a separately-translated descendant record would.
+  const extractBlockSrc = extractContentFunction("extractBlockText");
+  if (!extractBlockSrc) {
+    fail("content.js: cannot extract extractBlockText for refresh-compare test");
+    return;
+  }
+  let extractBlockText;
+  try {
+    extractBlockText = new Function(
+      "collectRawTextNodes",
+      "joinRawTextNodes",
+      `${extractBlockSrc}\nreturn extractBlockText;`
+    )(
+      (block) => block.textNodes,
+      (nodes) => nodes.map((node) => node.data).join(" ").trim()
+    );
+  } catch (error) {
+    fail(`content.js: extractBlockText is not runnable standalone: ${error.message}`);
+    return;
+  }
+  const nestedTextNode = { data: "nested block text" };
+  const nestedBlock = { contains: (node) => node === nestedTextNode };
+  const ancestorBlock = {
+    textNodes: [{ data: "direct ancestor text" }, nestedTextNode]
+  };
+  // Capture path (translateBlocks): the record's originalText excludes nested.
+  const record = {
+    nested: [nestedBlock],
+    originalText: extractBlockText(ancestorBlock, [nestedBlock])
+  };
+  assertEqual(record.originalText, "direct ancestor text", "refresh compare: recorded original excludes the nested descendant's text");
+  // Refresh path (scheduleDynamicTranslation): same extraction shape — the
+  // translated descendant's still-present source does not look like a change.
+  assertTrue(
+    extractBlockText(ancestorBlock, record.nested || []) === record.originalText,
+    "refresh compare: ancestor with direct text + translated descendant is not misdetected as changed"
+  );
+  // The exclusion is what saves it: the bare-block shape (old bug) sweeps in
+  // the descendant's text and would always mismatch the record.
+  assertFalse(
+    extractBlockText(ancestorBlock) === record.originalText,
+    "refresh compare: bare-block extraction sweeps in the nested descendant's text (must not be used for comparison)"
+  );
 
   // ---- (7) Confirmed selection survives a collapse (blank click) ----
   const maybeSrc = stripCommentsForScan(extractContentFunction("onSelectionMaybeTranslate") || "");
