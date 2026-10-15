@@ -486,9 +486,10 @@
       throw error;
     }
 
-    // Inherit ok/status/headers; override the body readers so the deadline
-    // stays armed until the caller finishes consuming the body.
-    const guarded = Object.create(response);
+    // Return a plain snapshot of the headers-phase fields plus guarded body
+    // readers. Never Object.create(response): Response accessors live on the
+    // prototype and demand the native receiver, so reading ok/status/headers
+    // off a proxy throws "Illegal invocation" in Chrome.
     const guardBodyRead = (method) => async function read(...args) {
       try {
         return await response[method](...args);
@@ -501,9 +502,15 @@
         clearTimer();
       }
     };
-    guarded.text = guardBodyRead("text");
-    guarded.json = guardBodyRead("json");
-    return guarded;
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+      url: response.url,
+      text: guardBodyRead("text"),
+      json: guardBodyRead("json")
+    };
   }
 
   return {

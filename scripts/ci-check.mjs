@@ -937,6 +937,9 @@ async function checkFetchTimeoutCoverage() {
   if (!/clearTimeout\(/.test(shared)) {
     fail("shared.js: fetchWithTimeout must clear its abort timer");
   }
+  if (/Object\.create\(\s*response\s*\)/.test(shared)) {
+    fail("shared.js: fetchWithTimeout must not Object.create(response) — native Response getters throw \"Illegal invocation\" when read off a proxy");
+  }
 
   // Static: content.js keeps counting request failures (timeouts included) as
   // state.failed with state.error for popup/toast surfacing — the stale-run
@@ -1064,6 +1067,48 @@ async function checkFetchTimeoutCoverage() {
     const fastBody = await settleOrFail(fast.text(), "fast body must settle");
     if (fastBody !== "{\"translations\":[\"你好\"]}") {
       fail(`fetchWithTimeout: fast response body must pass through the wrapper, got ${JSON.stringify(fastBody)}`);
+    }
+
+    // Regression (1.4.2): wrapping the Response via Object.create(response)
+    // made ok/status/statusText/headers throw "Illegal invocation" in Chrome,
+    // because those getters require the native receiver. The wrapper must
+    // expose plain copied fields and working body readers on a real Response.
+    globalThis.fetch = () => Promise.resolve(
+      new Response(JSON.stringify({ a: 1 }), {
+        status: 201,
+        headers: { "content-type": "application/json" }
+      })
+    );
+    const native = await settleOrFail(
+      fetchWithTimeout("https://api.deepseek.com/chat/completions", {}, 25),
+      "native Response fetch must settle"
+    );
+    if (native.ok !== true) {
+      fail(`fetchWithTimeout: wrapper.ok must mirror the native Response, got ${JSON.stringify(native.ok)}`);
+    }
+    if (native.status !== 201) {
+      fail(`fetchWithTimeout: wrapper.status must mirror the native Response, got ${JSON.stringify(native.status)}`);
+    }
+    if (typeof native.statusText !== "string") {
+      fail(`fetchWithTimeout: wrapper.statusText must be read eagerly without Illegal invocation, got ${String(native.statusText)}`);
+    }
+    const contentType = native.headers?.get?.("Content-Type");
+    if (contentType !== "application/json") {
+      fail(`fetchWithTimeout: wrapper.headers.get must work on the copied Headers, got ${JSON.stringify(contentType)}`);
+    }
+    const nativeJson = await settleOrFail(native.json(), "native json() must settle");
+    if (JSON.stringify(nativeJson) !== JSON.stringify({ a: 1 })) {
+      fail(`fetchWithTimeout: wrapper.json() must parse the native body, got ${JSON.stringify(nativeJson)}`);
+    }
+
+    globalThis.fetch = () => Promise.resolve(new Response("hello native body", { status: 200 }));
+    const nativeText = await settleOrFail(
+      fetchWithTimeout("https://api.deepseek.com/chat/completions", {}, 25),
+      "native text() fetch must settle"
+    );
+    const textResult = await settleOrFail(nativeText.text(), "native text() must settle");
+    if (textResult !== "hello native body") {
+      fail(`fetchWithTimeout: wrapper.text() must read the native body, got ${JSON.stringify(textResult)}`);
     }
   } finally {
     globalThis.fetch = originalFetch;
