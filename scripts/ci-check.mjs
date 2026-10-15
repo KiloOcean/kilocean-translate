@@ -2346,6 +2346,178 @@ async function checkSpaRefreshAndSelectionLifecycle() {
   }
 }
 
+// ---- P1: SPA flush race — 450 ms dynamic debounce vs 500 ms URL poll ----
+// A pushState route swap landing between poll ticks must not let the queued
+// dynamic flush issue requests under the pre-navigation generation (they
+// would stay billed and be re-billed by the poll-time re-discovery). The
+// flush has to reconcile location.href with lastSeenUrl synchronously, route
+// through handleSpaNavigation (generation bump + re-queue from document.body),
+// and stop. popstate/hashchange only accelerate the same check.
+async function checkSpaFlushRaceGuard() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  const watchSrc = extractContentFunction("setupSpaNavigationWatch");
+  const spaUrlSrc = extractContentFunction("spaNavigationUrl");
+  const checkSrc = extractContentFunction("checkSpaNavigation");
+  const schedSrc = extractContentFunction("scheduleDynamicTranslation");
+  if (!watchSrc || !spaUrlSrc || !checkSrc || !schedSrc) {
+    fail("content.js: cannot extract SPA watch/flush functions for flush-race test");
+    return;
+  }
+
+  // Accelerators: popstate AND hashchange both trigger the same URL check
+  // (plain window events — safe from the content-script isolated world).
+  // Comments are stripped first so the check needs the real addEventListener
+  // calls, not a comment mentioning the event names.
+  const watchCode = stripCommentsForScan(watchSrc);
+  if (!/popstate/.test(watchCode) || !/hashchange/.test(watchCode)) {
+    fail("content.js: setupSpaNavigationWatch must listen to popstate and hashchange to accelerate SPA URL detection");
+  }
+
+  // checkSpaNavigation reports whether it handled a navigation so the flush
+  // can tell "reconciled, stop" from "no change, proceed".
+  if (!/return false/.test(checkSrc) || !/return true/.test(checkSrc)) {
+    fail("content.js: checkSpaNavigation must return whether a navigation was handled (flush race guard)");
+  }
+
+  // Static ordering: the URL reconciliation sits inside the timer callback —
+  // after the debounce is armed, before any pruning / refresh processing /
+  // translateBlocks queueing. A check placed at schedule time could not see a
+  // pushState that happens during the 450 ms window.
+  const schedOrder = stripCommentsForScan(schedSrc);
+  const armAt = schedOrder.indexOf("dynamicTimer = setTimeout");
+  const guardAt = schedOrder.indexOf("checkSpaNavigation()");
+  const pruneAt = schedOrder.indexOf("pruneDetachedBlockRecords()");
+  const refreshAt = schedOrder.indexOf("pendingRefreshBlocks");
+  const translateAt = schedOrder.indexOf("translateBlocks(");
+  if (armAt < 0 || guardAt < 0 || pruneAt < 0 || refreshAt < 0 || translateAt < 0 ||
+      guardAt < armAt || pruneAt < guardAt || refreshAt < guardAt || translateAt < guardAt) {
+    fail("content.js: dynamic flush must reconcile the SPA URL (checkSpaNavigation) after arming and before any flush work");
+  }
+
+  // Functional race: the shipping scheduleDynamicTranslation +
+  // spaNavigationUrl + checkSpaNavigation run together; stubs record what the
+  // flush dared to do. handleSpaNavigation mirrors the real handler's
+  // contract (asserted statically in checkSpaNavigationAndSelectionStatics):
+  // bump the generation, drop stale pendingRoots, re-arm discovery from
+  // document.body.
+  const makeHarness = () => {
+    const staleRoot = { id: "stale-root" };
+    const bodyRoot = { id: "body-root" };
+    const fakeBlock = { id: "new-route-block" };
+    let harness;
+    try {
+      harness = new Function(
+        "staleRoot",
+        "bodyRoot",
+        "fakeBlock",
+        `
+        const location = { href: "https://x.com/home" };
+        let lastSeenUrl = location.href;
+        const timers = [];
+        const flushes = [];
+        const navigations = [];
+        const prunes = [];
+        const state = { active: true, phase: "translated" };
+        const pendingRoots = new Set();
+        const pendingRefreshBlocks = new Set();
+        const blockRecords = new Map();
+        let dynamicTimer = null;
+        let generation = 0;
+        let workQueue = Promise.resolve();
+        const setTimeout = (fn) => { timers.push(fn); return timers.length; };
+        const clearTimeout = () => {};
+        const notifyPopupStatus = () => {};
+        const pruneDetachedBlockRecords = () => { prunes.push(1); };
+        const extractBlockText = () => { throw new Error("refresh compare must not run in this harness"); };
+        const repairBlockRecordDom = () => { throw new Error("repair must not run in this harness"); };
+        const discardBlockRecord = () => { throw new Error("discard must not run in this harness"); };
+        const collectBlocks = (root) => (root === staleRoot || root === bodyRoot ? [fakeBlock] : []);
+        const finalizeDynamicPhase = () => {};
+        const translateBlocks = (blocks, runId, isDynamic) => {
+          flushes.push({ blocks, runId, isDynamic });
+          return Promise.resolve();
+        };
+        function handleSpaNavigation() {
+          if (!state.active) {
+            return;
+          }
+          navigations.push(location.href);
+          generation += 1;
+          pendingRoots.clear();
+          pendingRoots.add(bodyRoot);
+          scheduleDynamicTranslation();
+        }
+        ${spaUrlSrc}
+        ${checkSrc}
+        ${schedSrc}
+        return {
+          location,
+          pendingRoots,
+          scheduleDynamicTranslation,
+          fireTimer: async () => {
+            const fn = timers.shift();
+            if (fn) {
+              fn();
+            }
+            // The flush queues translateBlocks on the workQueue promise
+            // chain — let those microtasks settle before asserting.
+            await new Promise((resolve) => setImmediate(resolve));
+          },
+          armedTimers: () => timers.length,
+          flushes,
+          navigations,
+          pruneCount: () => prunes.length,
+          generationNow: () => generation
+        };
+        `
+      )(staleRoot, bodyRoot, fakeBlock);
+    } catch (error) {
+      fail(`content.js: SPA flush-race harness cannot run the shipping functions: ${error.message}`);
+      return null;
+    }
+    return { harness, staleRoot, bodyRoot, fakeBlock };
+  };
+
+  // Race: mutations of the NEW route queue under the old URL, pushState lands
+  // during the 450 ms window (no poll tick yet), then the debounce fires.
+  const raced = makeHarness();
+  if (!raced) {
+    return;
+  }
+  raced.harness.pendingRoots.add(raced.staleRoot);
+  raced.harness.scheduleDynamicTranslation();
+  raced.harness.location.href = "https://x.com/explore";
+  await raced.harness.fireTimer();
+  assertEqual(raced.harness.navigations, ["https://x.com/explore"], "SPA flush race: flush must run the navigation handler synchronously");
+  assertEqual(raced.harness.flushes.length, 0, "SPA flush race: stale flush must not queue translateBlocks under the old generation");
+  assertEqual(raced.harness.pruneCount(), 0, "SPA flush race: stale flush must stop before any of its own work");
+  assertEqual(raced.harness.generationNow(), 1, "SPA flush race: navigation handler must bump the generation");
+  assertEqual(raced.harness.armedTimers(), 1, "SPA flush race: navigation handler must re-arm dynamic discovery");
+  assertEqual([...raced.harness.pendingRoots], [raced.bodyRoot], "SPA flush race: discovery must be re-queued from document.body, dropping stale roots");
+
+  // The re-queued flush runs under the new generation and translates normally.
+  await raced.harness.fireTimer();
+  assertEqual(raced.harness.flushes, [{ blocks: [raced.fakeBlock], runId: 1, isDynamic: true }], "SPA flush race: re-queued flush translates under the new generation");
+  assertEqual(raced.harness.navigations.length, 1, "SPA flush race: unchanged URL must not re-navigate");
+  assertEqual(raced.harness.armedTimers(), 0, "SPA flush race: clean flush leaves no stray debounce");
+
+  // Control: no URL change — the flush proceeds directly, no navigation.
+  const control = makeHarness();
+  if (!control) {
+    return;
+  }
+  control.harness.pendingRoots.add(control.staleRoot);
+  control.harness.scheduleDynamicTranslation();
+  await control.harness.fireTimer();
+  assertEqual(control.harness.flushes, [{ blocks: [control.fakeBlock], runId: 0, isDynamic: true }], "SPA flush control: unchanged URL flushes without navigation");
+  assertEqual(control.harness.navigations.length, 0, "SPA flush control: no navigation recorded");
+}
+
 // ---- P1-1: total deadline budget ----
 async function checkTotalDeadlineBudget() {
   const require = createRequire(import.meta.url);
@@ -3341,6 +3513,15 @@ async function checkPackPathSafety() {
   }
   const { collectExtensionFiles, buildZip, normalizeEntryName } = mod;
 
+  // The output write itself must stay symlink-safe and atomic: an O_EXCL
+  // ("wx") temp file inside dist renamed over the destination — never a
+  // writeFileSync directly on the output path (that would follow a planted
+  // symlink and could leave a half-written zip behind).
+  const packSource = fs.readFileSync(path.join(ROOT, "scripts", "pack.mjs"), "utf8");
+  if (!/"wx"/.test(packSource) || !/renameSync\(/.test(packSource) || /writeFileSync\(\s*outPath/.test(packSource)) {
+    fail("pack safety: output must be written via an O_EXCL temp file + rename (never writeFileSync on the output path)");
+  }
+
   const assertEqual = (actual, expected, label) => {
     if (JSON.stringify(actual) !== JSON.stringify(expected)) {
       fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
@@ -3449,6 +3630,98 @@ async function checkPackPathSafety() {
     );
     if (fs.existsSync(path.join(zipRoot, "dist", "x.zip"))) {
       fail("pack safety: a rejected buildZip must not write its output");
+    }
+
+    // (6) Symlinked OUTPUT FILE: the zip write must replace the link itself
+    // (unlink + rename), never follow it — the victim file outside the root
+    // keeps its bytes, the output ends up a regular file, and no temp litter
+    // stays behind in dist.
+    const outLinkRoot = writeFixture(baseManifest);
+    let outLinkCollected;
+    try {
+      outLinkCollected = collectExtensionFiles(outLinkRoot);
+    } catch (error) {
+      fail(`pack safety: symlinked-output fixture must collect, got ${error.message}`);
+      outLinkCollected = null;
+    }
+    if (outLinkCollected) {
+      const victimStore = fs.mkdtempSync(path.join(os.tmpdir(), "kilocean-pack-victim-"));
+      tempDirs.push(victimStore);
+      const victimFile = path.join(victimStore, "victim.zip");
+      fs.writeFileSync(victimFile, "precious bytes");
+      const outLink = path.join(outLinkRoot, "dist", "fixture.zip");
+      fs.mkdirSync(path.join(outLinkRoot, "dist"));
+      fs.symlinkSync(victimFile, outLink);
+      try {
+        buildZip(outLink, outLinkRoot, outLinkCollected.files);
+      } catch (error) {
+        fail(`pack safety: symlinked output file must be replaced (unlink + rename), got: ${error.message}`);
+      }
+      if (fs.readFileSync(victimFile, "utf8") !== "precious bytes") {
+        fail("pack safety: buildZip must never write through a symlinked output file");
+      }
+      const outStat = fs.lstatSync(outLink, { throwIfNoEntry: false });
+      if (!outStat || !outStat.isFile()) {
+        fail("pack safety: buildZip output must be a regular file after replacing the symlink");
+      }
+      const { listZipEntries } = mod;
+      try {
+        const names = listZipEntries(outLink).map((entry) => entry.name).sort();
+        if (JSON.stringify(names) !== JSON.stringify([...outLinkCollected.files].sort())) {
+          fail("pack safety: zip written over a replaced symlink must still carry the full ship list");
+        }
+      } catch (error) {
+        fail(`pack safety: zip written over a replaced symlink must be a valid container: ${error.message}`);
+      }
+      const litter = fs.readdirSync(path.join(outLinkRoot, "dist")).filter((name) => name !== "fixture.zip");
+      if (litter.length > 0) {
+        fail(`pack safety: atomic write must leave no temp files in dist, found: ${litter.join(", ")}`);
+      }
+    }
+
+    // (7) Symlinked DIST DIR: refused by lstat even when the link points back
+    // inside the root, and refused by realpath containment when it points
+    // outside — nothing may ever be written through the link.
+    const distInsideRoot = writeFixture(baseManifest);
+    let distInsideCollected;
+    try {
+      distInsideCollected = collectExtensionFiles(distInsideRoot);
+    } catch (error) {
+      fail(`pack safety: symlinked-dist fixture must collect, got ${error.message}`);
+      distInsideCollected = null;
+    }
+    if (distInsideCollected) {
+      const insideTarget = path.join(distInsideRoot, "real-dist");
+      fs.mkdirSync(insideTarget);
+      fs.symlinkSync(insideTarget, path.join(distInsideRoot, "dist"));
+      assertRejects(
+        () => buildZip(path.join(distInsideRoot, "dist", "x.zip"), distInsideRoot, distInsideCollected.files),
+        "pack safety: symlinked dist dir must be refused even when it points inside the root"
+      );
+      if (fs.readdirSync(insideTarget).length > 0) {
+        fail("pack safety: nothing may be written through a symlinked dist dir");
+      }
+    }
+
+    const distEscapeRoot = writeFixture(baseManifest);
+    let distEscapeCollected;
+    try {
+      distEscapeCollected = collectExtensionFiles(distEscapeRoot);
+    } catch (error) {
+      fail(`pack safety: dist-escape fixture must collect, got ${error.message}`);
+      distEscapeCollected = null;
+    }
+    if (distEscapeCollected) {
+      const escapeStore = fs.mkdtempSync(path.join(os.tmpdir(), "kilocean-pack-escape-"));
+      tempDirs.push(escapeStore);
+      fs.symlinkSync(escapeStore, path.join(distEscapeRoot, "dist"));
+      assertRejects(
+        () => buildZip(path.join(distEscapeRoot, "dist", "x.zip"), distEscapeRoot, distEscapeCollected.files),
+        "pack safety: dist dir resolving outside the root must be refused"
+      );
+      if (fs.readdirSync(escapeStore).length > 0) {
+        fail("pack safety: nothing may be written through a dist dir that resolves outside the root");
+      }
     }
   } finally {
     for (const dir of tempDirs) {
@@ -3588,6 +3861,7 @@ async function main() {
   await checkModelMigrationAndRetryPolicy();
   await checkInflightCapAndRunCancellation();
   await checkSpaRefreshAndSelectionLifecycle();
+  await checkSpaFlushRaceGuard();
   await checkTotalDeadlineBudget();
   await checkTabConcurrencyAndNavigationCancel();
   checkTranslationReuseCache();
@@ -3602,7 +3876,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, inflight cap + run cancellation, SPA refresh + selection lifecycle, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
   process.exit(0);
 }
 

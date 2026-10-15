@@ -362,9 +362,77 @@ export function buildZip(outPath, rootDir, files, when = new Date()) {
   eocd.writeUInt32LE(offset, 16);
   eocd.writeUInt16LE(0, 20); // comment len
 
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  fs.writeFileSync(outPath, Buffer.concat([...parts, centralBuf, eocd]));
+  writeZipSafely(outPath, rootDir, Buffer.concat([...parts, centralBuf, eocd]));
   return entries.map((entry) => entry.nameBuf.toString("utf8"));
+}
+
+// The dist directory must be a real directory inside the root (never a
+// symlink — a swapped link could aim the output anywhere), a pre-existing
+// output file must be a regular file (a symlink is unlinked, never followed,
+// so the write cannot clobber whatever it points at), and the payload only
+// ever lands via an O_EXCL temp file + rename, so a crash cannot leave a
+// half-written zip in dist.
+export function writeZipSafely(outPath, rootDir, data) {
+  const distDir = path.dirname(outPath);
+  fs.mkdirSync(distDir, { recursive: true });
+
+  let distStat;
+  try {
+    distStat = fs.lstatSync(distDir);
+  } catch (error) {
+    throw new Error(`pack: cannot stat output directory ${distDir}: ${error.message}`);
+  }
+  if (distStat.isSymbolicLink()) {
+    throw new Error(`pack: output directory must not be a symlink: ${distDir}`);
+  }
+  if (!distStat.isDirectory()) {
+    throw new Error(`pack: output path's parent is not a directory: ${distDir}`);
+  }
+  const rootReal = fs.realpathSync(rootDir);
+  const distReal = fs.realpathSync(distDir);
+  if (distReal !== rootReal && !distReal.startsWith(rootReal + path.sep)) {
+    throw new Error(`pack: output directory resolves outside the extension root: ${distDir}`);
+  }
+
+  const tempPath = path.join(
+    distDir,
+    `.${path.basename(outPath)}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  );
+  try {
+    // "wx" (O_EXCL): create-or-fail, so a plant at tempPath can never be
+    // followed or overwritten — same trick assertSafeRealFile plays on reads.
+    const fd = fs.openSync(tempPath, "wx");
+    try {
+      fs.writeFileSync(fd, data);
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    let outStat = null;
+    try {
+      outStat = fs.lstatSync(outPath);
+    } catch {
+      // No destination yet — rename will create it.
+    }
+    if (outStat) {
+      if (outStat.isSymbolicLink()) {
+        // Replace the link itself; rename() would too, but unlinking first
+        // makes "never follow" explicit and keeps the lstat/rename window
+        // free of link targets entirely.
+        fs.unlinkSync(outPath);
+      } else if (!outStat.isFile()) {
+        throw new Error(`pack: output path exists and is not a regular file: ${outPath}`);
+      }
+    }
+    fs.renameSync(tempPath, outPath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // Temp file never got created, or the rename already consumed it.
+    }
+    throw error;
+  }
 }
 
 /** Parse a zip's central directory (for verification). */

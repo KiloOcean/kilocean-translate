@@ -465,8 +465,14 @@
     // X (and other SPAs) navigate via history.pushState without reloading the
     // document, so this content script stays alive across views. Page script
     // may patch history methods, so polling location.href is the only signal
-    // we can trust; popstate merely accelerates back/forward detection.
+    // we can trust; popstate/hashchange merely accelerate detection of the
+    // navigations that do fire an event. Both are plain window events, safe
+    // to hear from the content-script isolated world; pushState itself fires
+    // nothing observable without page-script injection, which we never do.
     window.addEventListener("popstate", () => {
+      checkSpaNavigation();
+    }, true);
+    window.addEventListener("hashchange", () => {
       checkSpaNavigation();
     }, true);
     setInterval(checkSpaNavigation, 500);
@@ -481,12 +487,14 @@
     return hashAt === -1 ? value : value.slice(0, hashAt);
   }
 
+  /** @returns {boolean} true when a navigation was detected and handled. */
   function checkSpaNavigation() {
     if (spaNavigationUrl(location.href) === spaNavigationUrl(lastSeenUrl)) {
-      return;
+      return false;
     }
     lastSeenUrl = location.href;
     handleSpaNavigation();
+    return true;
   }
 
   function handleSpaNavigation() {
@@ -2305,6 +2313,18 @@
     }
     dynamicTimer = setTimeout(() => {
       dynamicTimer = null;
+      // The 450 ms debounce can land between the 500 ms SPA poll ticks:
+      // right after a pushState route swap, the new view's queued mutations
+      // would flush under the pre-navigation generation — those requests stay
+      // billed even after the poll catches up, bumps the generation and
+      // re-discovers the same content. Reconcile the URL synchronously before
+      // this flush can issue anything; when a navigation was handled,
+      // handleSpaNavigation has already bumped the generation, dropped the
+      // stale pendingRoots and re-armed discovery from document.body, so this
+      // flush must simply stop and let the re-queued one run.
+      if (checkSpaNavigation()) {
+        return;
+      }
       pruneDetachedBlockRecords();
 
       // X "Show more" expands a recorded tweetText in place: that content
