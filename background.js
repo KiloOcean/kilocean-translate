@@ -144,7 +144,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "TEST_CONNECTION") {
-    translateBatch(["Hello, world."], message.targetLanguage, message.model, message.provider)
+    // Shorter deadline so a hanging endpoint fails the connection test fast.
+    translateBatch(
+      ["Hello, world."],
+      message.targetLanguage,
+      message.model,
+      message.provider,
+      DeepSeekTranslatorUtils.FETCH_TIMEOUT_MS.connectionTest
+    )
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({
         ok: false,
@@ -294,7 +301,13 @@ async function setSelectionBadge(tabId, active) {
   }
 }
 
-async function translateBatch(texts, targetLanguage, requestedModel, pinnedProvider) {
+async function translateBatch(
+  texts,
+  targetLanguage,
+  requestedModel,
+  pinnedProvider,
+  timeoutMs = DeepSeekTranslatorUtils.FETCH_TIMEOUT_MS.translation
+) {
   if (!Array.isArray(texts) || texts.length === 0 || texts.length > 24) {
     throw createError("翻译批次格式不正确", "INVALID_BATCH");
   }
@@ -349,15 +362,22 @@ async function translateBatch(texts, targetLanguage, requestedModel, pinnedProvi
 
   let response;
   try {
-    response = await fetch(providerConfig.apiUrl, {
+    // AbortController deadline: a hung provider request must fail with a clear
+    // Chinese timeout error instead of pinning the popup at "正在翻译" forever.
+    response = await DeepSeekTranslatorUtils.fetchWithTimeout(providerConfig.apiUrl, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify(body)
-    });
+    }, timeoutMs);
   } catch (error) {
+    if (DeepSeekTranslatorUtils.isTimeoutError(error)) {
+      // Surface the verbatim timeout message — wrapping it in 无法连接 would
+      // only obscure the cause.
+      throw error;
+    }
     const wrapped = createError(`无法连接 ${providerConfig.label}：${error.message}`, "NETWORK_ERROR");
     wrapped.canSplit = false;
     throw wrapped;

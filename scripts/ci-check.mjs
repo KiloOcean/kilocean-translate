@@ -866,6 +866,236 @@ function checkEnglishProfileDetection() {
   assertFalse(isSameTranslation("Hello", ""), "isSameTranslation: empty output never counts as same");
 }
 
+function extractTopLevelFunction(fileRel, name) {
+  // Pull a top-level (column 0) function body out of a classic script
+  // (popup.js) so unit tests run the shipping implementation without exports.
+  const source = fs.readFileSync(path.join(ROOT, fileRel), "utf8");
+  const match = source.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n\\}`));
+  return match ? match[0] : null;
+}
+
+async function checkFetchTimeoutCoverage() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for fetch timeout tests: ${error.message}`);
+    return;
+  }
+
+  const { fetchWithTimeout, isTimeoutError, FETCH_TIMEOUT_MS, FETCH_TIMEOUT_MESSAGE } = utils;
+  if (typeof fetchWithTimeout !== "function") {
+    fail("shared.js: fetchWithTimeout export missing");
+    return;
+  }
+  if (typeof isTimeoutError !== "function") {
+    fail("shared.js: isTimeoutError export missing");
+    return;
+  }
+
+  // Deadline constants: 30s translation batches (incl. selection), 15s test.
+  if (FETCH_TIMEOUT_MS?.translation !== 30000) {
+    fail(`fetch timeout: translation deadline must be 30000ms, got ${JSON.stringify(FETCH_TIMEOUT_MS?.translation)}`);
+  }
+  if (FETCH_TIMEOUT_MS?.connectionTest !== 15000) {
+    fail(`fetch timeout: connection test deadline must be 15000ms, got ${JSON.stringify(FETCH_TIMEOUT_MS?.connectionTest)}`);
+  }
+  if (FETCH_TIMEOUT_MESSAGE !== "请求超时，请检查网络或稍后重试") {
+    fail(`fetch timeout: user-facing message must be the exact Chinese timeout hint, got ${JSON.stringify(FETCH_TIMEOUT_MESSAGE)}`);
+  }
+  if (isTimeoutError(new Error("fetch failed")) || isTimeoutError(null)) {
+    fail("isTimeoutError: ordinary errors must not be classified as timeouts");
+  }
+
+  // Static: every provider fetch in background.js routes through the timeout
+  // helper — no bare fetch( call may remain.
+  const background = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"));
+  const bareFetches = background.match(/(?<![\w.$])fetch\s*\(/g) || [];
+  if (bareFetches.length > 0) {
+    fail(`background.js: every provider fetch must go through DeepSeekTranslatorUtils.fetchWithTimeout (found ${bareFetches.length} bare fetch call)`);
+  }
+  if (!/fetchWithTimeout\s*\(/.test(background)) {
+    fail("background.js: provider fetch must call DeepSeekTranslatorUtils.fetchWithTimeout");
+  }
+  if (!/isTimeoutError\s*\(/.test(background)) {
+    fail("background.js: fetch error path must rethrow timeout errors verbatim via DeepSeekTranslatorUtils.isTimeoutError");
+  }
+  if (!/FETCH_TIMEOUT_MS\.connectionTest/.test(background)) {
+    fail("background.js: TEST_CONNECTION must pass the 15s connection-test deadline into translateBatch");
+  }
+  if (!/FETCH_TIMEOUT_MS\.translation/.test(background)) {
+    fail("background.js: translateBatch must default to the 30s translation deadline");
+  }
+
+  // Static: the helper's own fetch carries the abort signal and clears its
+  // timer when the request settles.
+  const shared = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "shared.js"), "utf8"));
+  if (!/signal\s*:\s*controller\.signal/.test(shared)) {
+    fail("shared.js: fetchWithTimeout must pass controller.signal into fetch");
+  }
+  if (!/clearTimeout\(/.test(shared)) {
+    fail("shared.js: fetchWithTimeout must clear its abort timer");
+  }
+
+  // Static: content.js keeps counting request failures (timeouts included) as
+  // state.failed with state.error for popup/toast surfacing — the stale-run
+  // (SPA navigation) ignore must stay the only swallow path.
+  const content = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "content.js"), "utf8"));
+  if (!content.includes('new Error(response?.error || "翻译请求失败")')) {
+    fail("content.js: TRANSLATE_BATCH error responses must propagate response.error so timeout messages reach state.error");
+  }
+  if (!/state\.error\s*=\s*error\.message/.test(content)) {
+    fail("content.js: request failures must be recorded in state.error for popup/toast surfacing");
+  }
+
+  // Functional: a hanging provider fetch must abort after the deadline and
+  // reject with the exact Chinese timeout message.
+  // Node exits 0 when the event loop drains even with a pending promise, so a
+  // helper whose abort path is broken would hang this check into a false
+  // pass — race every functional await against a wall-clock watchdog.
+  const originalFetch = globalThis.fetch;
+  const WATCHDOG_MS = 2000;
+  const settleOrFail = (promise, label) => {
+    let settled = false;
+    let watchdog = null;
+    const guarded = promise.finally(() => {
+      settled = true;
+      if (watchdog !== null) {
+        clearTimeout(watchdog);
+      }
+    });
+    return Promise.race([
+      guarded,
+      new Promise((resolve) => {
+        watchdog = setTimeout(() => {
+          if (!settled) {
+            fail(`fetchWithTimeout: ${label} — no settlement within ${WATCHDOG_MS}ms (abort path broken?)`);
+          }
+          resolve(undefined);
+        }, WATCHDOG_MS);
+      })
+    ]);
+  };
+  const hangOnSignal = (signal) => new Promise((resolve, reject) => {
+    signal?.addEventListener("abort", () => {
+      const abortError = new Error("The operation was aborted");
+      abortError.name = "AbortError";
+      reject(abortError);
+    });
+  });
+  try {
+    globalThis.fetch = (url, options = {}) => hangOnSignal(options.signal);
+    let hungRejected = false;
+    try {
+      await settleOrFail(
+        fetchWithTimeout("https://api.deepseek.com/chat/completions", { method: "POST" }, 25),
+        "hanging fetch must settle"
+      );
+    } catch (error) {
+      hungRejected = true;
+      if (error.message !== FETCH_TIMEOUT_MESSAGE) {
+        fail(`fetchWithTimeout: hanging fetch must reject with the Chinese timeout message, got ${JSON.stringify(error.message)}`);
+      }
+      if (!isTimeoutError(error)) {
+        fail("fetchWithTimeout: hanging fetch must reject with an error isTimeoutError recognizes");
+      }
+      if (error.canSplit !== false) {
+        fail("fetchWithTimeout: timeout errors must keep canSplit false (bisecting would re-bill a hung endpoint)");
+      }
+    }
+    if (!hungRejected) {
+      fail("fetchWithTimeout: hanging fetch must reject after the deadline instead of pending forever");
+    }
+
+    // Ordinary network errors pass through unwrapped for caller-side handling.
+    const networkError = new TypeError("fetch failed");
+    globalThis.fetch = () => Promise.reject(networkError);
+    try {
+      await settleOrFail(
+        fetchWithTimeout("https://api.deepseek.com/chat/completions", {}, 25),
+        "rejecting fetch must settle"
+      );
+      fail("fetchWithTimeout: rejecting fetch must propagate the rejection");
+    } catch (error) {
+      if (isTimeoutError(error)) {
+        fail("fetchWithTimeout: non-abort network errors must not be misreported as timeouts");
+      }
+    }
+
+    // A stalled response body must abort too: the deadline stays armed until
+    // the body is consumed.
+    let capturedSignal = null;
+    globalThis.fetch = (url, options = {}) => {
+      capturedSignal = options.signal;
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        text: () => hangOnSignal(capturedSignal)
+      });
+    };
+    const guarded = await settleOrFail(
+      fetchWithTimeout("https://api.deepseek.com/chat/completions", {}, 25),
+      "headers must arrive for the stalled-body case"
+    );
+    let bodyRejected = false;
+    try {
+      await settleOrFail(guarded.text(), "stalled body must settle");
+    } catch (error) {
+      bodyRejected = true;
+      if (error.message !== FETCH_TIMEOUT_MESSAGE) {
+        fail(`fetchWithTimeout: stalled body must reject with the Chinese timeout message, got ${JSON.stringify(error.message)}`);
+      }
+    }
+    if (!bodyRejected) {
+      fail("fetchWithTimeout: stalled response body must reject after the deadline instead of pending forever");
+    }
+
+    // Happy path: a fast response reads through the wrapper untouched.
+    globalThis.fetch = () => Promise.resolve({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve("{\"translations\":[\"你好\"]}")
+    });
+    const fast = await settleOrFail(
+      fetchWithTimeout("https://api.deepseek.com/chat/completions", {}, 25),
+      "fast fetch must settle"
+    );
+    const fastBody = await settleOrFail(fast.text(), "fast body must settle");
+    if (fastBody !== "{\"translations\":[\"你好\"]}") {
+      fail(`fetchWithTimeout: fast response body must pass through the wrapper, got ${JSON.stringify(fastBody)}`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // Popup path: the verbatim timeout message must survive toFriendlyPageError
+  // and the connection-test / page-status errors surface error.message /
+  // status.error without rewriting.
+  const friendlySrc = extractTopLevelFunction("popup.js", "toFriendlyPageError");
+  if (!friendlySrc) {
+    fail("popup.js: cannot extract toFriendlyPageError for timeout-message test");
+    return;
+  }
+  let toFriendlyPageError;
+  try {
+    toFriendlyPageError = new Function(`${friendlySrc}\nreturn toFriendlyPageError;`)();
+  } catch (error) {
+    fail(`popup.js: toFriendlyPageError is not runnable standalone: ${error.message}`);
+    return;
+  }
+  if (toFriendlyPageError({ message: FETCH_TIMEOUT_MESSAGE }) !== FETCH_TIMEOUT_MESSAGE) {
+    fail("popup.js: toFriendlyPageError must surface the timeout message verbatim");
+  }
+  const popup = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
+  if (!/setStatus\("连接失败",\s*error\.message/.test(popup)) {
+    fail("popup.js: connection-test failure must surface error.message");
+  }
+  if (!/setStatus\("翻译失败",\s*status\.error/.test(popup)) {
+    fail("popup.js: page translation failure must surface status.error");
+  }
+}
+
 function checkVersionBump() {
   const manifest = readJson("manifest.json");
   if (manifest && manifest.version !== "1.4.2") {
@@ -973,7 +1203,7 @@ function checkSpaNavigationAndSelectionStatics() {
   }
 }
 
-function main() {
+async function main() {
   console.log("kilocean-translate ci-check");
   console.log(`root: ${ROOT}`);
 
@@ -993,6 +1223,7 @@ function main() {
   checkEnglishProfileDetection();
   checkVersionBump();
   checkSpaNavigationAndSelectionStatics();
+  await checkFetchTimeoutCoverage();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -1002,8 +1233,11 @@ function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage");
   process.exit(0);
 }
 
-main();
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

@@ -22,6 +22,15 @@
     original: "original"
   });
 
+  // Provider fetch deadlines. Translation batches (page + selection) get a
+  // generous 30s; the popup connection test fails fast at 15s. Without them a
+  // hung request keeps the popup at "正在翻译"/"正在连接" forever.
+  const FETCH_TIMEOUT_MS = Object.freeze({
+    translation: 30000,
+    connectionTest: 15000
+  });
+  const FETCH_TIMEOUT_MESSAGE = "请求超时，请检查网络或稍后重试";
+
   // On X (Twitter) hosts the translator only touches tweet bodies and profile
   // bios; sidebar / trends / follow rows / footer chrome must stay untouched.
   const X_TRANSLATABLE_SELECTOR = '[data-testid="tweetText"], [data-testid="UserDescription"]';
@@ -433,10 +442,76 @@
     return `${safeTitle}-${safeLanguage}-${dateLabel}.html`;
   }
 
+  // Error thrown when a provider fetch exceeds its deadline. canSplit stays
+  // false: a timeout says nothing about payload size, so bisecting and
+  // re-billing the halves would only hang again.
+  function createFetchTimeoutError() {
+    const error = new Error(FETCH_TIMEOUT_MESSAGE);
+    error.code = "FETCH_TIMEOUT";
+    error.isTimeout = true;
+    error.canSplit = false;
+    return error;
+  }
+
+  // True for the timeout error fetchWithTimeout produces. Callers rethrow it
+  // verbatim instead of wrapping it into generic network errors.
+  function isTimeoutError(error) {
+    return Boolean(error) &&
+      (error.isTimeout === true || error.code === "FETCH_TIMEOUT");
+  }
+
+  // fetch() under an AbortController deadline. The signal guards the whole
+  // request lifecycle, headers AND body: the returned wrapper keeps the timer
+  // armed until text()/json() settles (cleared in finally), so a response
+  // whose body stalls mid-stream aborts too. The current provider API is
+  // non-streaming; a future chunked read should instead reset the timer on
+  // each chunk (idle deadline). Aborting rejects with the user-facing Chinese
+  // timeout error, ready for popup/status/toast surfaces.
+  async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS.translation) {
+    const controller = new AbortController();
+    let timer = setTimeout(() => controller.abort(), timeoutMs);
+    const clearTimer = () => {
+      clearTimeout(timer);
+      timer = null;
+    };
+
+    let response;
+    try {
+      response = await fetch(url, { ...options, signal: controller.signal });
+    } catch (error) {
+      clearTimer();
+      if (controller.signal.aborted) {
+        throw createFetchTimeoutError();
+      }
+      throw error;
+    }
+
+    // Inherit ok/status/headers; override the body readers so the deadline
+    // stays armed until the caller finishes consuming the body.
+    const guarded = Object.create(response);
+    const guardBodyRead = (method) => async function read(...args) {
+      try {
+        return await response[method](...args);
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw createFetchTimeoutError();
+        }
+        throw error;
+      } finally {
+        clearTimer();
+      }
+    };
+    guarded.text = guardBodyRead("text");
+    guarded.json = guardBodyRead("json");
+    return guarded;
+  }
+
   return {
     DISPLAY_MODES,
     TARGET_LANGUAGE_NAMES,
     X_TRANSLATABLE_SELECTOR,
+    FETCH_TIMEOUT_MS,
+    FETCH_TIMEOUT_MESSAGE,
     normalizeDisplayMode,
     getTargetLanguageName,
     isTranslatableText,
@@ -451,6 +526,8 @@
     countSourceParagraphUnits,
     parseTranslationPayload,
     sanitizeExportFilename,
-    buildExportFilename
+    buildExportFilename,
+    fetchWithTimeout,
+    isTimeoutError
   };
 });
