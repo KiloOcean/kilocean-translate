@@ -44,7 +44,12 @@ PR: #___
 GOOD=<上一个已知可用的 commit 或 tag，例如 0253a57>
 git worktree add /tmp/kt-rollback "$GOOD" && cd /tmp/kt-rollback
 # 把 manifest.json 的 version 改成线上版本 +1 个补丁号（如线上 1.4.2 -> 1.4.3）
-node scripts/pack.mjs   # 没有 pack.mjs 的旧提交：只把 manifest 引用到的文件打成 zip
+if [ -f scripts/pack.mjs ]; then node scripts/pack.mjs; else
+  # 旧提交没有 pack.mjs：只打包扩展运行所需文件（排除 .git/scripts/tests/promo/selftest/docs）
+  mkdir -p dist && zip -r "dist/kilocean-translate-$(node -p "require('./manifest.json').version").zip" \
+    manifest.json *.js *.html *.css icons _locales -x '*.map' 2>/dev/null
+  unzip -l dist/*.zip   # 核对清单：不能含 .git、key、测试文件
+fi
 # 在 https://chrome.google.com/webstore/devconsole 上传 dist/*.zip 并提交审核；审核通过前，可先在商店里暂停分阶段发布或取消待审核版本
 ```
 
