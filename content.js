@@ -1974,11 +1974,27 @@
     return host;
   }
 
+  // True when a current eligible source text node of the block lives outside
+  // every owned original wrap: the SPA re-rendered equivalent text around our
+  // still-connected wraps, and that bare node would stay visible untranslated
+  // in translation-only mode unless repair rebuilds for it as well. Uses the
+  // same eligibility filter wrapTextNodesForToggle applies when collecting
+  // nodes it would wrap.
+  function hasUnwrappedOriginalTextNode(block, nestedBlocks) {
+    const nested = (nestedBlocks || []).filter(Boolean);
+    return collectRawTextNodes(block).some((node) => (
+      !nested.some((other) => other !== block && other.contains(node)) &&
+      !(block && !INTERACTIVE_TAGS.has(block.tagName) && isInsideInteractiveDescendant(node, block)) &&
+      !isOwnedOriginalWrap(node.parentElement)
+    ));
+  }
+
   // Same source text but the SPA re-rendered the DOM around it: our own
   // original wraps (and possibly the companion) left the tree with the old
-  // subtree. Rebuild the record's owned DOM from the cached translation —
-  // never via a fresh TRANSLATE_BATCH — so translation-only toggling and the
-  // visible translation survive equivalent-text re-renders without re-billing.
+  // subtree, or fresh text nodes appeared outside every wrap. Rebuild the
+  // record's owned DOM from the cached translation — never via a fresh
+  // TRANSLATE_BATCH — so translation-only toggling and the visible
+  // translation survive equivalent-text re-renders without re-billing.
   function repairBlockRecordDom(record) {
     if (!record?.block?.isConnected) {
       return;
@@ -1986,11 +2002,18 @@
     const gen = beginApplyingDom();
     try {
       const wraps = record.wraps || [];
-      if (wraps.length === 0 || wraps.some((wrap) => !wrap?.isConnected)) {
+      if (
+        wraps.length === 0 ||
+        wraps.some((wrap) => !wrap?.isConnected) ||
+        hasUnwrappedOriginalTextNode(record.block, record.nested)
+      ) {
         const rebuilt = wrapTextNodesForToggle(record.block, record.nested || [], "span");
         if (rebuilt.wraps.length > 0) {
-          record.wraps = rebuilt.wraps;
-          record.wrap = rebuilt.firstWrap;
+          // wrapTextNodesForToggle skips nodes already inside owned wraps, so a
+          // partial rebuild yields only the NEW wraps — keep the still-connected
+          // old ones too, or a later teardown could never unwrap them.
+          record.wraps = wraps.filter((wrap) => wrap?.isConnected).concat(rebuilt.wraps);
+          record.wrap = rebuilt.firstWrap || record.wrap;
         }
       }
       if (record.companion && !record.companion.isConnected) {

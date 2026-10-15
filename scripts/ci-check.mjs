@@ -4,6 +4,7 @@
  * Exit non-zero with clear messages on failure.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 import { spawnSync } from "node:child_process";
@@ -2042,8 +2043,11 @@ async function checkSpaRefreshAndSelectionLifecycle() {
     fail("content.js: cannot extract repairBlockRecordDom for rebuild test");
     return;
   }
+  // hasUnwrappedOriginalTextNode is injected as a controllable stub: the
+  // real one only needs a document, which the standalone harness lacks.
   let wrapCalls = 0;
   let relocateCalls = 0;
+  let unwrappedSource = false;
   let repairBlockRecordDom;
   try {
     repairBlockRecordDom = new Function(
@@ -2051,6 +2055,7 @@ async function checkSpaRefreshAndSelectionLifecycle() {
       "endApplyingDom",
       "wrapTextNodesForToggle",
       "relocateAfterHostCompanion",
+      "hasUnwrappedOriginalTextNode",
       `${repairSrc}\nreturn repairBlockRecordDom;`
     )(
       () => 0,
@@ -2062,7 +2067,8 @@ async function checkSpaRefreshAndSelectionLifecycle() {
       (record) => {
         relocateCalls += 1;
         record.relocated = true;
-      }
+      },
+      () => unwrappedSource
     );
   } catch (error) {
     fail(`content.js: repairBlockRecordDom is not runnable standalone: ${error.message}`);
@@ -2087,7 +2093,11 @@ async function checkSpaRefreshAndSelectionLifecycle() {
   };
   repairBlockRecordDom(swappedRecord);
   assertEqual(wrapCalls, 1, "repair: swapped wraps are rebuilt via wrapTextNodesForToggle");
-  assertEqual(swappedRecord.wraps.length, 2, "repair: record references the rebuilt wraps");
+  assertEqual(
+    swappedRecord.wraps.length,
+    3,
+    "repair: rebuilt record keeps the still-connected old wrap plus the new wraps (teardown must unwrap both)"
+  );
   assertEqual(swappedRecord.block.appended, swappedRecord.companion, "repair: detached companion is re-inserted from the cache");
   assertEqual(relocateCalls, 0, "repair: non-after layouts re-insert into the block");
   const intactRecord = {
@@ -2100,6 +2110,29 @@ async function checkSpaRefreshAndSelectionLifecycle() {
   repairBlockRecordDom(intactRecord);
   assertEqual(wrapCalls, 1, "repair: intact wraps are left alone");
   assertEqual(intactRecord.block.appended, null, "repair: connected companion is not re-inserted");
+  // SPA re-render planted a bare source node outside every owned wrap while
+  // the recorded wraps stayed connected: repair must rebuild for it too, or
+  // the node would show untranslated in translation-only mode.
+  unwrappedSource = true;
+  const bareNodeRecord = {
+    block: makeBlock(),
+    wraps: [{ isConnected: true, original: true }],
+    companion: { isConnected: true },
+    layout: "flow",
+    nested: []
+  };
+  repairBlockRecordDom(bareNodeRecord);
+  assertEqual(wrapCalls, 2, "repair: connected wraps alone do not skip the rebuild when a source node sits outside them");
+  assertEqual(
+    bareNodeRecord.wraps.length,
+    3,
+    "repair: rebuild for unwrapped source keeps the connected wrap and adds the new ones"
+  );
+  if (!bareNodeRecord.wraps.some((wrap) => wrap.original === true)) {
+    fail("repair: the still-connected owned wrap must stay referenced after the partial rebuild");
+  }
+  assertEqual(bareNodeRecord.block.appended, null, "repair: connected companion is not re-inserted on partial rebuild");
+  unwrappedSource = false;
   const afterRecord = {
     block: makeBlock(),
     wraps: [{ isConnected: true }],
@@ -2114,6 +2147,56 @@ async function checkSpaRefreshAndSelectionLifecycle() {
   if (/requestSegmentTranslations|translateBatchWithFallback/.test(repairSrc)) {
     fail("content.js: repairBlockRecordDom must never issue a new translation request");
   }
+
+  // The rebuild trigger itself: a live eligible source text node whose parent
+  // is not an owned wrap — with the same nested/interactive exclusions
+  // wrapTextNodesForToggle applies. Dependency-injected so it runs without a
+  // document.
+  const unwrappedCheckSrc = extractContentFunction("hasUnwrappedOriginalTextNode");
+  if (!unwrappedCheckSrc) {
+    fail("content.js: cannot extract hasUnwrappedOriginalTextNode for rebuild test");
+    return;
+  }
+  let hasUnwrappedOriginalTextNode;
+  try {
+    hasUnwrappedOriginalTextNode = new Function(
+      "collectRawTextNodes",
+      "isOwnedOriginalWrap",
+      "isInsideInteractiveDescendant",
+      "INTERACTIVE_TAGS",
+      `${unwrappedCheckSrc}\nreturn hasUnwrappedOriginalTextNode;`
+    )(
+      (block) => block.textNodes,
+      (el) => Boolean(el?.isOwnedWrap),
+      () => false,
+      new Set(["BUTTON"])
+    );
+  } catch (error) {
+    fail(`content.js: hasUnwrappedOriginalTextNode is not runnable standalone: ${error.message}`);
+    return;
+  }
+  const inOwnedWrap = { parentElement: { isOwnedWrap: true } };
+  const bareTextNode = { parentElement: { isOwnedWrap: false } };
+  const checkBlock = { tagName: "DIV", textNodes: [inOwnedWrap] };
+  assertFalse(
+    hasUnwrappedOriginalTextNode(checkBlock, []),
+    "repair trigger: fully wrapped source text does not force a rebuild"
+  );
+  checkBlock.textNodes = [inOwnedWrap, bareTextNode];
+  assertTrue(
+    hasUnwrappedOriginalTextNode(checkBlock, []),
+    "repair trigger: a bare source node next to owned wraps forces a rebuild"
+  );
+  checkBlock.textNodes = [inOwnedWrap, { parentElement: { isOwnedWrap: false }, nestedOwned: true }];
+  assertFalse(
+    hasUnwrappedOriginalTextNode(checkBlock, [{ contains: (node) => Boolean(node.nestedOwned) }]),
+    "repair trigger: text owned by a nested recorded block never forces a rebuild"
+  );
+  checkBlock.textNodes = [];
+  assertFalse(
+    hasUnwrappedOriginalTextNode(checkBlock, []),
+    "repair trigger: a block without source text nodes never forces a rebuild"
+  );
 
   // scheduleDynamicTranslation: unchanged source → repair; changed → discard.
   const schedSrc = extractContentFunction("scheduleDynamicTranslation");
@@ -2312,11 +2395,74 @@ async function checkTotalDeadlineBudget() {
     assertEqual(recovered.calls, 3, "translateBatch: generous budget retries both times");
   }
 
-  // Static: every attempt passes its remaining budget (not the fixed timeout)
-  // into fetchWithTimeout, and the loop consults canRetryWithinBudget.
+  // ---- Per-attempt timeout: a real timeout must be retryable in-budget ----
+  // Every attempt gets min(MAX_ATTEMPT_TIMEOUT_MS, remaining − reserve), never
+  // the whole remaining total budget — or a hung first attempt would eat all
+  // 30s alone and no timeout retry could ever fit. Spy on fetchWithTimeout to
+  // observe the per-attempt deadlines without wall-clock hangs (restore it in
+  // a finally: every check shares the one cached shared.js module instance).
+  if (utils.MAX_ATTEMPT_TIMEOUT_MS !== 10000) {
+    fail(`deadline budget: MAX_ATTEMPT_TIMEOUT_MS must be 10000ms, got ${JSON.stringify(utils.MAX_ATTEMPT_TIMEOUT_MS)}`);
+  }
+  const originalFetchWithTimeout = utils.fetchWithTimeout;
+  const runTimeoutRetry = async (totalBudgetMs, timeoutsBeforeSuccess) => {
+    const attemptTimeouts = [];
+    let fetchCalls = 0;
+    utils.fetchWithTimeout = async (url, options, timeoutMs, signal) => {
+      fetchCalls += 1;
+      attemptTimeouts.push(timeoutMs);
+      if (fetchCalls <= timeoutsBeforeSuccess) {
+        throw createFetchTimeoutError();
+      }
+      return jsonResponse(200, okBody);
+    };
+    const clock = { now: 0 };
+    try {
+      const result = await harness({ ...deepseekStorage }).translateBatch(
+        ["Hello"],
+        "zh-CN",
+        undefined,
+        undefined,
+        totalBudgetMs,
+        { sleep: async (ms) => { clock.now += ms; }, now: () => clock.now }
+      );
+      return { ok: true, result, attemptTimeouts };
+    } catch (error) {
+      return { ok: false, error, attemptTimeouts };
+    } finally {
+      utils.fetchWithTimeout = originalFetchWithTimeout;
+    }
+  };
+
+  const timeoutThenOk = await runTimeoutRetry(30000, 1);
+  if (!timeoutThenOk.ok) {
+    fail(`translateBatch: a first-attempt timeout must be retried within the total budget, got ${JSON.stringify(timeoutThenOk.error?.message)}`);
+  } else {
+    assertEqual(timeoutThenOk.result, ["你好"], "translateBatch: timeout-retry returns translations");
+    assertEqual(timeoutThenOk.attemptTimeouts.length, 2, "translateBatch: a retried timeout makes exactly 2 attempts");
+    assertEqual(timeoutThenOk.attemptTimeouts[0], 10000, "translateBatch: attempt 1 deadline is capped at MAX_ATTEMPT_TIMEOUT_MS, not the whole 30s budget");
+    assertEqual(timeoutThenOk.attemptTimeouts[1], 10000, "translateBatch: attempt 2 deadline stays capped while budget remains");
+  }
+
+  // A shrinking budget shrinks each attempt: min(10000, 5000−1000) = 4000,
+  // then after the ~1s jittered backoff min(10000, remaining−1000) ∈ [2800, 3200].
+  const shrinking = await runTimeoutRetry(5000, 1);
+  if (!shrinking.ok) {
+    fail(`translateBatch: timeout retry must still work in a 5s budget, got ${JSON.stringify(shrinking.error?.message)}`);
+  } else {
+    assertEqual(shrinking.attemptTimeouts[0], 4000, "translateBatch: attempt deadline is min(cap, remaining − MIN_ATTEMPT_BUDGET_MS reserve)");
+    const second = shrinking.attemptTimeouts[1];
+    if (typeof second !== "number" || second < 2800 || second > 3200) {
+      fail(`translateBatch: second attempt deadline must shrink with the remaining budget into [2800, 3200], got ${JSON.stringify(second)}`);
+    }
+  }
+
+  // Static: each attempt passes min(MAX_ATTEMPT_TIMEOUT_MS, remaining −
+  // reserve) into fetchWithTimeout — never the whole remaining budget — and
+  // the loop consults canRetryWithinBudget.
   const background = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"));
-  if (!/Math\.max\(deadline - now\(\),\s*1\)/.test(background)) {
-    fail("background.js: each attempt must pass its remaining deadline budget into fetchWithTimeout");
+  if (!/Math\.min\(\s*DeepSeekTranslatorUtils\.MAX_ATTEMPT_TIMEOUT_MS,\s*deadline - now\(\) - DeepSeekTranslatorUtils\.MIN_ATTEMPT_BUDGET_MS\s*\)/.test(background)) {
+    fail("background.js: each attempt must cap its fetch deadline at min(MAX_ATTEMPT_TIMEOUT_MS, remaining − MIN_ATTEMPT_BUDGET_MS reserve)");
   }
   if (!/canRetryWithinBudget\(/.test(background)) {
     fail("background.js: the retry loop must gate waits on DeepSeekTranslatorUtils.canRetryWithinBudget");
@@ -2483,6 +2629,13 @@ async function checkTabConcurrencyAndNavigationCancel() {
     type: "TRANSLATE_BATCH",
     texts,
     runId: 1,
+    provider: "deepseek",
+    targetLanguage: "zh-CN",
+    model: "deepseek-flash"
+  });
+  const selectionMessage = (texts) => ({
+    type: "SELECTION_TRANSLATE_BATCH",
+    texts,
     provider: "deepseek",
     targetLanguage: "zh-CN",
     model: "deepseek-flash"
@@ -2701,6 +2854,97 @@ async function checkTabConcurrencyAndNavigationCancel() {
     fail(`first url: vm harness failed: ${error.message}`);
   }
 
+  // (8) SELECTION_TRANSLATE_BATCH joins the same per-tab gate: while MAX page
+  // batches hold every slot, a selection from the same tab queues instead of
+  // breaching the cap, and starts once a slot frees.
+  try {
+    const deferred = makeDeferredFetch();
+    const vmSelQueue = buildBackgroundVm({ storageData: vmStorage, fetchImpl: deferred.fetchImpl });
+    const pageResponses = [];
+    for (let i = 0; i < MAX; i += 1) {
+      pageResponses.push(vmSelQueue.sendMessage(batchMessage([`Hello page ${i}`]), 18));
+    }
+    const selectionResponse = vmSelQueue.sendMessage(selectionMessage(["Hello selection"]), 18);
+    await tick();
+    assertEqual(deferred.state.calls, MAX, "selection slot: selection queues while page batches hold every slot");
+    assertEqual(deferred.state.maxInFlight, MAX, "selection slot: cap never exceeded with a selection in the queue");
+    for (const entry of deferred.pending.splice(0)) {
+      entry.resolve(vmJsonResponse(200, vmOkBody));
+    }
+    await tick();
+    assertEqual(deferred.state.calls, MAX + 1, "selection slot: selection starts once a slot frees");
+    for (const entry of deferred.pending.splice(0)) {
+      entry.resolve(vmJsonResponse(200, vmOkBody));
+    }
+    const settled = await withTimeout(Promise.all([...pageResponses, selectionResponse]), "selection slot settle");
+    if (!Array.isArray(settled) || settled.length !== MAX + 1 || settled.some((r) => r?.ok !== true)) {
+      fail(`selection slot: every batch incl. the selection must resolve ok, got ${JSON.stringify(settled?.map((r) => r?.ok))}`);
+    }
+  } catch (error) {
+    fail(`selection slot: vm harness failed: ${error.message}`);
+  }
+
+  // (9) Whole-tab reload during a selection's 429/5xx backoff cancels the
+  // run: no further provider call may leave the worker for the dead document.
+  try {
+    const scaledSetTimeout = (fn, ms) => setTimeout(fn, Math.max(Math.min(ms ?? 0, 30000), 50));
+    let selNavCalls = 0;
+    const fetchSelBusy = async () => {
+      selNavCalls += 1;
+      return vmJsonResponse(503, '{"error":{"message":"down"}}');
+    };
+    const vmSelNav = buildBackgroundVm({
+      storageData: vmStorage,
+      fetchImpl: fetchSelBusy,
+      setTimeoutImpl: scaledSetTimeout
+    });
+    const responsePromise = vmSelNav.sendMessage(selectionMessage(["Hello selection nav"]), 19);
+    await tick();
+    assertEqual(selNavCalls, 1, "selection nav cancel: first 503 attempt fired");
+    // The backoff sleep (~1s, scaled to 50ms) is pending right now.
+    vmSelNav.listeners.tabsUpdated[0](19, { status: "loading" }, { id: 19 });
+    const response = await withTimeout(responsePromise, "selection nav cancel response");
+    if (response?.ok !== false || response?.code !== "RUN_CANCELLED") {
+      fail(`selection nav cancel: reload must cancel the selection run with RUN_CANCELLED, got ${JSON.stringify(response)}`);
+    }
+    // Long enough for a (buggy) post-cancel retry to have fired after the
+    // scaled backoff elapsed.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assertEqual(selNavCalls, 1, "selection nav cancel: no fetch after the tab reloaded (selection backoff cancelled)");
+  } catch (error) {
+    fail(`selection nav cancel: vm harness failed: ${error.message}`);
+  }
+
+  // (10) Tab close during a selection's backoff: the sleep itself must be
+  // abortable — the backoff here is scaled to ≥3s real, far past the 2s
+  // response watchdog, so a non-abortable sleep cannot pass on timing alone —
+  // and no further provider call may fire afterwards.
+  try {
+    const scaledSetTimeout = (fn, ms) => setTimeout(fn, Math.max(ms ?? 0, 3000));
+    let selCloseCalls = 0;
+    const fetchSelBusy = async () => {
+      selCloseCalls += 1;
+      return vmJsonResponse(503, '{"error":{"message":"down"}}');
+    };
+    const vmSelClose = buildBackgroundVm({
+      storageData: vmStorage,
+      fetchImpl: fetchSelBusy,
+      setTimeoutImpl: scaledSetTimeout
+    });
+    const responsePromise = vmSelClose.sendMessage(selectionMessage(["Hello selection close"]), 20);
+    await tick();
+    assertEqual(selCloseCalls, 1, "selection close cancel: first 503 attempt fired");
+    vmSelClose.listeners.tabsRemoved[0](20);
+    const response = await withTimeout(responsePromise, "selection close cancel response");
+    if (response?.ok !== false || response?.code !== "RUN_CANCELLED") {
+      fail(`selection close cancel: closing the tab must cancel the selection run with RUN_CANCELLED, got ${JSON.stringify(response)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assertEqual(selCloseCalls, 1, "selection close cancel: no fetch after the tab closed (selection backoff aborted)");
+  } catch (error) {
+    fail(`selection close cancel: vm harness failed: ${error.message}`);
+  }
+
   // Statics: the gate and listeners exist in the shipping file.
   const background = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"));
   for (const needle of [
@@ -2716,6 +2960,15 @@ async function checkTabConcurrencyAndNavigationCancel() {
   }
   if (!/withTabTranslateSlot\(tabId,/.test(background)) {
     fail("background.js: TRANSLATE_BATCH must run under withTabTranslateSlot");
+  }
+  if (!/SELECTION_TRANSLATE_BATCH[\s\S]{0,900}?withTabTranslateSlot\(/.test(background)) {
+    fail("background.js: SELECTION_TRANSLATE_BATCH must run under withTabTranslateSlot (per-tab cancellation for selection runs)");
+  }
+  if (!/await sleep\(retryDelay, signal\)/.test(background) || !/await sleep\(timeoutRetryDelay, signal\)/.test(background)) {
+    fail("background.js: backoff sleeps must receive the abort signal so tab close/reload interrupts pending retries");
+  }
+  if (!/sleepSignal/.test(background)) {
+    fail("background.js: the default backoff sleep must be abortable via the tab cancellation signal");
   }
 }
 
@@ -2964,6 +3217,133 @@ async function checkPackaging() {
   }
 }
 
+// ---- P2 security: pack path safety (symlinks, traversal, escapes) ----
+async function checkPackPathSafety() {
+  let mod;
+  try {
+    mod = await import(pathToFileURL(path.join(ROOT, "scripts", "pack.mjs")).href);
+  } catch (error) {
+    fail(`scripts/pack.mjs: cannot be imported for path-safety test: ${error.message}`);
+    return;
+  }
+  const { collectExtensionFiles, buildZip, normalizeEntryName } = mod;
+
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertRejects = (fn, label) => {
+    try {
+      fn();
+    } catch {
+      return;
+    }
+    fail(`${label}: expected pack to reject`);
+  };
+
+  // normalizeEntryName: benign shapes normalize, escaping shapes reject.
+  assertEqual(normalizeEntryName("background.js"), "background.js", "normalizeEntryName: plain name");
+  assertEqual(normalizeEntryName("./background.js"), "background.js", "normalizeEntryName: leading ./ collapses");
+  assertEqual(normalizeEntryName("icons//16/./icon.png"), "icons/16/icon.png", "normalizeEntryName: duplicate separators and . segments collapse");
+  assertRejects(() => normalizeEntryName("../escape.js"), "normalizeEntryName: leading ..");
+  assertRejects(() => normalizeEntryName("a/../../escape.js"), "normalizeEntryName: mid ..");
+  assertRejects(() => normalizeEntryName("sub/../../worker.js"), "normalizeEntryName: .. that would resolve inside root is still rejected");
+  assertRejects(() => normalizeEntryName("/etc/passwd"), "normalizeEntryName: absolute unix path");
+  assertRejects(() => normalizeEntryName("C:\\Windows\\evil.js"), "normalizeEntryName: windows drive path");
+  assertRejects(() => normalizeEntryName("https://evil.example/x.js"), "normalizeEntryName: URL scheme");
+  assertRejects(() => normalizeEntryName(""), "normalizeEntryName: empty");
+
+  // Fixtures in a temp dir: a manifest referencing each hostile shape must
+  // fail the pack, and nothing may be read from outside the root.
+  const tempDirs = [];
+  const writeFixture = (manifest) => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "kilocean-pack-safety-"));
+    tempDirs.push(rootDir);
+    fs.writeFileSync(path.join(rootDir, "manifest.json"), JSON.stringify(manifest));
+    fs.writeFileSync(path.join(rootDir, "worker.js"), "console.log('fixture');\n");
+    return rootDir;
+  };
+  const baseManifest = {
+    manifest_version: 3,
+    name: "path-safety-fixture",
+    version: "1.4.2",
+    background: { service_worker: "worker.js" }
+  };
+
+  try {
+    // Sanity: the benign fixture collects and zips.
+    const okRoot = writeFixture(baseManifest);
+    let okCollected;
+    try {
+      okCollected = collectExtensionFiles(okRoot);
+    } catch (error) {
+      fail(`pack safety: benign fixture must collect, got ${error.message}`);
+      return;
+    }
+    try {
+      buildZip(path.join(okRoot, "dist", "fixture.zip"), okRoot, okCollected.files);
+    } catch (error) {
+      fail(`pack safety: benign fixture must zip, got ${error.message}`);
+    }
+
+    // (1) Symlink entry — rejected by lstat even though it points back inside
+    // the root (a swapped link is indistinguishable from an escape).
+    const linkRoot = writeFixture({ ...baseManifest, background: { service_worker: "linked.js" } });
+    fs.symlinkSync(path.join(linkRoot, "worker.js"), path.join(linkRoot, "linked.js"));
+    assertRejects(() => collectExtensionFiles(linkRoot), "pack safety: symlinked entry must be rejected");
+
+    // (2) Manifest traversal — ../outside.js exists (outside the root) but
+    // must never enter the ship list, let alone be read.
+    const outsideRoot = writeFixture(baseManifest);
+    const traversalRoot = writeFixture({ ...baseManifest, background: { service_worker: "../outside.js" } });
+    assertRejects(() => collectExtensionFiles(traversalRoot), "pack safety: manifest .. traversal must be rejected");
+
+    // (3) Absolute path reference.
+    const absoluteRoot = writeFixture({ ...baseManifest, background: { service_worker: "/etc/passwd" } });
+    assertRejects(() => collectExtensionFiles(absoluteRoot), "pack safety: absolute path reference must be rejected");
+
+    // (3b) Traversal that would resolve back INSIDE the root: the realpath
+    // containment alone cannot catch it — the entry NAME itself must be
+    // rejected so no ".." ever reaches a zip entry.
+    const insideTraversalRoot = writeFixture({ ...baseManifest, background: { service_worker: "sub/../worker.js" } });
+    fs.mkdirSync(path.join(insideTraversalRoot, "sub"));
+    assertRejects(
+      () => collectExtensionFiles(insideTraversalRoot),
+      "pack safety: a .. segment resolving inside the root must still be rejected as an entry name"
+    );
+
+    // (4) realpath escape: linkdir is a symlinked DIRECTORY pointing outside
+    // the root — linkdir/worker.js lstats as a regular file, so only the
+    // realpath containment check catches it.
+    const escapeRoot = writeFixture({ ...baseManifest, background: { service_worker: "linkdir/worker.js" } });
+    const outsideStore = fs.mkdtempSync(path.join(os.tmpdir(), "kilocean-pack-outside-"));
+    tempDirs.push(outsideStore);
+    fs.writeFileSync(path.join(outsideStore, "worker.js"), "console.log('smuggled');\n");
+    fs.symlinkSync(outsideStore, path.join(escapeRoot, "linkdir"));
+    assertRejects(() => collectExtensionFiles(escapeRoot), "pack safety: realpath escape via symlinked directory must be rejected");
+
+    // (5) buildZip re-validates even a caller-supplied list (defense in depth).
+    const zipRoot = writeFixture(baseManifest);
+    fs.symlinkSync(path.join(zipRoot, "worker.js"), path.join(zipRoot, "linked.js"));
+    assertRejects(
+      () => buildZip(path.join(zipRoot, "dist", "x.zip"), zipRoot, ["manifest.json", "../worker.js"]),
+      "pack safety: buildZip must reject traversal entries"
+    );
+    assertRejects(
+      () => buildZip(path.join(zipRoot, "dist", "x.zip"), zipRoot, ["manifest.json", "linked.js"]),
+      "pack safety: buildZip must reject symlink entries"
+    );
+    if (fs.existsSync(path.join(zipRoot, "dist", "x.zip"))) {
+      fail("pack safety: a rejected buildZip must not write its output");
+    }
+  } finally {
+    for (const dir of tempDirs) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+}
+
 function checkVersionBump() {
   const manifest = readJson("manifest.json");
   if (manifest && manifest.version !== "1.4.2") {
@@ -3099,6 +3479,7 @@ async function main() {
   await checkTabConcurrencyAndNavigationCancel();
   checkTranslationReuseCache();
   await checkPackaging();
+  await checkPackPathSafety();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -3108,7 +3489,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, inflight cap + run cancellation, SPA refresh + selection lifecycle, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging");
+  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, inflight cap + run cancellation, SPA refresh + selection lifecycle, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
   process.exit(0);
 }
 

@@ -38,6 +38,16 @@
   // budget is the whole deadline, which callers keep well above this floor.
   const MIN_ATTEMPT_BUDGET_MS = 1000;
 
+  // Per-attempt ceiling for one provider fetch. Without it every attempt
+  // would inherit the whole remaining total budget as its own timeout, so a
+  // hung first request could burn all 30s alone and no timeout retry could
+  // ever fit. Each attempt instead gets
+  // min(MAX_ATTEMPT_TIMEOUT_MS, remaining − MIN_ATTEMPT_BUDGET_MS reserve):
+  // 10s stays comfortably above p99 latency for a ≤24-segment batch while
+  // leaving the 30s translation budget room for ~1s/~3s backoffs and a
+  // second or third attempt.
+  const MAX_ATTEMPT_TIMEOUT_MS = 10000;
+
   // DeepSeek chat models: the API renamed deepseek-v4-flash → deepseek-flash
   // (DeepSeek-V4.1-Flash, see selftest/deepseek-connectivity-2026-10-15.md).
   // Saved settings may still hold the legacy name; migrateModelName maps it
@@ -668,6 +678,7 @@
     RETRY_BASE_DELAYS_MS,
     RETRY_AFTER_CAP_MS,
     MIN_ATTEMPT_BUDGET_MS,
+    MAX_ATTEMPT_TIMEOUT_MS,
     isRetryableStatus,
     parseRetryAfterMs,
     computeRetryDelay,

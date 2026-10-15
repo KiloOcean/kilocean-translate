@@ -316,7 +316,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
     selectionSendTimes.push(Date.now());
-    translateBatch(message.texts, message.targetLanguage, message.model, message.provider)
+    // Same per-tab gate as TRANSLATE_BATCH: the tab's slot cap applies and a
+    // tab close / whole navigation aborts the in-flight fetch, every pending
+    // retry and the backoff sleeps between them (a dead tab's selection must
+    // not keep billing).
+    const tabId = Number.isInteger(sender.tab?.id) ? sender.tab.id : null;
+    withTabTranslateSlot(tabId, (signal) => translateBatch(
+      message.texts,
+      message.targetLanguage,
+      message.model,
+      message.provider,
+      undefined,
+      { signal }
+    ))
       .then((translations) => sendResponse({ ok: true, translations }))
       .catch((error) => sendResponse({
         ok: false,
@@ -494,9 +506,25 @@ async function translateBatch(
   // Injectable so tests run the retry loop without wall-clock delays.
   // isCancelled is polled before every attempt and after every backoff sleep
   // so an abandoned run stops billing immediately; signal aborts the in-flight
-  // fetch itself (tab navigation / removal); now drives the total deadline.
+  // fetch itself AND every pending backoff sleep (tab navigation / removal —
+  // a closed tab must not keep a queued retry armed for seconds); now drives
+  // the total deadline.
   {
-    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    sleep = (ms, sleepSignal) => new Promise((resolve, reject) => {
+      if (sleepSignal?.aborted) {
+        reject(createError("翻译已取消", "RUN_CANCELLED"));
+        return;
+      }
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(createError("翻译已取消", "RUN_CANCELLED"));
+      };
+      const timer = setTimeout(() => {
+        sleepSignal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      sleepSignal?.addEventListener("abort", onAbort);
+    }),
     isCancelled = () => false,
     signal = null,
     now = Date.now
@@ -564,9 +592,12 @@ async function translateBatch(
   //
   // timeoutMs is a TOTAL budget for the whole call — every attempt, every
   // Retry-After/backoff wait, every body read draws from the same deadline.
-  // Each attempt passes its remaining budget to fetchWithTimeout; a wait that
-  // cannot leave MIN_ATTEMPT_BUDGET_MS of room for one more meaningful
-  // attempt fails fast instead of sleeping past the deadline.
+  // Each attempt passes min(MAX_ATTEMPT_TIMEOUT_MS, remaining minus a
+  // MIN_ATTEMPT_BUDGET_MS reserve) to fetchWithTimeout — never the whole
+  // remaining budget, or a hung first attempt would eat it all and no
+  // timeout retry could ever fit. A wait that cannot leave
+  // MIN_ATTEMPT_BUDGET_MS of room for one more meaningful attempt fails fast
+  // instead of sleeping past the deadline.
   const runCancelled = () => Boolean(signal && signal.aborted) || isCancelled();
   const maxAttempts = 1 + DeepSeekTranslatorUtils.MAX_PROVIDER_RETRIES;
   const deadline = now() + timeoutMs;
@@ -595,6 +626,16 @@ async function translateBatch(
       throw DeepSeekTranslatorUtils.createFetchTimeoutError();
     }
     try {
+      // Per-attempt deadline: capped below the remaining total budget (with a
+      // MIN_ATTEMPT_BUDGET_MS reserve) so a real timeout can still be retried
+      // inside the same deadline instead of the first attempt owning all of it.
+      const attemptTimeoutMs = Math.max(
+        Math.min(
+          DeepSeekTranslatorUtils.MAX_ATTEMPT_TIMEOUT_MS,
+          deadline - now() - DeepSeekTranslatorUtils.MIN_ATTEMPT_BUDGET_MS
+        ),
+        1
+      );
       const attemptResponse = await DeepSeekTranslatorUtils.fetchWithTimeout(providerConfig.apiUrl, {
         method: "POST",
         headers: {
@@ -602,7 +643,7 @@ async function translateBatch(
           "Content-Type": "application/json"
         },
         body: JSON.stringify(body)
-      }, Math.max(deadline - now(), 1), signal);
+      }, attemptTimeoutMs, signal);
       responseText = await attemptResponse.text();
       if (
         attemptResponse.ok ||
@@ -623,7 +664,7 @@ async function translateBatch(
         response = attemptResponse;
         break;
       }
-      await sleep(retryDelay);
+      await sleep(retryDelay, signal);
     } catch (error) {
       if (DeepSeekTranslatorUtils.isTimeoutError(error)) {
         if (!canRetry) {
@@ -644,7 +685,7 @@ async function translateBatch(
         // Timeouts are transient like 5xx: re-arm with the remaining budget
         // and try again (no Retry-After exists for an aborted request).
         lastRetryableResponse = null;
-        await sleep(timeoutRetryDelay);
+        await sleep(timeoutRetryDelay, signal);
       } else if (runCancelled()) {
         // fetchWithTimeout rethrows the raw abort error when an external
         // cancellation signal (tab navigation / removal) cut the request.

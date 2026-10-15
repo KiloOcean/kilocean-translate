@@ -47,6 +47,64 @@ const isLocalReference = (value) =>
   !value.startsWith("#") &&
   !value.startsWith("/");
 
+// Canonical ship-list entry name: posix separators, no duplicate separators,
+// no "." segments. Absolute paths (unix /, windows drive / UNC), URL schemes
+// and any ".." segment are rejected outright — a manifest or bundled
+// reference must never name anything outside the extension root.
+export function normalizeEntryName(rel, origin = "entry") {
+  const raw = String(rel ?? "");
+  const posix = raw.split(path.sep).join("/").replace(/\/+/g, "/").trim();
+  if (
+    posix === "" ||
+    posix.startsWith("/") ||
+    posix.startsWith("\\") ||
+    /^[a-zA-Z]:/.test(posix) ||
+    /^[a-z][a-z\d+\-.]*:/i.test(posix)
+  ) {
+    throw new Error(`pack: ${origin} must be a relative path inside the extension root, got: ${raw}`);
+  }
+  const parts = [];
+  for (const part of posix.split("/")) {
+    if (part === "" || part === ".") {
+      continue;
+    }
+    if (part === "..") {
+      throw new Error(`pack: ${origin} must not traverse outside the extension root (..): ${raw}`);
+    }
+    parts.push(part);
+  }
+  if (parts.length === 0) {
+    throw new Error(`pack: ${origin} must name a file, got: ${raw}`);
+  }
+  return parts.join("/");
+}
+
+// Every shipped path must be a regular file (never a symlink — lstat, so the
+// link itself is rejected even when it points back inside the root) whose
+// realpath stays under the root's realpath, so neither a crafted manifest
+// reference nor a swapped symlink can smuggle file contents from outside the
+// extension root into the zip.
+export function assertSafeRealFile(rootDir, rel) {
+  const full = path.join(rootDir, rel);
+  let stat;
+  try {
+    stat = fs.lstatSync(full);
+  } catch {
+    throw new Error(`pack: missing file: ${rel}`);
+  }
+  if (stat.isSymbolicLink()) {
+    throw new Error(`pack: symlink must not ship: ${rel}`);
+  }
+  if (!stat.isFile()) {
+    throw new Error(`pack: not a regular file: ${rel}`);
+  }
+  const rootReal = fs.realpathSync(rootDir);
+  const fileReal = fs.realpathSync(full);
+  if (fileReal !== rootReal && !fileReal.startsWith(rootReal + path.sep)) {
+    throw new Error(`pack: file resolves outside the extension root: ${rel}`);
+  }
+}
+
 function readManifest(rootDir) {
   const manifestPath = path.join(rootDir, "manifest.json");
   if (!fs.existsSync(manifestPath)) {
@@ -110,12 +168,13 @@ export function collectExtensionFiles(rootDir = ROOT) {
   const pending = [];
 
   const add = (rel, origin) => {
-    if (!rel || rel.endsWith("/")) {
-      return;
-    }
-    if (!files.has(rel)) {
-      files.add(rel);
-      pending.push([rel, origin]);
+    // Normalize + validate at the single choke point every reference flows
+    // through (manifest fields, html href/src, injected file lists): a path
+    // that is absolute or climbs with .. never enters the ship list.
+    const name = normalizeEntryName(rel, origin);
+    if (!files.has(name)) {
+      files.add(name);
+      pending.push([name, origin]);
     }
   };
 
@@ -158,11 +217,14 @@ export function collectExtensionFiles(rootDir = ROOT) {
   }
 
   // Walk the reference graph: html pulls css/js, js pulls injected file lists.
+  // Validate before anything is read: a reference to a missing file, a
+  // symlink, or a path whose realpath leaves the root fails the pack.
   while (pending.length > 0) {
     const [rel, origin] = pending.shift();
-    const full = path.join(rootDir, rel);
-    if (!fs.existsSync(full)) {
-      throw new Error(`pack: ${origin} references missing file: ${rel}`);
+    try {
+      assertSafeRealFile(rootDir, rel);
+    } catch (error) {
+      throw new Error(`pack: ${origin} references an unsafe or missing file: ${rel} (${error.message})`);
     }
     if (rel.endsWith(".html") || rel.endsWith(".htm")) {
       collectHtmlReferences(rootDir, rel, add);
@@ -253,11 +315,12 @@ function zipEntry(name, data, when) {
  */
 export function buildZip(outPath, rootDir, files, when = new Date()) {
   const entries = files.map((rel) => {
-    const full = path.join(rootDir, rel);
-    if (!fs.existsSync(full) || !fs.statSync(full).isFile()) {
-      throw new Error(`pack: cannot zip missing file: ${rel}`);
-    }
-    return zipEntry(rel, fs.readFileSync(full), when);
+    // Defense in depth: entry names are re-normalized and every file is
+    // lstat/realpath-checked right before it is read, so even a caller-supplied
+    // list cannot zip a symlink or anything outside the root.
+    const name = normalizeEntryName(rel, "zip entry");
+    assertSafeRealFile(rootDir, name);
+    return zipEntry(name, fs.readFileSync(path.join(rootDir, name)), when);
   });
 
   const parts = [];
