@@ -77,7 +77,7 @@ jobs:
       pull-requests: read
       issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@78cd3bdb29b70389fddf6dd061272ee9c7b7fd55  # devflow-gates main @ 78cd3bd (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@2f2d3ebc3bd300d0da389574954effb94eb244c5  # devflow-gates main @ 78cd3bd (pinned; bump deliberately)
     with:
       wait_minutes: 20
 
@@ -90,4 +90,4 @@ jobs:
       pull-requests: read
       issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@78cd3bdb29b70389fddf6dd061272ee9c7b7fd55  # devflow-gates main @ 78cd3bd (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@2f2d3ebc3bd300d0da389574954effb94eb244c5  # devflow-gates main @ 78cd3bd (pinned; bump deliberately)
