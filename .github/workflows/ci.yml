@@ -16,6 +16,8 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # Manual runs (Actions tab / `gh workflow run ci.yml --ref <branch>`).
+  workflow_dispatch:
 
 permissions:
   contents: read
