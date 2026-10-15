@@ -79,8 +79,9 @@
   // Bounded LRU of source→translation under the current run settings:
   // virtualized lists remount tweets with identical text, and re-requesting
   // the same source would only re-bill the provider. Keyed by text + provider
-  // + target + model + displayMode so any run-setting change misses; cleared
-  // when the session ends (restoreOriginal).
+  // + target + model so any run-setting change misses; displayMode only
+  // picks how an entry is rendered, never its content, so toggling it keeps
+  // hitting the same cache. Cleared when the session ends (restoreOriginal).
   const TRANSLATION_CACHE_LIMIT = 500;
   /** @type {Map<string, string>} */
   const translationCache = new Map();
@@ -648,7 +649,6 @@
       runSettings.provider,
       runSettings.targetLanguage,
       runSettings.model,
-      state.displayMode,
       text
     ].join("\u0000");
   }

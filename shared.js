@@ -108,7 +108,7 @@
   }
 
   // High-frequency English function words. Ordinary English prose (tweets,
-  // bios) always carries several of these, while French/German/Spanish
+  // bios) always carries several of these, while French/German/Spanish/Italian
   // sentences carry none of them (their function words live in the set below).
   const ENGLISH_STOPWORDS = new Set([
     "the", "and", "is", "to", "of", "a", "in", "for", "you", "that", "it",
@@ -125,7 +125,7 @@
   // Function words of the other big Latin-script languages. A couple of hits
   // mark the text as not English even when an English-looking word sneaks in
   // ("die" in German, "son" in Spanish): precision wins over recall, because
-  // wrongly skipping French/German/Spanish would silently drop their
+  // wrongly skipping French/German/Spanish/Italian would silently drop their
   // translation, while wrongly translating an English block only echoes it.
   const NON_ENGLISH_STOPWORDS = new Set([
     // French
@@ -145,23 +145,30 @@
     "por", "con", "pero", "muy", "ya", "sobre", "entre", "cuando", "como",
     "porque", "más", "yo", "tú", "él", "ella", "usted", "nosotros", "ellos",
     "si", "esta", "está", "están", "hay", "tiene", "desde", "hasta", "donde",
-    "quien", "fue", "ser", "mis", "sus", "nuestro"
+    "quien", "fue", "ser", "mis", "sus", "nuestro",
+    // Italian
+    "il", "lo", "gli", "che", "non", "per", "e", "ma", "sono", "era",
+    "come", "questo", "questa", "quello", "quella", "anche", "nel", "dal",
+    "dalla", "della", "degli", "loro", "suo", "sua", "ho", "hai", "ha",
+    "molto", "sempre", "bene"
   ]);
 
-  // English stopwords that double as ordinary function words in
-  // French/Spanish/German: "Me gusta bailar" / "On arrive demain matin"
-  // (fr/es "me"/"on"/"a"), "Was nun" (de "was"). They can never prove
-  // English on their own — only unambiguous hits (the/and/of…) count as
-  // evidence for the skip shortcut.
-  const AMBIGUOUS_ENGLISH_STOPWORDS = new Set(["a", "me", "on", "was", "in"]);
+  // English stopwords that double as ordinary function words in the other
+  // Latin-script languages: "Me gusta bailar" (es "me"), "On arrive demain
+  // matin" (fr "on"/"a"), "Was nun" (de "was"), "I problemi sociali" (it "i"
+  // is the masculine plural article). They can never prove English on their
+  // own — only unambiguous hits (the/and/of…) count as evidence for the skip
+  // shortcut.
+  const AMBIGUOUS_ENGLISH_STOPWORDS = new Set(["a", "i", "me", "on", "was", "in"]);
 
   // Lightweight English detector for Latin-script text: tokenize words, then
-  // score unambiguous English function words against French/German/Spanish
-  // markers and accented letters. Deliberately conservative — any doubt must
-  // resolve to false so the caller keeps translating: any foreign function
-  // word vetoes the shortcut outright, short texts (≤3 words) need at least
-  // one unambiguous English function word, longer texts need a 0.15 strong
-  // stopword ratio. Never treat "all Latin script" as English on its own.
+  // score unambiguous English function words against French/German/Spanish/
+  // Italian markers and accented letters. Deliberately conservative — any
+  // doubt must resolve to false so the caller keeps translating: any foreign
+  // function word vetoes the shortcut outright, short texts (≤3 words) need
+  // at least two distinct English function words with one of them
+  // unambiguous, longer texts need a 0.15 strong stopword ratio. Never treat
+  // "all Latin script" as English on its own.
   function looksLikeEnglish(text) {
     if (typeof text !== "string") {
       return false;
@@ -174,9 +181,15 @@
     let englishHits = 0;
     let foreignHits = 0;
     let nonAsciiWords = 0;
+    const distinctEnglishWords = new Set();
+    const distinctUnambiguousWords = new Set();
     for (const word of words) {
-      if (ENGLISH_STOPWORDS.has(word) && !AMBIGUOUS_ENGLISH_STOPWORDS.has(word)) {
-        englishHits += 1;
+      if (ENGLISH_STOPWORDS.has(word)) {
+        distinctEnglishWords.add(word);
+        if (!AMBIGUOUS_ENGLISH_STOPWORDS.has(word)) {
+          englishHits += 1;
+          distinctUnambiguousWords.add(word);
+        }
       }
       if (NON_ENGLISH_STOPWORDS.has(word)) {
         foreignHits += 1;
@@ -198,7 +211,11 @@
       return false;
     }
     if (words.length <= 3) {
-      return englishHits >= 1;
+      // One English-looking function word proves nothing about a short text:
+      // it may be a shared Romance/English token ("I problemi sociali",
+      // "Me gusta bailar"). Require two distinct English function words, at
+      // least one of them unambiguous.
+      return distinctEnglishWords.size >= 2 && distinctUnambiguousWords.size >= 1;
     }
     return englishHits > 0 && englishHits / words.length >= 0.15;
   }

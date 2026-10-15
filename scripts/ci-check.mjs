@@ -828,6 +828,17 @@ function checkEnglishProfileDetection() {
   assertFalse(looksLikeEnglish("Ich arbeite als Softwareentwickler und trinke gern Kaffee."), "looksLikeEnglish: German sentence");
   assertFalse(looksLikeEnglish("Me gusta trabajar en proyectos libres y aprender cosas nuevas."), "looksLikeEnglish: Spanish sentence");
   assertFalse(looksLikeEnglish("Das ist ein deutscher Satz mit vielen Wörtern."), "looksLikeEnglish: accented German sentence");
+  // Italian must never be detected as English either: its masculine plural
+  // article "i" is spelled exactly like the English pronoun "I", so a lone
+  // hit proves nothing ("I problemi sociali" — 1.4.2 QA report).
+  assertFalse(looksLikeEnglish("I problemi sociali"), "looksLikeEnglish: 'I problemi sociali' is Italian — single-letter 'I' alone is not English evidence");
+  assertFalse(looksLikeEnglish("I problemi sociali continuano"), "looksLikeEnglish: Italian with the ambiguous 'I' article never clears the ratio either");
+  assertFalse(looksLikeEnglish("A casa"), "looksLikeEnglish: 'A casa' is Romance — single-letter 'a' alone is not English evidence");
+  // Italian function words veto the skip like every other Romance marker:
+  // even with real English hits around them ("the team"), one "per"/"che"
+  // means the block must keep translating for en.
+  assertFalse(looksLikeEnglish("I problemi per the team"), "looksLikeEnglish: an Italian marker ('per') vetoes the skip even beside English hits");
+  assertFalse(looksLikeEnglish("Che cosa vuoi fare"), "looksLikeEnglish: Italian sentence with 'che' veto");
   // Short / ambiguous text stays conservative: translate unless clearly English.
   assertFalse(looksLikeEnglish("Home"), "looksLikeEnglish: single noun without function words");
   assertFalse(looksLikeEnglish("Hola mundo"), "looksLikeEnglish: short Spanish");
@@ -870,6 +881,10 @@ function checkEnglishProfileDetection() {
   assertFalse(
     isAlreadyTargetLanguage("Me gusta trabajar en proyectos libres y aprender cosas nuevas.", "en"),
     "isAlreadyTargetLanguage: Spanish bio translates for en"
+  );
+  assertFalse(
+    isAlreadyTargetLanguage("I problemi sociali", "en"),
+    "isAlreadyTargetLanguage: Italian translates for en (article 'I' is not the pronoun)"
   );
   assertFalse(isAlreadyTargetLanguage("Software engineer", "en"), "isAlreadyTargetLanguage: stopword-less short text stays conservative for en");
 
@@ -2627,6 +2642,65 @@ async function checkTabConcurrencyAndNavigationCancel() {
     fail(`hung provider: vm harness failed: ${error.message}`);
   }
 
+  // (6) A whole-tab reload clears cancelledContentRuns: the new document's
+  // content script restarts its run generation at 1, so it must not inherit
+  // the previous document's cancellation of generation 1.
+  try {
+    const deferred = makeDeferredFetch();
+    const vmReload = buildBackgroundVm({ storageData: vmStorage, fetchImpl: deferred.fetchImpl });
+    vmReload.sendMessage({ type: "CANCEL_TRANSLATE_BATCHES", runId: 1 }, 16);
+    await tick();
+    const blocked = await withTimeout(vmReload.sendMessage(batchMessage(["Hello blocked"]), 16), "stale cancel response");
+    if (blocked?.ok !== false || blocked?.code !== "RUN_CANCELLED") {
+      fail(`reload: a cancelled generation must stay cancelled before any navigation, got ${JSON.stringify(blocked)}`);
+    }
+    assertEqual(deferred.state.calls, 0, "reload: cancelled run makes no provider call");
+    // The reload (status "loading") is a whole-tab navigation: the stale
+    // cancelledContentRuns entry for the tab must go with the old document.
+    vmReload.listeners.tabsUpdated[0](16, { status: "loading" }, { id: 16 });
+    const responsePromise = vmReload.sendMessage(batchMessage(["Hello reload"]), 16);
+    await tick();
+    assertEqual(deferred.state.calls, 1, "reload: post-reload generation-1 run starts");
+    deferred.pending[0].resolve(vmJsonResponse(200, vmOkBody));
+    const response = await withTimeout(responsePromise, "reload response");
+    if (response?.ok !== true) {
+      fail(`reload: whole-tab navigation must clear the stale cancellation for the reused generation, got ${JSON.stringify(response)}`);
+    }
+  } catch (error) {
+    fail(`reload: vm harness failed: ${error.message}`);
+  }
+
+  // (7) A cold-started worker has no baseline URL for a tab: the tab's FIRST
+  // url event must not be treated as a whole-tab navigation (memory-only
+  // lastTabUrls map), while status "loading" still cancels and a later
+  // baseline-backed non-fragment change still cancels.
+  try {
+    const deferred = makeDeferredFetch();
+    const vmFirstUrl = buildBackgroundVm({ storageData: vmStorage, fetchImpl: deferred.fetchImpl });
+    const responsePromise = vmFirstUrl.sendMessage(batchMessage(["Hello first url"]), 17);
+    await tick();
+    assertEqual(deferred.state.calls, 1, "first url: batch was in flight");
+    vmFirstUrl.listeners.tabsUpdated[0](17, { url: "https://x.com/home" }, { id: 17 });
+    await tick();
+    assertEqual(deferred.state.calls, 1, "first url: baseline-less url event keeps the batch running");
+    deferred.pending[0].resolve(vmJsonResponse(200, vmOkBody));
+    const response = await withTimeout(responsePromise, "first url response");
+    if (response?.ok !== true) {
+      fail(`first url: the tab's first url event must not cancel the batch, got ${JSON.stringify(response)}`);
+    }
+    // Baseline recorded: a non-fragment url change still counts as navigation.
+    const secondPromise = vmFirstUrl.sendMessage(batchMessage(["Hello path change"]), 17);
+    await tick();
+    assertEqual(deferred.state.calls, 2, "first url: second batch was in flight");
+    vmFirstUrl.listeners.tabsUpdated[0](17, { url: "https://x.com/explore" }, { id: 17 });
+    const cancelled = await withTimeout(secondPromise, "path change response");
+    if (cancelled?.ok !== false || cancelled?.code !== "RUN_CANCELLED") {
+      fail(`first url: a baseline-backed non-fragment url change must cancel with RUN_CANCELLED, got ${JSON.stringify(cancelled)}`);
+    }
+  } catch (error) {
+    fail(`first url: vm harness failed: ${error.message}`);
+  }
+
   // Statics: the gate and listeners exist in the shipping file.
   const background = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"));
   for (const needle of [
@@ -2697,10 +2771,16 @@ function checkTranslationReuseCache() {
   assertNull(api.getCachedTranslation("Hello world", { ...settings, model: "deepseek-v4-pro" }), "reuse cache: model change misses");
   assertNull(api.getCachedTranslation("Hello world", { ...settings, provider: "kimi", model: "kimi-k2.6" }), "reuse cache: provider change misses");
   assertNull(api.getCachedTranslation("Hello world", { ...settings, targetLanguage: "en" }), "reuse cache: target change misses");
+  // displayMode only picks how a translation is rendered, never its content:
+  // it is not part of the cache key, so toggling it reuses the billed entry.
   state.displayMode = "translation-only";
-  assertNull(api.getCachedTranslation("Hello world", settings), "reuse cache: displayMode change misses");
+  assertEqual(api.getCachedTranslation("Hello world", settings), "你好，世界", "reuse cache: displayMode change still hits (not part of the key)");
+  state.displayMode = "original";
+  assertEqual(api.getCachedTranslation("Hello world", settings), "你好，世界", "reuse cache: every displayMode reads the same entry");
   state.displayMode = "bilingual";
-  assertEqual(api.getCachedTranslation("Hello world", settings), "你好，世界", "reuse cache: restored displayMode hits again");
+  if (/displayMode/.test(stripCommentsForScan(keySrc))) {
+    fail("content.js: translationCacheKey must not include displayMode (rendering choice, not translation identity)");
+  }
 
   // Empty / whitespace-only translations are never stored.
   api.setCachedTranslation("Blank text", "   ", settings);

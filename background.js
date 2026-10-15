@@ -213,7 +213,11 @@ function isWholeTabNavigationChange(tabId, changeInfo) {
   let urlNavigation = false;
   if (changeInfo.url != null) {
     const previous = lastTabUrls.get(tabId);
-    urlNavigation = previous == null || stripUrlHash(previous) !== stripUrlHash(changeInfo.url);
+    // No baseline yet (cold-started worker — the map is memory-only): this
+    // first url event proves nothing by itself, so record it and treat the
+    // change as same-document. A real document change still reports
+    // status "loading" and cancels through that.
+    urlNavigation = previous != null && stripUrlHash(previous) !== stripUrlHash(changeInfo.url);
     lastTabUrls.set(tabId, changeInfo.url);
   }
   return changeInfo.status === "loading" || urlNavigation;
@@ -244,8 +248,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
   // A whole-page change (full load, or a non-hash url change) kills every
   // content-script instance of the old document: abort its in-flight and
-  // queued TRANSLATE_BATCHes so nothing keeps billing a dead page.
+  // queued TRANSLATE_BATCHes so nothing keeps billing a dead page, and drop
+  // its cancelled-run marks — the next document's content script restarts
+  // its run generation at 1 and must not inherit the old document's
+  // cancellations (a reload reusing generation 1 would stay blocked).
   if (isWholeTabNavigationChange(tabId, changeInfo)) {
+    cancelledContentRuns.delete(tabId);
     cancelTabTranslateBatches(tabId);
   }
 });
