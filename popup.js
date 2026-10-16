@@ -203,8 +203,9 @@ function reconcileModel(model, storageSnapshot) {
 // value this save establishes in storage (the written value, or the stored
 // value an edit already matched) so completion can tell a settled edit from
 // one the user retyped while the write was in flight. The legacy apiKey
-// mirror follows the active provider's key whenever a provider/key field
-// changes.
+// mirror follows the active provider's key whenever a provider/key field is
+// written — including a write to "" (clearing the last key must clear the
+// mirror too, or the next load would resurrect the key as a legacy apiKey).
 function collectDirtyPatch(model, controlValues) {
   const patch = {};
   const fields = [];
@@ -220,7 +221,9 @@ function collectDirtyPatch(model, controlValues) {
     }
   }
   const provider = PROVIDER_META[controlValues.provider] ? controlValues.provider : "deepseek";
-  if (patch.provider || patch.deepseekApiKey || patch.kimiApiKey) {
+  // `in`, not truthiness: a cleared key writes "" and must still update the
+  // legacy mirror.
+  if ("provider" in patch || "deepseekApiKey" in patch || "kimiApiKey" in patch) {
     patch.apiKey = controlValues[PROVIDER_META[provider].keyField] ?? model.snapshot[PROVIDER_META[provider].keyField];
   }
   return { patch, fields, savedValues };
@@ -395,11 +398,11 @@ function applyFieldsToControls(applied) {
     }
   }
   if ("displayMode" in applied) {
-    const nextMode = Utils.normalizeDisplayMode(applied.displayMode);
-    if (nextMode !== currentDisplayMode) {
-      currentDisplayMode = nextMode;
-      renderDisplayMode();
-    }
+    // Always render, even when the mode is unchanged: on a first load the
+    // stored/default mode equals the in-memory default, and the buttons still
+    // need their initial active state (no button is marked active in markup).
+    currentDisplayMode = Utils.normalizeDisplayMode(applied.displayMode);
+    renderDisplayMode();
   }
   // The key input mirrors the active provider's key — the post-swap one if
   // a provider was just applied — unless the user is editing it.
@@ -751,7 +754,10 @@ async function initialize() {
   currentTab = tabs[0];
 
   changesDuringRead = {};
-  const read = await chrome.storage.local.get(DEFAULT_SETTINGS);
+  // Read raw (get(null), no defaults): migrateSettings must tell a <=1.3.x
+  // store (per-provider key fields absent) from a 1.4 store that merely holds
+  // empty keys — a defaults-filled read would erase that distinction.
+  const read = await chrome.storage.local.get(null);
   // Overlay deltas delivered while the read was in flight: the read may have
   // resolved with a snapshot older than those already-applied writes.
   const stored = { ...read, ...changesDuringRead };
@@ -762,8 +768,9 @@ async function initialize() {
   // Persist one-time storage upgrades (legacy apiKey → deepseekApiKey,
   // retired model names) so the old values do not survive on disk; the
   // model already holds the migrated view, and the onChanged this write
-  // triggers re-reconciles the same values.
-  const migrationPatch = collectMigrationPatch(stored, migrated);
+  // triggers re-reconciles the same values. Diff against the defaults-merged
+  // view so an untouched store never materializes default values.
+  const migrationPatch = collectMigrationPatch({ ...DEFAULT_SETTINGS, ...stored }, migrated);
   if (Object.keys(migrationPatch).length) {
     await chrome.storage.local.set(migrationPatch);
   }
@@ -804,9 +811,12 @@ function migrateSettings(raw) {
   let kimiApiKey = String(settings.kimiApiKey || "").trim();
   const legacy = String(settings.apiKey || "").trim();
   let didMigrate = false;
-  // Only treat `apiKey` as a <=1.3.x DeepSeek key when no per-provider keys
-  // exist yet; a Kimi-only user's mirrored apiKey is not legacy storage.
-  if (!deepseekApiKey && !kimiApiKey && legacy) {
+  // Only treat `apiKey` as a <=1.3.x DeepSeek key when no per-provider key
+  // fields exist yet — ABSENT, not empty: an empty deepseekApiKey/kimiApiKey
+  // is a key the user cleared, and migrating its stale apiKey mirror would
+  // resurrect the deleted key (a Kimi-only user's mirrored apiKey is likewise
+  // not legacy storage).
+  if (!("deepseekApiKey" in raw) && !("kimiApiKey" in raw) && legacy) {
     deepseekApiKey = legacy;
     didMigrate = true;
   }

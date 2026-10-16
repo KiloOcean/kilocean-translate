@@ -43,15 +43,21 @@ function normalizeProvider(providerId) {
 }
 
 async function loadSettings() {
-  const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
+  // Read raw (get(null), no defaults): whether the per-provider key fields
+  // are ABSENT (a <=1.3.x store) rather than merely empty (a cleared 1.4
+  // key) decides the legacy migration below — a defaults-filled read would
+  // erase that distinction.
+  const stored = await chrome.storage.local.get(null);
   const provider = normalizeProvider(stored.provider);
   let deepseekApiKey = String(stored.deepseekApiKey || "").trim();
   const kimiApiKey = String(stored.kimiApiKey || "").trim();
   const legacyKey = String(stored.apiKey || "").trim();
   // <=1.3.x stored a single DeepSeek key under `apiKey`; migrate it once,
-  // and only when no per-provider keys exist yet (a Kimi-only user's
-  // mirrored apiKey is not legacy storage).
-  if (!deepseekApiKey && !kimiApiKey && legacyKey) {
+  // and only when no per-provider key fields exist yet — absent, not empty:
+  // an empty deepseekApiKey/kimiApiKey is a key the user cleared, and
+  // migrating its stale apiKey mirror would resurrect the deleted key (a
+  // Kimi-only user's mirrored apiKey is likewise not legacy storage).
+  if (!("deepseekApiKey" in stored) && !("kimiApiKey" in stored) && legacyKey) {
     deepseekApiKey = legacyKey;
   }
   const activeKey = provider === "kimi" ? kimiApiKey : deepseekApiKey;

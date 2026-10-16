@@ -1928,12 +1928,28 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
     attributes: {},
     listeners: {},
     options: [],
-    classList: {
-      toggle() {},
-      add() {},
-      remove() {},
-      contains: () => false
-    },
+    // Real class tracking (not a no-op): tests assert rendered classes,
+    // e.g. the display-mode buttons' `active` state.
+    classList: (() => {
+      const classes = new Set();
+      return {
+        toggle(name, force) {
+          const on = force === undefined ? !classes.has(name) : Boolean(force);
+          if (on) {
+            classes.add(name);
+          } else {
+            classes.delete(name);
+          }
+        },
+        add(name) {
+          classes.add(name);
+        },
+        remove(name) {
+          classes.delete(name);
+        },
+        contains: (name) => classes.has(name)
+      };
+    })(),
     addEventListener(type, fn) {
       (this.listeners[type] = this.listeners[type] || []).push(fn);
     },
@@ -2705,6 +2721,17 @@ async function checkSettingsStateModel() {
       {},
       "collectDirtyPatch: a clean model writes nothing"
     );
+    // Clearing the last key is a real write: the empty string must reach the
+    // legacy apiKey mirror too, or the stale mirror would make the next load
+    // treat the deleted key as a <=1.3.x legacy apiKey and resurrect it.
+    assertEqual(
+      pure.collectDirtyPatch(
+        { snapshot: { ...model.snapshot }, edits: { deepseekApiKey: "" } },
+        { ...controlValues, deepseekApiKey: "" }
+      ).patch,
+      { deepseekApiKey: "", apiKey: "" },
+      "collectDirtyPatch: clearing the last key clears the legacy apiKey mirror"
+    );
   }
 
   // settleSavedEdits + collectDirtyPatch's savedValues: save completion
@@ -2878,6 +2905,85 @@ async function checkSettingsStateModel() {
     assertEqual(setCalls[1], { targetLanguage: "ja" }, "save: a language edit writes only the language (no key mirror)");
     await new Promise((resolve) => setTimeout(resolve, 0));
     assertEqual(popup.hooks.getSettingsModel().edits, {}, "save: language dirty flag cleared by the auto-save");
+  }
+
+  // First load must render the display-mode buttons even when the stored (or
+  // default) mode equals the in-memory default: the popup markup ships no
+  // preselected button, so skipping the "unchanged" render leaves the radio
+  // without an active button until the user clicks one.
+  {
+    const modeClasses = (popup) =>
+      popup.sandbox.document.querySelectorAll(".mode-button").map((button) => ({
+        mode: button.dataset.mode,
+        active: button.classList.contains("active")
+      }));
+    const empty = createPopupVm({});
+    await empty.hooks.initializePromise;
+    assertEqual(
+      modeClasses(empty),
+      [
+        { mode: "bilingual", active: true },
+        { mode: "translation-only", active: false },
+        { mode: "original", active: false }
+      ],
+      "display mode: first load on empty storage marks the default (bilingual) button active"
+    );
+    const storedMode = createPopupVm({ displayMode: "original" });
+    await storedMode.hooks.initializePromise;
+    assertEqual(
+      modeClasses(storedMode).filter((entry) => entry.active),
+      [{ mode: "original", active: true }],
+      "display mode: first load applies a stored non-default mode to the buttons"
+    );
+  }
+
+  // Deleting the last stored key must survive every later load path: the
+  // save clears both the per-provider field and the legacy mirror, and no
+  // reopen (popup migrateSettings) or worker load (background loadSettings)
+  // may resurrect the deleted key from a stale mirror.
+  {
+    const deletedStorage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: "",
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(deletedStorage);
+    await popup.hooks.initializePromise;
+    const keyInput = popup.dom.get("api-key");
+    assertEqual(keyInput.value, DEEPSEEK_KEY, "key delete: the stored key loads into the input");
+    keyInput.value = "";
+    fire(keyInput, "input");
+    await popup.hooks.saveSettings();
+    assertEqual(deletedStorage.deepseekApiKey, "", "key delete: saving the cleared input empties deepseekApiKey");
+    assertEqual(deletedStorage.apiKey, "", "key delete: the legacy apiKey mirror is cleared with it");
+
+    const reopened = createPopupVm(deletedStorage);
+    await reopened.hooks.initializePromise;
+    assertEqual(String(deletedStorage.deepseekApiKey || ""), "", "key delete: popup reopen does not resurrect the deleted key");
+    assertEqual(reopened.dom.get("api-key").value, "", "key delete: reopened popup shows an empty key input");
+
+    const worker = createBackgroundVm(deletedStorage);
+    await worker.hooks.loadSettings();
+    assertEqual(String(deletedStorage.deepseekApiKey || ""), "", "key delete: background loadSettings does not resurrect the deleted key");
+    assertEqual(String(deletedStorage.apiKey || ""), "", "key delete: the mirror stays empty after the worker load");
+
+    // Storage as the pre-fix build left it after a delete (per-provider
+    // fields present-but-empty, stale mirror alongside): both load paths
+    // treat it as cleared and heal the mirror instead of migrating it.
+    const stalePopupStorage = { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: DEEPSEEK_KEY, model: "deepseek-flash" };
+    const stalePopup = createPopupVm(stalePopupStorage);
+    await stalePopup.hooks.initializePromise;
+    assertEqual(String(stalePopupStorage.deepseekApiKey || ""), "", "stale mirror: popup load does not resurrect the deleted key");
+    assertEqual(String(stalePopupStorage.apiKey || ""), "", "stale mirror: popup load heals the stale apiKey mirror to empty");
+    const staleWorkerStorage = { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: DEEPSEEK_KEY, model: "deepseek-flash" };
+    const staleWorker = createBackgroundVm(staleWorkerStorage);
+    await staleWorker.hooks.loadSettings();
+    assertEqual(String(staleWorkerStorage.deepseekApiKey || ""), "", "stale mirror: background load does not resurrect the deleted key");
+    assertEqual(String(staleWorkerStorage.apiKey || ""), "", "stale mirror: background load heals the mirror");
   }
 
   // (5) Preserve edits made while a save is pending: the storage write of
