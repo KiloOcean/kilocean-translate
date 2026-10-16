@@ -2356,6 +2356,19 @@ async function checkKeyMigrationGate() {
       }
     }
 
+    // Provider-only import must not leave the other provider's model.
+    {
+      const p2 = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" });
+      await p2.hooks.initializePromise;
+      await p2.hooks.applyImportedSettings({ provider: "kimi" });
+      if (p2.storage.model !== "kimi-k2.6") {
+        fail(`import: provider-only import must normalize model to kimi default, got ${p2.storage.model}`);
+      }
+      if (p2.storage.deepseekApiKey !== DEEPSEEK_KEY || p2.storage.kimiApiKey !== KIMI_KEY) {
+        fail("import: provider-only import must keep both keys");
+      }
+    }
+
     // parseImportedSettings: happy paths and every rejection reason.
     const goodFile = {
       format: "kilocean-translate-settings",

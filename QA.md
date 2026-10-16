@@ -72,3 +72,4 @@ fi
 > The label must be applied AFTER the last push — otherwise the QA Gate
 > rejects with "label predates the latest push". A new push removes the
 > label; re-verify and re-apply it.
+- [ ] 旧 unpacked（≤1.4.2，路径 ID）改为加载 1.4.3：ID 变为商店 ID，popup 显示「未配置」且缺 Key 引导含一次性过渡说明；粘贴一次后再次重载/更新不再需要输入。

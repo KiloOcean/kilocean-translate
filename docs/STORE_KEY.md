@@ -62,3 +62,7 @@ console.log(id); // lmdbhjngjhlgbpmbjfffegjalchblpke
 无关。`manifest.key` 是扩展身份公钥；DeepSeek / Kimi 的 API Key 只保存在用户本机的
 `chrome.storage.local`（见弹窗「设置备份」的导出/导入，默认不含 Key），永不进入仓库或
 上传包。
+
+## 已有「加载已解压」用户的一次性过渡（1.4.2 → 1.4.3）
+
+加上 `key` 后，unpacked 安装的扩展 ID 会从「路径推导的 ID」变为商店 ID。`chrome.storage.local` 按扩展 ID 隔离，所以 **此前以开发者模式加载 ≤1.4.2 的用户** 在 1.4.3 下会看到「未配置」，需要重新粘贴一次 Key（popup 的缺 Key 引导中有说明）；之后的安装/更新 ID 固定，不会再丢。商店安装的用户 ID 本就不变，存储与迁移不受影响（ci-check 迁移门禁覆盖）。旧 ID 的数据仍保留在旧的 unpacked 条目中，未移除前不会丢失，无法跨扩展自动读取（没有共享存储且不新增权限）。

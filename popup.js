@@ -321,6 +321,8 @@ elements.provider.addEventListener("change", () => {
   // Bank the key shown in the input under the provider it belongs to, then
   // swap the input to the newly selected provider's stored key.
   providerKeys[currentProvider] = elements.apiKey.value.trim();
+  // Drop any in-flight connection test for the previous provider's key.
+  keyTestOp += 1;
   currentProvider = nextProvider;
   applyProviderUi(nextProvider, { resetModel: true });
   elements.apiKey.value = providerKeys[nextProvider];
@@ -849,6 +851,13 @@ async function applyImportedSettings(imported) {
     : "deepseek";
   const deepseekApiKey = updates.deepseekApiKey ?? String(stored.deepseekApiKey || "").trim();
   const kimiApiKey = updates.kimiApiKey ?? String(stored.kimiApiKey || "").trim();
+  // Keep provider and model compatible: a partial import (provider-only or
+  // model-only) must not leave a model belonging to the other provider.
+  const effectiveModel = updates.model || stored.model;
+  const providerModels = PROVIDER_META[provider].models.map((entry) => entry.value ?? entry);
+  if (!providerModels.includes(effectiveModel)) {
+    updates.model = PROVIDER_META[provider].defaultModel;
+  }
   // Legacy mirror for content.js's selection key gate.
   updates.apiKey = provider === "kimi" ? kimiApiKey : deepseekApiKey;
   await chrome.storage.local.set(updates);
