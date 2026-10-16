@@ -473,9 +473,34 @@ elements.exportSettings.addEventListener("click", () => {
   void exportSettingsFile();
 });
 
+// Chromium (Linux, ~128–130, crbug 364825891) can destroy an action popup
+// when a file chooser opens, so the import never runs. Import therefore runs
+// from popup.html opened as a normal extension tab (?view=settings), which
+// survives the chooser. chrome.tabs.create needs no extra permission.
+const IS_SETTINGS_TAB = (() => {
+  try {
+    return new URLSearchParams(globalThis.location?.search || "").get("view") === "settings";
+  } catch {
+    return false;
+  }
+})();
+
 elements.importSettings.addEventListener("click", () => {
-  elements.importFile.click();
+  if (IS_SETTINGS_TAB) {
+    elements.importFile.click();
+    return;
+  }
+  void chrome.tabs.create({ url: chrome.runtime.getURL("popup.html?view=settings") }).then(() => {
+    window.close();
+  });
 });
+
+if (IS_SETTINGS_TAB) {
+  document.body?.classList?.add("settings-tab");
+  setTimeout(() => {
+    setStatus("导入设置", "点击「导入设置」选择之前导出的 JSON 文件", "idle");
+  }, 0);
+}
 
 elements.importFile.addEventListener("change", () => {
   const file = elements.importFile.files && elements.importFile.files[0];

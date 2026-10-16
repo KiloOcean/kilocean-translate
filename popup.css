@@ -559,3 +559,8 @@ select:focus {
   text-decoration: underline;
 }
 
+
+/* popup.html opened as a tab for settings import (file chooser safe). */
+body.settings-tab {
+  margin: 24px auto;
+}

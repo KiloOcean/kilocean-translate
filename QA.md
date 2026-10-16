@@ -73,3 +73,4 @@ fi
 > rejects with "label predates the latest push". A new push removes the
 > label; re-verify and re-apply it.
 - [ ] 旧 unpacked（≤1.4.2，路径 ID）改为加载 1.4.3：ID 变为商店 ID，popup 显示「未配置」且缺 Key 引导含一次性过渡说明；粘贴一次后再次重载/更新不再需要输入。
+- [ ] 导入设置：popup 点「导入设置」打开设置标签页（popup.html?view=settings），在该页选择 JSON 导入成功；Linux Chromium 上选择文件后导入仍执行。

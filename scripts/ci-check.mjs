@@ -2512,6 +2512,11 @@ async function checkKeyMigrationGate() {
 
   // ---- Static: export uses blob + <a download>, never chrome.downloads ----
   const popupScan = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
+  // Import must not run its file chooser inside the transient action popup
+  // (crbug 364825891): popup opens popup.html?view=settings as a tab.
+  if (!/view=settings/.test(popupScan) || !/chrome\.tabs\.create\(/.test(popupScan) || !/IS_SETTINGS_TAB/.test(popupScan)) {
+    fail("popup.js: settings import must run from an extension tab (view=settings), not the action popup");
+  }
   if (!/new Blob\(/.test(popupScan) || !/createObjectURL\(/.test(popupScan) || !/\.download\s*=/.test(popupScan)) {
     fail("popup.js: settings export must use Blob + <a download> (no downloads permission)");
   }
