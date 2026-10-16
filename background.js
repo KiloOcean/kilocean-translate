@@ -233,6 +233,13 @@ chrome.runtime.onInstalled.addListener(async () => {
   await loadSettings();
 });
 
+// Browser start re-runs the worker cold: run the <=1.3.x key / legacy model
+// migration eagerly (loadSettings only ever writes drifted fields, never
+// clears a stored key) so the first translate of the session sees it.
+chrome.runtime.onStartup.addListener(async () => {
+  await loadSettings();
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   void clearPendingSelection(tabId);
   cancelledContentRuns.delete(tabId);

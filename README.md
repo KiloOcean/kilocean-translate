@@ -34,7 +34,9 @@ Chrome / Edge 扩展：用你自己的 DeepSeek 或 Kimi（Moonshot）API Key，
 
 ## 商店包
 
-正式发布请用商店后台上传的 zip（勿把含密钥的本地配置打进包）。当前版本见 `manifest.json`（1.4.2）。
+正式发布请用商店后台上传的 zip（勿把含密钥的本地配置打进包）。当前版本见 `manifest.json`（1.4.3）。
+
+`manifest.json` 中的 `key` 字段是本扩展在 Chrome Web Store 的**公钥**（public key），不是 API Key，可以安全保留在仓库与上传包中：它保证 unpacked（开发者模式加载）与商店安装得到同一个扩展 ID（`lmdbhjngjhlgbpmbjfffegjalchblpke`），存储（含已保存的 API Key）在两者之间通用。CWS 上传包含 `key` 的 zip 时，仅当该 key 与商店条目的公钥一致才会被接受；不一致时须先移除该字段再上传。详见 [`docs/STORE_KEY.md`](docs/STORE_KEY.md)。
 
 ## 隐私
 

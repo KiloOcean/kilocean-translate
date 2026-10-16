@@ -21,6 +21,13 @@ PR: #___
 - [ ] 移动端 / 小屏表现正常（如适用）/ Mobile or narrow viewport looks right (if applicable)
 - [ ] 控制台无新增错误、警告 / No new console errors or warnings
 
+## 1.4.3 手动验证（Key 持久化）/ 1.4.3 Manual checks (key persistence)
+
+- [ ] **商店升级不丢 Key**：从商店上一版本（1.4.2 / 1.3.x）升级到 1.4.3 后，打开扩展弹窗无需重新输入 Key（顶部「DeepSeek / Kimi：已配置 · 尾号 xxxx」直接可见），整页翻译与划词翻译正常。
+  **Upgrade from the previous store version (1.4.2 / 1.3.x) to 1.4.3 keeps saved keys** — the popup shows the per-provider key status (已配置 · 尾号 xxxx) without re-entering anything, and page/selection translation still work.（1.3.x 的单 Key 存量会自动迁移为 DeepSeek Key。）
+- [ ] **unpacked 与商店 ID 一致**：开发者模式「加载已解压的扩展程序」加载本仓库根目录后，`chrome://extensions` 中显示的 ID 为 `lmdbhjngjhlgbpmbjfffegjalchblpke`，与商店条目一致（`manifest.json` 的 `key` 字段 = 商店公钥，见 `docs/STORE_KEY.md`）；unpacked 下同样能看到已保存的 Key 状态。
+  **Unpacked install shows the same ID as the store listing** (`lmdbhjngjhlgbpmbjfffegjalchblpke`) because `manifest.key` carries the store public key.
+
 ## 黄金样例 / Golden Samples
 
 > 用真实输入/输出对固定行为，防止悄悄漂移。

@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -22,7 +23,18 @@ const ALLOWED_HOSTS = new Set([
 const JS_FILES = ["background.js", "content.js", "popup.js", "shared.js"];
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
+// Chrome Web Store item this repository publishes to. manifest.key must carry
+// the item's public key so unpacked installs share the store extension ID (and
+// therefore chrome.storage — saved API keys survive the switch).
+const STORE_EXTENSION_ID = "lmdbhjngjhlgbpmbjfffegjalchblpke";
+
 const errors = [];
+
+// Obviously-fake API key fixtures, built at runtime so no key-shaped literal
+// lives in the source (keeps secret scanners quiet without allowlisting).
+function fakeKey(tag, len) {
+  return ["sk", tag + "FAKE".padEnd(len - 4, "X")].join("-");
+}
 
 function fail(msg) {
   errors.push(msg);
@@ -83,6 +95,31 @@ function checkManifest() {
   for (const host of hosts) {
     if (!ALLOWED_HOSTS.has(host)) {
       fail(`disallowed host_permission: ${host} (allowlist: ${[...ALLOWED_HOSTS].join(", ")})`);
+    }
+  }
+
+  // manifest.key = the Chrome Web Store public key (NOT an API key). It pins
+  // unpacked installs to the store extension ID so saved keys survive the
+  // unpacked→store transition. Derivation: sha256(base64-decoded DER), first
+  // 16 bytes, each nibble 0-15 → 'a'-'p'.
+  if (typeof manifest.key !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(manifest.key)) {
+    fail(
+      `manifest.key (Chrome Web Store public key, base64) is required so unpacked installs keep the store ID ${STORE_EXTENSION_ID}, got ${JSON.stringify(manifest.key)}`
+    );
+  } else {
+    const der = Buffer.from(manifest.key, "base64");
+    if (der.toString("base64") !== manifest.key || der.length < 160) {
+      fail("manifest.key must base64-decode (round-trip) to a DER public key of plausible size");
+    } else {
+      const digest = crypto.createHash("sha256").update(der).digest();
+      let derivedId = "";
+      for (let i = 0; i < 16; i += 1) {
+        derivedId += String.fromCharCode(97 + (digest[i] >> 4));
+        derivedId += String.fromCharCode(97 + (digest[i] & 0xf));
+      }
+      if (derivedId !== STORE_EXTENSION_ID) {
+        fail(`manifest.key must derive the store extension ID ${STORE_EXTENSION_ID}, got ${derivedId}`);
+      }
     }
   }
 }
@@ -1785,6 +1822,644 @@ async function checkModelMigrationAndRetryPolicy() {
   }
 }
 
+// ---- 1.4.3 key persistence: upgrades must never wipe a stored key ----
+// Loads the REAL background.js (+ shared.js) into a node vm behind a mock
+// chrome (storage.local, runtime.onInstalled/onStartup/onMessage, tabs,
+// action) and replays every stored-settings shape a 1.3.x / 1.4.x user can
+// carry into 1.4.3 through the shipping code paths: direct loadSettings,
+// onInstalled(update), worker cold-restart (script reload + onStartup), and
+// the live message paths (TEST_CONNECTION / TRANSLATE_BATCH). A stored key
+// may be migrated (legacy apiKey → deepseekApiKey) or mirrored (apiKey), but
+// never emptied. The popup load path runs in its own vm with a minimal DOM
+// mock, including the settings import/export merge rules.
+function createBackgroundVm(storageData, fetchImpl) {
+  const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
+  const backgroundSource = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
+  const listeners = {
+    installed: [],
+    startup: [],
+    message: [],
+    tabsRemoved: [],
+    tabsUpdated: []
+  };
+  const sandbox = {
+    console: { log() {}, warn() {}, error() {} },
+    setTimeout,
+    clearTimeout,
+    AbortController,
+    fetch: fetchImpl,
+    chrome: {
+      runtime: {
+        id: "kilocean-ci-extension-id",
+        onInstalled: { addListener: (fn) => listeners.installed.push(fn) },
+        onStartup: { addListener: (fn) => listeners.startup.push(fn) },
+        onMessage: { addListener: (fn) => listeners.message.push(fn) }
+      },
+      storage: {
+        local: {
+          get: async (defaults) => ({ ...(defaults || {}), ...storageData }),
+          set: async (updates) => { Object.assign(storageData, updates); }
+        },
+        session: {
+          get: async () => ({}),
+          set: async () => {},
+          remove: async () => {}
+        },
+        onChanged: { addListener() {} }
+      },
+      tabs: {
+        onRemoved: { addListener: (fn) => listeners.tabsRemoved.push(fn) },
+        onUpdated: { addListener: (fn) => listeners.tabsUpdated.push(fn) }
+      },
+      action: {
+        setBadgeText: async () => {},
+        setBadgeBackgroundColor: async () => {}
+      }
+    }
+  };
+  const context = vm.createContext(sandbox);
+  sandbox.importScripts = (rel) => {
+    if (rel !== "shared.js") {
+      throw new Error(`unexpected importScripts: ${rel}`);
+    }
+    vm.runInContext(sharedSource, context, { filename: "shared.js" });
+  };
+  vm.runInContext(
+    `${backgroundSource}\n;globalThis.__hooks = { loadSettings, translateBatch, PROVIDERS, DEFAULT_SETTINGS };`,
+    context,
+    { filename: "background.js" }
+  );
+  return {
+    storage: storageData,
+    listeners,
+    hooks: sandbox.__hooks,
+    sendMessage: (message, sender = { id: sandbox.chrome.runtime.id, tab: { id: 11 } }) =>
+      new Promise((resolve) => {
+        if (listeners.message.length !== 1) {
+          throw new Error("background vm: exactly one runtime.onMessage listener expected");
+        }
+        listeners.message[0](message, sender, resolve);
+      })
+  };
+}
+
+// Minimal DOM stub good enough to run the real popup.js load path (and the
+// settings import/export helpers) without a browser.
+function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok: false }) } = {}) {
+  const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
+  const popupSource = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
+
+  const makeElement = (overrides = {}) => ({
+    value: "",
+    type: "text",
+    textContent: "",
+    disabled: false,
+    hidden: false,
+    checked: false,
+    focused: false,
+    files: [],
+    dataset: {},
+    attributes: {},
+    listeners: {},
+    options: [],
+    classList: {
+      toggle() {},
+      add() {},
+      remove() {},
+      contains: () => false
+    },
+    addEventListener(type, fn) {
+      (this.listeners[type] = this.listeners[type] || []).push(fn);
+    },
+    removeEventListener() {},
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    focus() {
+      this.focused = true;
+    },
+    appendChild(node) {
+      this.options.push(node);
+      return node;
+    },
+    click() {},
+    remove() {},
+    ...overrides
+  });
+  // <select>-like: assigning innerHTML = "" must clear the options list like
+  // the real DOM, or applyProviderUi's rebuild would stack stale options.
+  const makeSelect = () => {
+    const element = makeElement();
+    let innerHTML = "";
+    Object.defineProperty(element, "innerHTML", {
+      get() {
+        return innerHTML;
+      },
+      set(next) {
+        innerHTML = String(next);
+        if (innerHTML === "") {
+          element.options.length = 0;
+        }
+      }
+    });
+    return element;
+  };
+
+  const byId = new Map();
+  const element = (id, overrides) => {
+    if (!byId.has(id)) {
+      byId.set(id, id === "provider" || id === "model" || id === "target-language"
+        ? makeSelect()
+        : makeElement(overrides));
+    }
+    return byId.get(id);
+  };
+  for (const id of [
+    "provider",
+    "api-key",
+    "api-key-label",
+    "get-key-link",
+    "key-status-deepseek",
+    "key-status-deepseek-value",
+    "key-status-kimi",
+    "key-status-kimi-value",
+    "key-guide",
+    "target-language",
+    "model",
+    "toggle-key",
+    "test-connection",
+    "translate",
+    "restore",
+    "export-html",
+    "print-pdf",
+    "export-settings",
+    "import-settings",
+    "import-file",
+    "export-include-keys",
+    "status-title",
+    "status-detail",
+    "selection-confirm-panel",
+    "selection-confirm-text",
+    "selection-confirm-btn",
+    "selection-confirm-dismiss"
+  ]) {
+    element(id);
+  }
+  element("api-key").type = "password";
+  const statusCard = makeElement();
+  const modeButtons = ["bilingual", "translation-only", "original"].map((mode) =>
+    makeElement({ dataset: { mode } })
+  );
+
+  const sandbox = {
+    console: { log() {}, warn() {}, error() {} },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    addEventListener() {},
+    document: {
+      getElementById: (id) => byId.get(id) || null,
+      querySelector: (selector) => (selector === ".status-card" ? statusCard : null),
+      querySelectorAll: (selector) => (selector === ".mode-button" ? modeButtons : []),
+      createElement: () => makeElement(),
+      body: makeElement(),
+      addEventListener() {},
+      visibilityState: "visible"
+    },
+    chrome: {
+      runtime: {
+        getManifest: () => ({ version: "1.4.3" }),
+        onMessage: { addListener() {} },
+        sendMessage: (message) => runtimeMessageHandler(message)
+      },
+      storage: {
+        local: {
+          get: async (defaults) => ({ ...(defaults || {}), ...storageData }),
+          set: async (updates) => { Object.assign(storageData, updates); }
+        },
+        onChanged: { addListener() {} }
+      },
+      tabs: {
+        query: async () => [{ id: 42 }],
+        sendMessage: async () => ({ ok: true, status: { active: false } })
+      },
+      scripting: { executeScript: async () => {} }
+    }
+  };
+  sandbox.window = sandbox;
+  const context = vm.createContext(sandbox);
+  vm.runInContext(sharedSource, context, { filename: "shared.js" });
+  vm.runInContext(
+    `${popupSource}\n;globalThis.__popupHooks = {
+      parseImportedSettings,
+      applyImportedSettings,
+      handleApiKeyPasted,
+      apiKeyFormatReason,
+      saveSettings,
+      migrateSettings,
+      initializePromise,
+      getProviderKeys: () => providerKeys
+    };`,
+    context,
+    { filename: "popup.js" }
+  );
+  return {
+    storage: storageData,
+    dom: byId,
+    hooks: sandbox.__popupHooks
+  };
+}
+
+async function checkKeyMigrationGate() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  const LEGACY_KEY = fakeKey("legacy", 26);
+  const DEEPSEEK_KEY = fakeKey("deepseek", 21);
+  const KIMI_KEY = fakeKey("kimi", 25);
+
+  // Provider fetch mock: capture the Authorization header, answer with a
+  // well-formed minimal translation so the whole shipping path succeeds.
+  const seenRequests = [];
+  const okBody = JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({ translations: ["你好"] }) } }]
+  });
+  const okFetch = async (url, options = {}) => {
+    seenRequests.push({ url, authorization: options.headers?.Authorization || "" });
+    return {
+      ok: true,
+      status: 200,
+      statusText: "",
+      headers: { get: () => null },
+      url,
+      text: async () => okBody
+    };
+  };
+
+  // A stored key may migrate or mirror, never disappear.
+  const storageKeysSurvive = (seed, data, label) => {
+    const seedDeepseek = String(seed.deepseekApiKey || "").trim();
+    const seedKimi = String(seed.kimiApiKey || "").trim();
+    const seedLegacy = String(seed.apiKey || "").trim();
+    if (seedDeepseek) {
+      assertTrue(
+        String(data.deepseekApiKey || "").trim() === seedDeepseek,
+        `${label}: stored DeepSeek key must survive every 1.4.3 load path`
+      );
+    }
+    if (seedKimi) {
+      assertTrue(
+        String(data.kimiApiKey || "").trim() === seedKimi,
+        `${label}: stored Kimi key must survive every 1.4.3 load path`
+      );
+    }
+    if (seedLegacy && !seedDeepseek && !seedKimi) {
+      assertTrue(
+        String(data.deepseekApiKey || "").trim() === seedLegacy,
+        `${label}: <=1.3.x legacy apiKey must migrate into deepseekApiKey, not vanish`
+      );
+    }
+  };
+
+  // Replay one stored-settings shape through every upgrade path against the
+  // SAME evolving storage object: repeated worker cold-restarts (script
+  // reload = onStartup equivalent), onInstalled(update), settings loads and
+  // the live TEST_CONNECTION message path (which must bill the expected key).
+  const runUpgradeGauntlet = async (label, seed, { expectedProvider, expectedActiveKey, expectedModel }) => {
+    const storageData = { ...seed };
+    for (let round = 0; round < 3; round += 1) {
+      // (a) worker cold-restart: fresh vm, top-level runs, onStartup fires,
+      //     then a direct settings load.
+      const cold = createBackgroundVm(storageData, okFetch);
+      assertTrue(cold.listeners.startup.length === 1, `${label}: background must register a runtime.onStartup migration pass`);
+      for (const onStartup of cold.listeners.startup) {
+        await onStartup();
+      }
+      const settings = await cold.hooks.loadSettings();
+      storageKeysSurvive(seed, storageData, `${label} (cold restart ${round})`);
+      assertEqual(settings.provider, expectedProvider, `${label}: provider preserved (round ${round})`);
+      assertEqual(settings.model, expectedModel, `${label}: model mapped to current name (round ${round})`);
+      assertEqual(
+        String(settings[expectedProvider === "kimi" ? "kimiApiKey" : "deepseekApiKey"] || ""),
+        expectedActiveKey,
+        `${label}: migrated key is usable in returned settings (round ${round})`
+      );
+
+      // (b) onInstalled(update) — the store-upgrade event itself.
+      const updated = createBackgroundVm(storageData, okFetch);
+      for (const onInstalled of updated.listeners.installed) {
+        await onInstalled({ reason: "update", previousVersion: "1.4.2" });
+      }
+      storageKeysSurvive(seed, storageData, `${label} (onInstalled update ${round})`);
+
+      // (c) live message path: TEST_CONNECTION exercises loadSettings +
+      //     translateBatch end to end and must send the expected bearer key.
+      const requestsBefore = seenRequests.length;
+      const live = createBackgroundVm(storageData, okFetch);
+      const response = await live.sendMessage({
+        type: "TEST_CONNECTION",
+        provider: expectedProvider,
+        targetLanguage: "zh-CN",
+        model: expectedModel
+      });
+      assertTrue(response?.ok === true, `${label}: TEST_CONNECTION succeeds with migrated settings (round ${round})`);
+      assertEqual(seenRequests.length, requestsBefore + 1, `${label}: connection test bills exactly one request (round ${round})`);
+      assertEqual(
+        seenRequests[seenRequests.length - 1].authorization,
+        `Bearer ${expectedActiveKey}`,
+        `${label}: migrated key reaches the provider Authorization header (round ${round})`
+      );
+
+      // (d) popup open between rounds (below) rewrites the full settings
+      //     object — folded in by the popup scenarios after this loop.
+    }
+    return storageData;
+  };
+
+  // ---- 1.3.x single-key storage (apiKey + legacy model name) ----
+  const migratedFromLegacy = await runUpgradeGauntlet(
+    "1.3.x → 1.4.3",
+    { apiKey: LEGACY_KEY, model: "deepseek-v4-flash" },
+    { expectedProvider: "deepseek", expectedActiveKey: LEGACY_KEY, expectedModel: "deepseek-flash" }
+  );
+  assertEqual(migratedFromLegacy.deepseekApiKey, LEGACY_KEY, "1.3.x → 1.4.3: legacy key persisted as deepseekApiKey");
+  assertEqual(migratedFromLegacy.model, "deepseek-flash", "1.3.x → 1.4.3: legacy model name retired in storage");
+
+  // ---- 1.4.x DeepSeek user, current + legacy model names ----
+  await runUpgradeGauntlet(
+    "1.4.x deepseek (legacy model)",
+    { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, model: "deepseek-v4-flash", targetLanguage: "zh-CN", displayMode: "bilingual" },
+    { expectedProvider: "deepseek", expectedActiveKey: DEEPSEEK_KEY, expectedModel: "deepseek-flash" }
+  );
+  await runUpgradeGauntlet(
+    "1.4.x deepseek (current model)",
+    { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, model: "deepseek-v4-pro" },
+    { expectedProvider: "deepseek", expectedActiveKey: DEEPSEEK_KEY, expectedModel: "deepseek-v4-pro" }
+  );
+
+  // ---- 1.4.x Kimi user: kimi key must survive, and the legacy apiKey
+  // mirror must NOT be reinterpreted as a DeepSeek key ----
+  const kimiStorage = await runUpgradeGauntlet(
+    "1.4.x kimi (mirrored apiKey)",
+    { provider: "kimi", kimiApiKey: KIMI_KEY, apiKey: KIMI_KEY, model: "kimi-k2.6" },
+    { expectedProvider: "kimi", expectedActiveKey: KIMI_KEY, expectedModel: "kimi-k2.6" }
+  );
+  assertEqual(String(kimiStorage.deepseekApiKey || ""), "", "1.4.x kimi: mirrored apiKey is not re-imported as a DeepSeek key");
+
+  // ---- 1.4.x dual-key user ----
+  const dualStorage = await runUpgradeGauntlet(
+    "1.4.x dual keys",
+    { provider: "kimi", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, apiKey: KIMI_KEY, model: "kimi-k2.6" },
+    { expectedProvider: "kimi", expectedActiveKey: KIMI_KEY, expectedModel: "kimi-k2.6" }
+  );
+  assertEqual(dualStorage.deepseekApiKey, DEEPSEEK_KEY, "1.4.x dual keys: inactive DeepSeek key survives Kimi sessions");
+  assertEqual(dualStorage.apiKey, KIMI_KEY, "1.4.x dual keys: apiKey mirrors the active provider's key");
+
+  // ---- Popup load path (vm + DOM mock): open on legacy storage, then
+  // re-open on the result — keys must never be wiped by the popup save ----
+  {
+    // 1.3.x storage + popup open → migration persists, status row shows the tail.
+    const legacyPopupStorage = { apiKey: LEGACY_KEY, model: "deepseek-v4-flash" };
+    const testRequests = [];
+    const popup1 = createPopupVm(legacyPopupStorage, {
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          testRequests.push(message);
+          return { ok: true };
+        }
+        return { ok: false };
+      }
+    });
+    await popup1.hooks.initializePromise;
+    assertEqual(legacyPopupStorage.deepseekApiKey, LEGACY_KEY, "popup load 1.3.x: legacy key persisted as deepseekApiKey");
+    assertEqual(legacyPopupStorage.apiKey, LEGACY_KEY, "popup load 1.3.x: selection-gate mirror carries the key");
+    assertEqual(legacyPopupStorage.model, "deepseek-flash", "popup load 1.3.x: legacy model name migrated");
+    assertEqual(popup1.dom.get("api-key").value, LEGACY_KEY, "popup load 1.3.x: key input shows the migrated key");
+    assertEqual(
+      popup1.dom.get("key-status-deepseek-value").textContent,
+      `已配置 · 尾号 ${LEGACY_KEY.slice(-4)}`,
+      "popup key status: DeepSeek row shows 已配置 with the key tail"
+    );
+    assertEqual(
+      popup1.dom.get("key-status-kimi-value").textContent,
+      "未配置",
+      "popup key status: Kimi row shows 未配置 when no key exists"
+    );
+
+    // Re-open the popup on the migrated storage: values stay put (no wipe).
+    const popup2 = createPopupVm(legacyPopupStorage);
+    await popup2.hooks.initializePromise;
+    assertEqual(legacyPopupStorage.deepseekApiKey, LEGACY_KEY, "popup reopen: migrated key not wiped");
+
+    // Kimi-only 1.4.x storage through the popup.
+    const kimiPopupStorage = { provider: "kimi", kimiApiKey: KIMI_KEY, apiKey: KIMI_KEY, model: "kimi-k2.6" };
+    const popup3 = createPopupVm(kimiPopupStorage);
+    await popup3.hooks.initializePromise;
+    assertEqual(kimiPopupStorage.kimiApiKey, KIMI_KEY, "popup load 1.4.x kimi: kimi key not wiped");
+    assertEqual(String(kimiPopupStorage.deepseekApiKey || ""), "", "popup load 1.4.x kimi: no phantom DeepSeek key appears");
+    assertEqual(
+      popup3.dom.get("key-status-kimi-value").textContent,
+      `已配置 · 尾号 ${KIMI_KEY.slice(-4)}`,
+      "popup key status: Kimi row shows 已配置 with the key tail"
+    );
+
+    // Paste flow: format gate before network, auto-save, then connection test.
+    // Seeded with BOTH providers' keys so the auto-save also proves that
+    // saving the active provider never clobbers the inactive one's key.
+    const pasteStorage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const pastePopup = createPopupVm(pasteStorage, {
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          testRequests.push(message);
+          return { ok: true };
+        }
+        return { ok: false };
+      }
+    });
+    await pastePopup.hooks.initializePromise;
+    const pasteDom = pastePopup.dom;
+    pasteDom.get("api-key").value = "not-a-key";
+    await pastePopup.hooks.handleApiKeyPasted();
+    assertEqual(testRequests.length, 0, "paste flow: format-invalid key must not hit the network");
+    assertEqual(pasteDom.get("status-title").textContent, "Key 格式错误", "paste flow: format error surfaces a clear title");
+    assertTrue(
+      String(pasteDom.get("status-detail").textContent).includes("sk-"),
+      "paste flow: format error explains the expected shape"
+    );
+    assertEqual(pastePopup.storage.deepseekApiKey, "not-a-key", "paste flow: invalid-shape paste is still saved locally (no silent drop)");
+    assertEqual(pastePopup.storage.kimiApiKey, KIMI_KEY, "paste flow: saving the DeepSeek input never wipes the stored Kimi key");
+
+    pasteDom.get("api-key").value = DEEPSEEK_KEY;
+    await pastePopup.hooks.handleApiKeyPasted();
+    assertEqual(testRequests.length, 1, "paste flow: well-formed key triggers exactly one connection test");
+    assertEqual(testRequests[0].type, "TEST_CONNECTION", "paste flow: verification goes through the background message path");
+    assertEqual(pasteDom.get("status-title").textContent, "Key 有效", "paste flow: success surfaces a clear title");
+    assertEqual(pastePopup.storage.deepseekApiKey, DEEPSEEK_KEY, "paste flow: pasted key auto-saved");
+    assertEqual(pastePopup.storage.kimiApiKey, KIMI_KEY, "paste flow: auto-save keeps the inactive provider's key");
+    assertEqual(
+      pasteDom.get("key-status-deepseek-value").textContent,
+      `已配置 · 尾号 ${DEEPSEEK_KEY.slice(-4)}`,
+      "paste flow: key status refreshes after save"
+    );
+  }
+
+  // ---- Settings import/export (popup vm): schema validation + no-wipe merge ----
+  {
+    const storage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(storage);
+    await popup.hooks.initializePromise;
+
+    // parseImportedSettings: happy paths and every rejection reason.
+    const goodFile = {
+      format: "kilocean-translate-settings",
+      version: 1,
+      settings: { provider: "kimi", targetLanguage: "ja", model: "deepseek-v4-flash", displayMode: "translation-only" }
+    };
+    assertEqual(
+      popup.hooks.parseImportedSettings(goodFile),
+      { provider: "kimi", targetLanguage: "ja", displayMode: "translation-only", model: "deepseek-flash" },
+      "import parse: valid file passes with legacy model mapped"
+    );
+    assertEqual(
+      popup.hooks.parseImportedSettings({ format: "kilocean-translate-settings", version: 1, settings: {} }),
+      {},
+      "import parse: key-less file parses to an empty field set"
+    );
+    assertEqual(
+      popup.hooks.parseImportedSettings({
+        format: "kilocean-translate-settings",
+        version: 1,
+        settings: { deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: "" }
+      }),
+      { deepseekApiKey: DEEPSEEK_KEY },
+      "import parse: blank key field counts as absent, valid key imports"
+    );
+    const rejectsWith = (parsed, needle, label) => {
+      try {
+        popup.hooks.parseImportedSettings(parsed);
+        fail(`${label}: expected rejection`);
+      } catch (error) {
+        assertTrue(
+          String(error.message).includes(needle),
+          `${label}: rejection must mention "${needle}", got "${error.message}"`
+        );
+      }
+    };
+    rejectsWith(null, "设置对象", "import parse: non-object");
+    rejectsWith({ format: "other", version: 1, settings: {} }, "format", "import parse: wrong format field");
+    rejectsWith({ format: "kilocean-translate-settings", version: 2, settings: {} }, "版本", "import parse: unknown version");
+    rejectsWith({ format: "kilocean-translate-settings", version: 1 }, "settings", "import parse: missing settings object");
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { bogus: "x" } },
+      "无法识别的字段",
+      "import parse: unknown field"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { provider: 7 } },
+      "字符串",
+      "import parse: non-string field"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { provider: "openai" } },
+      "服务商",
+      "import parse: provider enum"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { targetLanguage: "fr" } },
+      "目标语言",
+      "import parse: target language enum"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { displayMode: "dual" } },
+      "显示模式",
+      "import parse: display mode enum"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { model: "gpt-4o" } },
+      "模型",
+      "import parse: model not allowed"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { deepseekApiKey: "nope" } },
+      "格式不正确",
+      "import parse: malformed key rejects the file"
+    );
+
+    // applyImportedSettings without keys: fields merge, keys untouched.
+    await popup.hooks.applyImportedSettings({ targetLanguage: "ja", displayMode: "translation-only" });
+    assertEqual(storage.targetLanguage, "ja", "import apply: file fields overwrite storage");
+    assertEqual(storage.displayMode, "translation-only", "import apply: display mode overwrites storage");
+    assertEqual(storage.deepseekApiKey, DEEPSEEK_KEY, "import apply (key-less file): DeepSeek key not wiped");
+    assertEqual(storage.kimiApiKey, KIMI_KEY, "import apply (key-less file): Kimi key not wiped");
+    assertEqual(storage.apiKey, DEEPSEEK_KEY, "import apply (key-less file): mirror keeps the active key");
+
+    // applyImportedSettings with keys + provider switch.
+    const NEW_DEEPSEEK = fakeKey("newdeepseek", 19);
+    const NEW_KIMI = fakeKey("newkimi", 23);
+    await popup.hooks.applyImportedSettings({
+      provider: "kimi",
+      model: "kimi-k3",
+      deepseekApiKey: NEW_DEEPSEEK,
+      kimiApiKey: NEW_KIMI
+    });
+    assertEqual(storage.provider, "kimi", "import apply: provider switches");
+    assertEqual(storage.model, "kimi-k3", "import apply: model switches");
+    assertEqual(storage.deepseekApiKey, NEW_DEEPSEEK, "import apply: file-provided DeepSeek key imports");
+    assertEqual(storage.kimiApiKey, NEW_KIMI, "import apply: file-provided Kimi key imports");
+    assertEqual(storage.apiKey, NEW_KIMI, "import apply: mirror follows the switched provider");
+    assertEqual(
+      popup.hooks.getProviderKeys(),
+      { deepseek: NEW_DEEPSEEK, kimi: NEW_KIMI },
+      "import apply: in-memory provider keys match storage"
+    );
+    assertEqual(
+      popup.dom.get("key-status-kimi-value").textContent,
+      `已配置 · 尾号 ${NEW_KIMI.slice(-4)}`,
+      "import apply: key status re-renders"
+    );
+  }
+
+  // ---- Static: export uses blob + <a download>, never chrome.downloads ----
+  const popupScan = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
+  if (!/new Blob\(/.test(popupScan) || !/createObjectURL\(/.test(popupScan) || !/\.download\s*=/.test(popupScan)) {
+    fail("popup.js: settings export must use Blob + <a download> (no downloads permission)");
+  }
+  if (/chrome\.downloads/.test(popupScan)) {
+    fail("popup.js: settings export must not touch chrome.downloads");
+  }
+  if (!/包含 API Key/.test(fs.readFileSync(path.join(ROOT, "popup.html"), "utf8"))) {
+    fail("popup.html: export opt-in checkbox with the 明文保存 warning must exist");
+  }
+}
+
 async function checkInflightCapAndRunCancellation() {
   const require = createRequire(import.meta.url);
   let utils;
@@ -2764,13 +3439,14 @@ async function checkTotalDeadlineBudget() {
 function buildBackgroundVm({ storageData = {}, fetchImpl, setTimeoutImpl = setTimeout } = {}) {
   const backgroundSource = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
   const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
-  const listeners = { installed: [], message: [], tabsUpdated: [], tabsRemoved: [] };
+  const listeners = { installed: [], startup: [], message: [], tabsUpdated: [], tabsRemoved: [] };
   const storage = { ...storageData };
   const extensionId = "ci-test-extension-id";
   const chromeStub = {
     runtime: {
       id: extensionId,
       onInstalled: { addListener: (fn) => listeners.installed.push(fn) },
+      onStartup: { addListener: (fn) => listeners.startup.push(fn) },
       onMessage: { addListener: (fn) => listeners.message.push(fn) }
     },
     tabs: {
@@ -3732,18 +4408,18 @@ async function checkPackPathSafety() {
 
 function checkVersionBump() {
   const manifest = readJson("manifest.json");
-  if (manifest && manifest.version !== "1.4.2") {
-    fail(`manifest.version must be 1.4.2 for this release, got ${JSON.stringify(manifest.version)}`);
+  if (manifest && manifest.version !== "1.4.3") {
+    fail(`manifest.version must be 1.4.3 for this release, got ${JSON.stringify(manifest.version)}`);
   }
 
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
-  if (!readme.includes("1.4.2")) {
-    fail("README.md: version hint must mention 1.4.2");
+  if (!readme.includes("1.4.3")) {
+    fail("README.md: version hint must mention 1.4.3");
   }
 
   const content = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
-  if (!content.includes("Kilocean Translate 1.4.2")) {
-    fail("content.js: export generator meta must carry the extension version 1.4.2");
+  if (!content.includes("Kilocean Translate 1.4.3")) {
+    fail("content.js: export generator meta must carry the extension version 1.4.3");
   }
 }
 
@@ -3859,6 +4535,7 @@ async function main() {
   checkSpaNavigationAndSelectionStatics();
   await checkFetchTimeoutCoverage();
   await checkModelMigrationAndRetryPolicy();
+  await checkKeyMigrationGate();
   await checkInflightCapAndRunCancellation();
   await checkSpaRefreshAndSelectionLifecycle();
   await checkSpaFlushRaceGuard();
@@ -3876,7 +4553,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
+  console.log("OK: manifest (incl. store key → extension ID), permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm), inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
   process.exit(0);
 }
 

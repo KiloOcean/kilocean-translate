@@ -2418,7 +2418,7 @@
     base.setAttribute("href", document.baseURI || location.href);
     const generator = document.createElement("meta");
     generator.setAttribute("name", "generator");
-    generator.setAttribute("content", "千浩翻译 · Kilocean Translate 1.4.2");
+    generator.setAttribute("content", "千浩翻译 · Kilocean Translate 1.4.3");
     const source = document.createElement("meta");
     source.setAttribute("name", "deepseek-translator-source");
     source.setAttribute("content", location.href);

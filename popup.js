@@ -40,11 +40,142 @@ const DEFAULT_SETTINGS = {
   displayMode: Utils.DISPLAY_MODES.bilingual
 };
 
+// ---- Settings export / import (pure helpers, DOM-free) ----
+const SETTINGS_EXPORT_FORMAT = "kilocean-translate-settings";
+const SETTINGS_EXPORT_VERSION = 1;
+const SETTINGS_IMPORT_FIELDS = new Set([
+  "provider",
+  "targetLanguage",
+  "model",
+  "displayMode",
+  "deepseekApiKey",
+  "kimiApiKey"
+]);
+const SETTINGS_IMPORT_PROVIDERS = new Set(["deepseek", "kimi"]);
+const SETTINGS_IMPORT_LANGUAGES = new Set(["zh-CN", "zh-TW", "ja", "ko", "en"]);
+const SETTINGS_IMPORT_DISPLAY_MODES = new Set([
+  Utils.DISPLAY_MODES.bilingual,
+  Utils.DISPLAY_MODES.translationOnly,
+  Utils.DISPLAY_MODES.original
+]);
+
+// Loose shape check only: catches paste accidents (truncated copy, stray
+// whitespace/newlines, wrong field) without risking false rejections of a
+// real DeepSeek (sk- + 32 hex) or Kimi/Moonshot (sk- + base62) key. Returns
+// null when the shape looks valid, a user-facing reason otherwise.
+function apiKeyFormatReason(value) {
+  const raw = String(value ?? "");
+  const key = raw.trim();
+  if (!key) {
+    return "Key 不能为空";
+  }
+  if (key !== raw) {
+    return "Key 首尾有多余空白";
+  }
+  if (/\s/.test(key)) {
+    return "Key 中间不能包含空白或换行";
+  }
+  if (!key.startsWith("sk-")) {
+    return "Key 应以 sk- 开头";
+  }
+  if (key.length < 16 || key.length > 200) {
+    return "Key 长度不正确";
+  }
+  if (!/^sk-[A-Za-z0-9_-]+$/.test(key)) {
+    return "Key 含有非法字符";
+  }
+  return null;
+}
+
+function settingsImportModels() {
+  return [
+    ...new Set([...PROVIDER_META.deepseek.models, ...PROVIDER_META.kimi.models].map((item) => item.value))
+  ];
+}
+
+// Validate an exported-settings document. Throws with a user-facing Chinese
+// reason on any schema violation (unknown field, wrong type, bad enum, model
+// not allowed, malformed key); returns ONLY the fields present in the file —
+// absent key fields stay absent so importing can never wipe a stored key.
+function parseImportedSettings(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("文件内容不是设置对象");
+  }
+  if (parsed.format !== SETTINGS_EXPORT_FORMAT) {
+    throw new Error(`format 字段不匹配（应为本扩展导出的 ${SETTINGS_EXPORT_FORMAT} 文件）`);
+  }
+  if (parsed.version !== SETTINGS_EXPORT_VERSION) {
+    throw new Error(`不支持的设置文件版本：${JSON.stringify(parsed.version)}`);
+  }
+  const raw = parsed.settings;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("缺少 settings 字段");
+  }
+  const unknown = Object.keys(raw).filter((field) => !SETTINGS_IMPORT_FIELDS.has(field));
+  if (unknown.length > 0) {
+    throw new Error(`无法识别的字段：${unknown.join("、")}`);
+  }
+  for (const [field, value] of Object.entries(raw)) {
+    if (field === "deepseekApiKey" || field === "kimiApiKey") {
+      if (typeof value !== "string") {
+        throw new Error(`字段 ${field} 必须是字符串`);
+      }
+      continue;
+    }
+    if (typeof value !== "string") {
+      throw new Error(`字段 ${field} 必须是字符串`);
+    }
+    if (!value.trim()) {
+      throw new Error(`字段 ${field} 不能为空`);
+    }
+  }
+  if (raw.provider && !SETTINGS_IMPORT_PROVIDERS.has(raw.provider)) {
+    throw new Error(`不支持的服务商：${raw.provider}`);
+  }
+  if (raw.targetLanguage && !SETTINGS_IMPORT_LANGUAGES.has(raw.targetLanguage)) {
+    throw new Error(`不支持的目标语言：${raw.targetLanguage}`);
+  }
+  if (raw.displayMode && !SETTINGS_IMPORT_DISPLAY_MODES.has(raw.displayMode)) {
+    throw new Error(`不支持的显示模式：${raw.displayMode}`);
+  }
+  const imported = {};
+  for (const field of ["provider", "targetLanguage", "displayMode"]) {
+    if (raw[field]) {
+      imported[field] = raw[field].trim();
+    }
+  }
+  if (raw.model) {
+    const model = Utils.migrateModelName(raw.model.trim());
+    if (!settingsImportModels().includes(model)) {
+      throw new Error(`不支持的模型：${raw.model}`);
+    }
+    imported.model = model;
+  }
+  for (const field of ["deepseekApiKey", "kimiApiKey"]) {
+    const key = String(raw[field] || "").trim();
+    if (!key) {
+      // Absent / blank key field: nothing to import — never a wipe signal.
+      continue;
+    }
+    const reason = apiKeyFormatReason(key);
+    if (reason) {
+      throw new Error(`${field === "deepseekApiKey" ? "DeepSeek" : "Kimi"} API Key 格式不正确：${reason}`);
+    }
+    imported[field] = key;
+  }
+  return imported;
+}
+
 const elements = {
   provider: document.getElementById("provider"),
   apiKey: document.getElementById("api-key"),
   apiKeyLabel: document.getElementById("api-key-label"),
   getKeyLink: document.getElementById("get-key-link"),
+  keyStatusDeepseek: document.getElementById("key-status-deepseek"),
+  keyStatusDeepseekValue: document.getElementById("key-status-deepseek-value"),
+  keyStatusKimi: document.getElementById("key-status-kimi"),
+  keyStatusKimiValue: document.getElementById("key-status-kimi-value"),
+  keyGuide: document.getElementById("key-guide"),
   targetLanguage: document.getElementById("target-language"),
   model: document.getElementById("model"),
   toggleKey: document.getElementById("toggle-key"),
@@ -53,6 +184,10 @@ const elements = {
   restore: document.getElementById("restore"),
   exportHtml: document.getElementById("export-html"),
   printPdf: document.getElementById("print-pdf"),
+  exportSettings: document.getElementById("export-settings"),
+  importSettings: document.getElementById("import-settings"),
+  importFile: document.getElementById("import-file"),
+  exportIncludeKeys: document.getElementById("export-include-keys"),
   statusCard: document.querySelector(".status-card"),
   statusTitle: document.getElementById("status-title"),
   statusDetail: document.getElementById("status-detail"),
@@ -72,10 +207,13 @@ let displayModeOp = 0;
 // the two credentials; elements.apiKey always edits currentProvider's entry.
 let currentProvider = "deepseek";
 let providerKeys = { deepseek: "", kimi: "" };
+// Monotonic token for the paste-triggered key verification: a newer paste
+// (or manual test) invalidates the previous run's status write.
+let keyTestOp = 0;
 /** @type {{ text: string, rangeId: string } | null} */
 let pendingSelection = null;
 
-initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
+const initializePromise = initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
 
 // Keep radiogroup in sync when content coerces original→bilingual mid-start.
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -160,9 +298,19 @@ function persistSettingsNow() {
   void saveSettings();
 }
 
-elements.apiKey.addEventListener("input", schedulePersistSettings);
+elements.apiKey.addEventListener("input", () => {
+  schedulePersistSettings();
+  renderKeyStatus();
+});
 elements.apiKey.addEventListener("change", persistSettingsNow);
 elements.apiKey.addEventListener("blur", persistSettingsNow);
+// Paste → auto-save + auto connection test. The pasted value lands after the
+// default paste action, so run on the next tick.
+elements.apiKey.addEventListener("paste", () => {
+  setTimeout(() => {
+    void handleApiKeyPasted();
+  }, 0);
+});
 elements.provider.addEventListener("change", () => {
   const nextProvider = PROVIDER_META[elements.provider.value] ? elements.provider.value : "deepseek";
   if (nextProvider === currentProvider) {
@@ -174,6 +322,7 @@ elements.provider.addEventListener("change", () => {
   currentProvider = nextProvider;
   applyProviderUi(nextProvider, { resetModel: true });
   elements.apiKey.value = providerKeys[nextProvider];
+  renderKeyStatus();
   persistSettingsNow();
 });
 elements.targetLanguage.addEventListener("change", persistSettingsNow);
@@ -327,6 +476,23 @@ elements.printPdf.addEventListener("click", async () => {
   );
 });
 
+elements.exportSettings.addEventListener("click", () => {
+  void exportSettingsFile();
+});
+
+elements.importSettings.addEventListener("click", () => {
+  elements.importFile.click();
+});
+
+elements.importFile.addEventListener("change", () => {
+  const file = elements.importFile.files && elements.importFile.files[0];
+  elements.importFile.value = "";
+  if (!file) {
+    return;
+  }
+  void importSettingsFile(file);
+});
+
 async function initialize() {
   const [settings, tabs] = await Promise.all([
     chrome.storage.local.get(DEFAULT_SETTINGS),
@@ -347,6 +513,7 @@ async function initialize() {
   }
   currentDisplayMode = Utils.normalizeDisplayMode(migrated.displayMode);
   renderDisplayMode();
+  renderKeyStatus();
   // Controls now mirror storage — safe to persist on hide/unload.
   initialized = true;
   if (migrated._didMigrate) {
@@ -445,7 +612,261 @@ async function saveSettings() {
     displayMode: Utils.normalizeDisplayMode(currentDisplayMode)
   };
   await chrome.storage.local.set(settings);
+  renderKeyStatus();
   return settings;
+}
+
+// ---- Persistent per-provider key status (top of the settings panel) ----
+
+function keyTail(key) {
+  const value = String(key || "").trim();
+  // Only ever surface the last 4 chars, and only for key-shaped values:
+  // short fragments show nothing instead of leaking most of the key.
+  return value.length >= 8 ? value.slice(-4) : "";
+}
+
+function renderKeyStatus() {
+  const rows = [
+    { id: "deepseek", row: elements.keyStatusDeepseek, value: elements.keyStatusDeepseekValue },
+    { id: "kimi", row: elements.keyStatusKimi, value: elements.keyStatusKimiValue }
+  ];
+  for (const { id, row, value } of rows) {
+    if (!row || !value) {
+      continue;
+    }
+    const key = String(providerKeys[id] || "").trim();
+    row.dataset.active = id === currentProvider ? "true" : "false";
+    if (key) {
+      const tail = keyTail(key);
+      value.textContent = tail ? `已配置 · 尾号 ${tail}` : "已配置";
+      row.dataset.tone = "ok";
+    } else {
+      value.textContent = "未配置";
+      row.dataset.tone = "missing";
+    }
+  }
+  if (String(providerKeys[currentProvider] || "").trim()) {
+    elements.keyGuide.hidden = true;
+    elements.keyGuide.classList.remove("highlight");
+    elements.apiKey.classList.remove("attention");
+  }
+}
+
+// Expand + highlight the key entry step (both providers' console links) when
+// an action is blocked on a missing key — not just a red status line.
+function revealKeyEntry() {
+  elements.keyGuide.hidden = false;
+  elements.keyGuide.classList.add("highlight");
+  elements.apiKey.classList.add("attention");
+}
+
+// ---- Paste → auto-save + auto connection test ----
+
+async function handleApiKeyPasted() {
+  const label = PROVIDER_META[currentProvider]?.label || "API";
+  persistSettingsNow();
+  renderKeyStatus();
+  const key = elements.apiKey.value.trim();
+  if (!key) {
+    setStatus("Key 已清空", `下次翻译前请重新填写 ${label} API Key`, "idle");
+    return;
+  }
+  // Format gate before any network call: a paste accident fails in ms with a
+  // clear reason instead of a confusing 401.
+  const formatReason = apiKeyFormatReason(elements.apiKey.value);
+  if (formatReason) {
+    keyTestOp += 1;
+    revealKeyEntry();
+    setStatus("Key 格式错误", `${formatReason}（已保存本机，未发起网络验证）`, "error");
+    return;
+  }
+  await runKeyConnectionTest();
+}
+
+async function runKeyConnectionTest() {
+  const label = PROVIDER_META[currentProvider]?.label || "API";
+  const op = ++keyTestOp;
+  setStatus(`正在验证 ${label} Key`, "发送一条最小测试请求", "loading");
+  try {
+    const settings = await saveSettings();
+    const response = await chrome.runtime.sendMessage({
+      type: "TEST_CONNECTION",
+      provider: settings.provider,
+      targetLanguage: settings.targetLanguage,
+      model: settings.model
+    });
+    if (op !== keyTestOp) {
+      return;
+    }
+    if (response?.ok) {
+      setStatus("Key 有效", `${label} 连接成功，可以开始翻译`, "success");
+      return;
+    }
+    const [title, detail] = friendlyKeyTestFailure(response, label);
+    setStatus(title, detail, "error");
+  } catch (error) {
+    if (op !== keyTestOp) {
+      return;
+    }
+    setStatus("网络错误", toFriendlyPageError(error), "error");
+  }
+}
+
+function friendlyKeyTestFailure(response, label) {
+  const code = String(response?.code || "");
+  if (code === "API_401") {
+    return ["Key 无效", `${label} 返回 401：Key 不正确或已失效，请重新复制粘贴`];
+  }
+  if (code === "API_402") {
+    return ["余额不足", `${label} 返回 402：账户余额不足，请充值后重试`];
+  }
+  if (code === "API_429") {
+    return ["额度受限", `${label} 返回 429：请求过于频繁或额度不足，请稍后重试`];
+  }
+  if (code === "MISSING_API_KEY") {
+    return ["Key 缺失", "Key 保存失败，请重新粘贴后再试"];
+  }
+  if (code === "NETWORK_ERROR") {
+    return ["网络错误", response?.error || "无法连接服务商，请检查网络后重试"];
+  }
+  return ["验证失败", response?.error || "连接测试失败，请稍后重试"];
+}
+
+// ---- Settings export / import ----
+
+// Blob + <a download>: works in the popup without the downloads permission.
+// Keys are excluded unless the user opts in with the warning checkbox; empty
+// key fields are omitted so a re-import never sees a blank key value.
+async function exportSettingsFile() {
+  let settings;
+  try {
+    settings = await saveSettings();
+  } catch {
+    settings = {
+      provider: currentProvider,
+      targetLanguage: elements.targetLanguage.value,
+      model: elements.model.value,
+      displayMode: Utils.normalizeDisplayMode(currentDisplayMode)
+    };
+  }
+  const includeKeys = Boolean(elements.exportIncludeKeys?.checked);
+  const payload = {
+    format: SETTINGS_EXPORT_FORMAT,
+    version: SETTINGS_EXPORT_VERSION,
+    createdAt: new Date().toISOString(),
+    settings: {
+      provider: settings.provider,
+      targetLanguage: settings.targetLanguage,
+      model: settings.model,
+      displayMode: settings.displayMode
+    }
+  };
+  if (includeKeys) {
+    for (const field of ["deepseekApiKey", "kimiApiKey"]) {
+      const key = String(providerKeys[field] || "").trim();
+      if (key) {
+        payload.settings[field] = key;
+      }
+    }
+  }
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `kilocean-translate-settings-${chrome.runtime.getManifest().version}.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+  setStatus(
+    "设置已导出",
+    includeKeys ? "注意：文件内含 API Key 明文，请妥善保管，勿分享" : "导出文件不含 API Key",
+    "success"
+  );
+}
+
+async function importSettingsFile(file) {
+  let text;
+  try {
+    text = await file.text();
+  } catch {
+    setStatus("导入失败", "无法读取所选文件", "error");
+    return;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    setStatus("导入失败", "文件不是有效的 JSON", "error");
+    return;
+  }
+  let imported;
+  try {
+    imported = parseImportedSettings(parsed);
+  } catch (error) {
+    setStatus("导入失败", error.message, "error");
+    return;
+  }
+  try {
+    const applied = await applyImportedSettings(imported);
+    setStatus("设置已导入", applied.detail, "success");
+  } catch (error) {
+    setStatus("导入失败", error?.message || "写入设置失败", "error");
+  }
+}
+
+// Merge validated fields into storage + UI. Non-key fields overwrite; key
+// fields only when the file carried a valid one — a file without keys never
+// touches the keys already saved on this machine.
+async function applyImportedSettings(imported) {
+  const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
+  const updates = {};
+  for (const field of ["provider", "targetLanguage", "model", "displayMode"]) {
+    if (imported[field]) {
+      updates[field] = imported[field];
+    }
+  }
+  if (imported.deepseekApiKey) {
+    updates.deepseekApiKey = imported.deepseekApiKey;
+  }
+  if (imported.kimiApiKey) {
+    updates.kimiApiKey = imported.kimiApiKey;
+  }
+  const provider = PROVIDER_META[updates.provider || stored.provider]
+    ? (updates.provider || stored.provider)
+    : "deepseek";
+  const deepseekApiKey = updates.deepseekApiKey ?? String(stored.deepseekApiKey || "").trim();
+  const kimiApiKey = updates.kimiApiKey ?? String(stored.kimiApiKey || "").trim();
+  // Legacy mirror for content.js's selection key gate.
+  updates.apiKey = provider === "kimi" ? kimiApiKey : deepseekApiKey;
+  await chrome.storage.local.set(updates);
+
+  currentProvider = provider;
+  providerKeys = { deepseek: deepseekApiKey, kimi: kimiApiKey };
+  elements.provider.value = provider;
+  applyProviderUi(provider, { resetModel: false });
+  if (updates.model && [...elements.model.options].some((option) => option.value === updates.model)) {
+    elements.model.value = updates.model;
+  }
+  if (
+    updates.targetLanguage &&
+    [...elements.targetLanguage.options].some((option) => option.value === updates.targetLanguage)
+  ) {
+    elements.targetLanguage.value = updates.targetLanguage;
+  }
+  elements.apiKey.value = providerKeys[provider];
+  if (updates.displayMode) {
+    currentDisplayMode = Utils.normalizeDisplayMode(updates.displayMode);
+    renderDisplayMode();
+  }
+  renderKeyStatus();
+  const detail = imported.deepseekApiKey || imported.kimiApiKey
+    ? "已导入文件中的 API Key"
+    : "文件不含 Key，已保留本机保存的 Key";
+  return { detail };
 }
 
 function renderDisplayMode() {
@@ -460,8 +881,15 @@ function validateApiKey() {
   if (elements.apiKey.value.trim()) {
     return true;
   }
+  // Expand + highlight the key entry step with both providers' console links
+  // instead of only a red status line.
+  revealKeyEntry();
   elements.apiKey.focus();
-  setStatus("缺少 API Key", `请先填写 ${PROVIDER_META[elements.provider.value]?.label || ""} API Key`, "error");
+  setStatus(
+    "缺少 API Key",
+    `请先填写 ${PROVIDER_META[elements.provider.value]?.label || ""} API Key（展开的链接可免费创建）`,
+    "error"
+  );
   return false;
 }
 

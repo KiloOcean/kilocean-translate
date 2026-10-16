@@ -95,6 +95,96 @@ h2 {
   text-decoration: none;
 }
 
+.key-status {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.key-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 9px;
+  background: rgba(12, 16, 26, 0.6);
+  font-size: 11px;
+}
+
+.key-status-label {
+  color: #aab0c1;
+  font-weight: 650;
+}
+
+.key-status-row[data-active="true"] .key-status-label {
+  color: #d9ddec;
+}
+
+.key-status-value {
+  color: #9299ae;
+}
+
+.key-status-row[data-tone="ok"] .key-status-value {
+  color: #48d89b;
+}
+
+.key-status-row[data-tone="missing"] .key-status-value {
+  color: #ff8f9b;
+}
+
+.key-guide {
+  margin-top: 10px;
+  padding: 10px 11px;
+  border: 1px solid rgba(145, 164, 255, 0.35);
+  border-radius: 10px;
+  background: rgba(102, 124, 255, 0.08);
+}
+
+.key-guide.highlight {
+  animation: key-guide-flash 1.2s ease-in-out 2;
+}
+
+.key-guide-title {
+  color: #d9ddec;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.key-guide-links {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.key-guide-links a {
+  color: #91a4ff;
+  font-size: 11px;
+  text-decoration: none;
+}
+
+.key-guide-links a:hover {
+  text-decoration: underline;
+}
+
+.key-guide-help {
+  margin-top: 8px;
+  color: #7f879b;
+  font-size: 10px;
+}
+
+@keyframes key-guide-flash {
+  50% { border-color: rgba(145, 164, 255, 0.85); box-shadow: 0 0 0 3px rgba(112, 135, 255, 0.18); }
+}
+
+input.attention {
+  animation: key-input-flash 1.2s ease-in-out 2;
+}
+
+@keyframes key-input-flash {
+  50% { border-color: #91a4ff; box-shadow: 0 0 0 3px rgba(145, 164, 255, 0.22); }
+}
+
 .section-heading a:hover {
   text-decoration: underline;
 }
@@ -317,6 +407,46 @@ select:focus {
 
 .export-panel p {
   margin-top: 9px;
+  line-height: 1.45;
+}
+
+.settings-io-panel {
+  margin-top: 12px;
+}
+
+.include-keys-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: #aab0c1;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.include-keys-toggle input {
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  padding: 0;
+  accent-color: #5267ec;
+  cursor: pointer;
+}
+
+.include-keys-toggle .warn {
+  color: #ffb86e;
+}
+
+.settings-io-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.settings-io-help {
+  margin-top: 9px;
+  color: #7f879b;
+  font-size: 10px;
   line-height: 1.45;
 }
 
