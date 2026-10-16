@@ -537,10 +537,13 @@ elements.provider.addEventListener("change", () => {
   keyTestOp += 1;
   applyProviderUi(nextProvider, { resetModel: true });
   // The switch (and the model reset above) are user edits this view owns.
+  // The model edit is banked UNCONDITIONALLY from the rebuilt select, never
+  // diffed against the snapshot: a previous switch's write may still be in
+  // flight, so the snapshot can be stale — diffing against it could leave a
+  // departed provider's model banked and land an inconsistent pair in
+  // storage (provider deepseek + kimi model).
   settingsModel.edits.provider = nextProvider;
-  if (elements.model.value !== settingsModel.snapshot.model) {
-    settingsModel.edits.model = elements.model.value;
-  }
+  settingsModel.edits.model = elements.model.value;
   // Swap the key input to the new provider's pending-or-stored key.
   elements.apiKey.value = providerKeyValue(nextProvider);
   renderKeyStatus();
@@ -578,9 +581,10 @@ elements.modeButtons.forEach((button) => {
     settingsModel.edits.displayMode = mode;
     currentDisplayMode = mode;
     renderDisplayMode();
-    await chrome.storage.local.set({ displayMode: mode });
-    settingsModel.snapshot.displayMode = mode;
-    delete settingsModel.edits.displayMode;
+    // Through the serialized save path (never a direct storage write): a
+    // newer click while this write is pending stays dirty and settles via
+    // the follow-up save instead of being un-banked unconditionally.
+    await saveSettings();
     if (op !== displayModeOp || mode !== currentDisplayMode) {
       return;
     }
@@ -772,7 +776,7 @@ async function initialize() {
   // view so an untouched store never materializes default values.
   const migrationPatch = collectMigrationPatch({ ...DEFAULT_SETTINGS, ...stored }, migrated);
   if (Object.keys(migrationPatch).length) {
-    await chrome.storage.local.set(migrationPatch);
+    await enqueueSettingsWrite(migrationPatch);
   }
   // Controls now mirror storage — safe to persist on hide/unload.
   initialized = true;
@@ -867,6 +871,47 @@ function applyProviderUi(providerId, { resetModel }) {
 let settingsSaveInFlight = null;
 let settingsSaveFollowUp = null;
 
+// ---- Serialized storage write queue ----
+// The ONLY call site of chrome.storage.local.set in popup.js. Every write
+// this view makes — dirty-edit saves, provider switches, imports, key
+// deletes/clears, the one-time startup migration, display-mode clicks — is
+// a patch on this queue. The next write starts only after the previous one
+// settles, so two writes can never commit out of order and let an older
+// patch overwrite a newer edit; edits made while a write is pending stay
+// dirty (settingsModel.edits) and merge into the next queued patch.
+let settingsWriteBusy = false;
+const settingsWriteQueue = [];
+
+function enqueueSettingsWrite(patch) {
+  return new Promise((resolve, reject) => {
+    settingsWriteQueue.push({ patch, resolve, reject });
+    drainSettingsWrites();
+  });
+}
+
+function drainSettingsWrites() {
+  if (settingsWriteBusy) {
+    return;
+  }
+  const next = settingsWriteQueue.shift();
+  if (!next) {
+    return;
+  }
+  settingsWriteBusy = true;
+  Promise.resolve(chrome.storage.local.set(next.patch)).then(
+    (value) => {
+      settingsWriteBusy = false;
+      next.resolve(value);
+      drainSettingsWrites();
+    },
+    (error) => {
+      settingsWriteBusy = false;
+      next.reject(error);
+      drainSettingsWrites();
+    }
+  );
+}
+
 function saveSettings() {
   if (!settingsSaveInFlight) {
     return runSettingsSave();
@@ -900,7 +945,7 @@ async function performSettingsSave() {
   const controlValues = readControlValues();
   const { patch, savedValues } = collectDirtyPatch(settingsModel, controlValues);
   if (Object.keys(patch).length) {
-    await chrome.storage.local.set(patch);
+    await enqueueSettingsWrite(patch);
     for (const [field, value] of Object.entries(patch)) {
       settingsModel.snapshot[field] = value;
     }
@@ -1146,11 +1191,14 @@ async function importSettingsFile(file) {
   }
 }
 
-// Merge validated fields into storage + UI. Non-key fields overwrite; key
+// Merge validated fields into the settings model + controls, then enqueue
+// ONE save through the shared write queue. Non-key fields overwrite; key
 // fields only when the file carried a valid one — a file without keys never
-// touches the keys already saved on this machine.
+// touches the keys already saved on this machine. Import is expressed as
+// dirty edits (never its own storage write path): it coalesces with any
+// write already in flight, and an edit the user makes to an imported field
+// while the import's write is pending stays dirty and wins the follow-up.
 async function applyImportedSettings(imported) {
-  const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
   const updates = {};
   for (const field of ["provider", "targetLanguage", "model", "displayMode"]) {
     if (imported[field]) {
@@ -1163,31 +1211,35 @@ async function applyImportedSettings(imported) {
   if (imported.kimiApiKey) {
     updates.kimiApiKey = imported.kimiApiKey;
   }
-  const provider = PROVIDER_META[updates.provider || stored.provider]
-    ? (updates.provider || stored.provider)
+  // Resolve against the CURRENT view (controls + pending edits), never a
+  // fresh storage read: a read would race the serialized write queue.
+  const provider = PROVIDER_META[updates.provider ?? activeProvider()]
+    ? (updates.provider ?? activeProvider())
     : "deepseek";
-  const deepseekApiKey = updates.deepseekApiKey ?? String(stored.deepseekApiKey || "").trim();
-  const kimiApiKey = updates.kimiApiKey ?? String(stored.kimiApiKey || "").trim();
   // Keep provider and model compatible: a partial import (provider-only or
   // model-only) must not leave a model belonging to the other provider.
-  const effectiveModel = updates.model || stored.model;
+  const effectiveModel = updates.model ?? elements.model.value;
   const providerModels = PROVIDER_META[provider].models.map((entry) => entry.value ?? entry);
   if (!providerModels.includes(effectiveModel)) {
     updates.model = PROVIDER_META[provider].defaultModel;
   }
-  // Legacy mirror for content.js's selection key gate.
-  updates.apiKey = provider === "kimi" ? kimiApiKey : deepseekApiKey;
-  await chrome.storage.local.set(updates);
 
-  // The file's values are the new truth for every field it carried: drop
-  // pending edits for those fields, then run the single sync path so the
-  // controls, key status and snapshot all follow storage.
-  for (const field of Object.keys(updates)) {
-    delete settingsModel.edits[field];
+  // The file's values are the new truth for every field it carried: bank
+  // them as edits (over any pending edit of the same field) and apply them
+  // to the controls through the single field applier.
+  const applied = {};
+  for (const [field, value] of Object.entries(updates)) {
+    settingsModel.edits[field] = value;
+    applied[field] = value;
   }
-  reconcile(updates);
+  applyFieldsToControls(applied);
+  // applyFieldsToControls never touches a dirty key input — and the imported
+  // keys ARE the current edits now — so point the input at them explicitly.
+  elements.apiKey.value = providerKeyValue(provider);
+  renderKeyStatus();
   // Drop any in-flight connection test for the pre-import provider/key.
   keyTestOp += 1;
+  await saveSettings();
   const detail = imported.deepseekApiKey || imported.kimiApiKey
     ? "已导入文件中的 API Key"
     : "文件不含 Key，已保留本机保存的 Key";

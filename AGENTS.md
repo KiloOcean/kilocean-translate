@@ -15,6 +15,8 @@ No package.json. Load unpacked extension from repo root in chrome://extensions.
 - Keep PRs small; one issue → one focused PR.
 - Preserve permissions: activeTab, scripting, storage; host only https://api.deepseek.com/*.
 - Watch selection race tokens and displayMode vs chrome.storage sync.
+- Route every popup.js storage write through the serialized write queue (`enqueueSettingsWrite` / `saveSettings`) — CI enforces exactly one `chrome.storage.local.set` call site.
+- Add concurrency tests (controlled fake storage whose `set()` resolves manually) for any new popup.js write path.
 - Fill the PR template; call out content-script / permission risk.
 - Prefer **ready-for-review** (not forever-draft) when CI should auto-merge.
 
@@ -22,6 +24,8 @@ No package.json. Load unpacked extension from repo root in chrome://extensions.
 
 - Commit API keys or expand host permissions without an explicit ask.
 - Drive-by rewrite of content.js / background.js.
+- Call `chrome.storage.local.set` (or `.remove`) directly in popup.js — bypassing the queue reintroduces the mid-write edit races.
+- Ship a new popup.js write path without a gated-storage concurrency test.
 - Skip `node scripts/ci-check.mjs`.
 - Urge merge on Build green alone.
 

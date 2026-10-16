@@ -3089,6 +3089,215 @@ async function checkSettingsStateModel() {
   }
 }
 
+// ---- Serialized write queue: concurrency (controlled fake storage) ----
+// Third round of the same race class: every chrome.storage.local.set in
+// popup.js must go through ONE serialized queue, and edits made while a
+// write is pending must coalesce into the next queued patch instead of
+// racing the pending one (or being wiped by it). The fake storage here
+// parks each set() until the test releases it, so every scenario can place
+// a new edit inside each pending write and watch the follow-up land it.
+async function checkSettingsWriteQueueConcurrency() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const fire = (el, type) => {
+    for (const fn of el.listeners[type] || []) {
+      fn();
+    }
+  };
+
+  const DEEPSEEK_KEY = fakeKey("queuedeepseek", 21);
+  const KIMI_KEY = fakeKey("queuekimi", 25);
+  const RETYPED_KEY = fakeKey("queueretype", 24);
+
+  // Controlled fake storage: set() returns a promise the test resolves by
+  // calling entry.release() (which is also when the update lands), and the
+  // state tracks how many writes were in flight at once.
+  const gateStorage = (popup) => {
+    const state = { writes: [], inFlight: 0, maxInFlight: 0 };
+    popup.sandbox.chrome.storage.local.set = (updates) => {
+      state.inFlight += 1;
+      state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
+      const entry = { updates };
+      state.writes.push(entry);
+      return new Promise((resolve) => {
+        entry.release = () => {
+          state.inFlight -= 1;
+          Object.assign(popup.storage, updates);
+          resolve();
+        };
+      });
+    };
+    return state;
+  };
+  const seededStorage = () => ({
+    provider: "deepseek",
+    deepseekApiKey: DEEPSEEK_KEY,
+    kimiApiKey: KIMI_KEY,
+    apiKey: DEEPSEEK_KEY,
+    model: "deepseek-flash",
+    targetLanguage: "zh-CN",
+    displayMode: "bilingual"
+  });
+
+  // (1) Double provider switch (DeepSeek → Kimi → DeepSeek) plus a field
+  // edit, all while the first switch's write is pending: the model edit must
+  // follow the LATEST control state (never a stale snapshot), and everything
+  // must coalesce into one follow-up write that leaves storage's
+  // provider/model pair consistent and matching the UI.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const providerSelect = popup.dom.get("provider");
+    const modelSelect = popup.dom.get("model");
+    const langSelect = popup.dom.get("target-language");
+
+    providerSelect.value = "kimi";
+    fire(providerSelect, "change");
+    assertEqual(gate.writes.length, 1, "provider switch: the switch's save is the only write so far");
+    assertEqual(
+      gate.writes[0].updates,
+      { provider: "kimi", model: "kimi-k2.6", apiKey: KIMI_KEY },
+      "provider switch: the pending write carries the new provider, its resolved model and the mirror"
+    );
+
+    // Second switch BEFORE the first write settles — plus a language edit —
+    // all while write #1 is parked.
+    providerSelect.value = "deepseek";
+    fire(providerSelect, "change");
+    langSelect.value = "ja";
+    fire(langSelect, "change");
+
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "provider switch: exactly one coalesced follow-up write starts once the pending one settles");
+    assertEqual(
+      gate.writes[1].updates,
+      { provider: "deepseek", model: "deepseek-flash", targetLanguage: "ja", apiKey: DEEPSEEK_KEY },
+      "provider switch: the follow-up writes the second switch's provider/model pair plus the coalesced language edit"
+    );
+    gate.writes[1].release();
+    await tick();
+    assertEqual(popup.storage.provider, "deepseek", "double switch: storage ends at the second provider");
+    assertEqual(popup.storage.model, "deepseek-flash", "double switch: storage model matches the final provider (no stale kimi model)");
+    assertEqual(popup.storage.targetLanguage, "ja", "double switch: the mid-write language edit reached storage");
+    assertEqual(providerSelect.value, "deepseek", "double switch: the select shows the final provider");
+    assertEqual(modelSelect.value, "deepseek-flash", "double switch: the model control matches storage");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "double switch: every edit settles once the writes land");
+    assertTrue(gate.maxInFlight === 1, "double switch: at most one write in flight at a time");
+  }
+
+  // (2) Import is a batch of edits on the same queue: an edit made to an
+  // imported field WHILE the import's write is pending survives it (the old
+  // code deleted edits for imported fields after its own unserialized write).
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const langSelect = popup.dom.get("target-language");
+    const importing = popup.hooks.applyImportedSettings({ provider: "kimi", model: "kimi-k3", targetLanguage: "ja" });
+    assertEqual(gate.writes.length, 1, "import: the import enqueues exactly one write");
+    assertEqual(
+      gate.writes[0].updates,
+      { provider: "kimi", targetLanguage: "ja", model: "kimi-k3", apiKey: KIMI_KEY },
+      "import: the write carries the imported fields and the mirror follows the imported provider"
+    );
+    // The user retypes an imported field while the import's write is parked.
+    langSelect.value = "ko";
+    fire(langSelect, "change");
+    gate.writes[0].release();
+    await importing;
+    await tick();
+    assertEqual(gate.writes.length, 2, "import: the mid-write edit gets exactly one follow-up write");
+    assertEqual(gate.writes[1].updates, { targetLanguage: "ko" }, "import: the follow-up writes only the edited field");
+    gate.writes[1].release();
+    await tick();
+    assertEqual(popup.storage.targetLanguage, "ko", "import: the edit made during the pending import ends in storage");
+    assertEqual(popup.storage.provider, "kimi", "import: the imported provider survives the concurrent edit");
+    assertEqual(popup.storage.model, "kimi-k3", "import: the imported model survives the concurrent edit");
+    assertEqual(langSelect.value, "ko", "import: the control keeps showing the user's newer edit");
+    assertTrue(gate.maxInFlight === 1, "import: at most one write in flight at a time");
+  }
+
+  // (3) Plain field edit retyped mid-write: the newer value wins.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const langSelect = popup.dom.get("target-language");
+    langSelect.value = "ja";
+    fire(langSelect, "change");
+    assertEqual(gate.writes[0].updates, { targetLanguage: "ja" }, "field edit: the first write carries the edit");
+    langSelect.value = "en";
+    fire(langSelect, "change");
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "field edit: the retype gets exactly one follow-up write");
+    assertEqual(gate.writes[1].updates, { targetLanguage: "en" }, "field edit: the follow-up writes the newest value");
+    gate.writes[1].release();
+    await tick();
+    assertEqual(popup.storage.targetLanguage, "en", "field edit: the retyped value ends in storage");
+    assertTrue(gate.maxInFlight === 1, "field edit: at most one write in flight at a time");
+  }
+
+  // (4) Key delete + retype during the pending write: the new key (not the
+  // deletion, not the old key) ends in storage with a consistent mirror.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = "";
+    fire(keyInput, "input");
+    fire(keyInput, "change");
+    assertEqual(
+      gate.writes[0].updates,
+      { deepseekApiKey: "", apiKey: "" },
+      "key delete: clearing the last key writes the empty value and clears the mirror"
+    );
+    // A new key typed while the deletion's write is parked.
+    keyInput.value = RETYPED_KEY;
+    fire(keyInput, "input");
+    fire(keyInput, "change");
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "key delete: the new key gets exactly one follow-up write");
+    assertEqual(
+      gate.writes[1].updates,
+      { deepseekApiKey: RETYPED_KEY, apiKey: RETYPED_KEY },
+      "key delete: the follow-up writes the new key and keeps the mirror consistent"
+    );
+    gate.writes[1].release();
+    await tick();
+    assertEqual(popup.storage.deepseekApiKey, RETYPED_KEY, "key delete: the new key ends in storage");
+    assertEqual(popup.storage.apiKey, RETYPED_KEY, "key delete: the legacy mirror ends consistent with the new key");
+    assertTrue(gate.maxInFlight === 1, "key delete: at most one write in flight at a time");
+  }
+
+  // Static: exactly one chrome.storage.local.set call site — the queue — and
+  // no other direct (or remove-) write path anywhere in popup.js.
+  const popupScan = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
+  const setSites = popupScan.match(/chrome\.storage\.local\.set\s*\(/g) || [];
+  if (setSites.length !== 1) {
+    fail(`popup.js: chrome.storage.local.set must have exactly one call site (the serialized write queue), found ${setSites.length}`);
+  }
+  if (/chrome\.storage\.local\.remove/.test(popupScan)) {
+    fail("popup.js: chrome.storage.local.remove must not appear — every storage mutation routes through the write queue");
+  }
+  if (!/enqueueSettingsWrite\(/.test(popupScan)) {
+    fail("popup.js: the serialized write queue entrypoint enqueueSettingsWrite must exist");
+  }
+}
+
 async function checkInflightCapAndRunCancellation() {
   const require = createRequire(import.meta.url);
   let utils;
@@ -5166,6 +5375,7 @@ async function main() {
   await checkModelMigrationAndRetryPolicy();
   await checkKeyMigrationGate();
   await checkSettingsStateModel();
+  await checkSettingsWriteQueueConcurrency();
   await checkInflightCapAndRunCancellation();
   await checkSpaRefreshAndSelectionLifecycle();
   await checkSpaFlushRaceGuard();
@@ -5183,7 +5393,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest (incl. store key → extension ID), permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm), settings state model (snapshot + dirty flags), inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
+  console.log("OK: manifest (incl. store key → extension ID), permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm), settings state model (snapshot + dirty flags), serialized write queue concurrency (controlled fake storage), inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
   process.exit(0);
 }
 
