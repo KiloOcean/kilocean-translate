@@ -2374,6 +2374,22 @@ async function checkKeyMigrationGate() {
     await stale.hooks.saveSettings();
     assertEqual(stale.storage.deepseekApiKey, NEWER, "stale view: save after an external key change keeps the newer key");
     assertEqual(stale.storage.kimiApiKey, KIMI_KEY, "stale view: other provider key untouched");
+    let releaseStale;
+    const staleGate = new Promise((resolve) => { releaseStale = resolve; });
+    const racing = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" },
+      { runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? staleGate : { ok: false }) }
+    );
+    await racing.hooks.initializePromise;
+    const pending = racing.hooks.runKeyConnectionTest();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    racing.emitStorageChange({ deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: NEWER } });
+    releaseStale({ ok: true });
+    await pending;
+    assertTrue(
+      racing.dom.get("status-title").textContent !== "Key 有效",
+      "stale view: external key change supersedes an in-flight test result"
+    );
   }
 
   // ---- Settings import/export (popup vm): schema validation + no-wipe merge ----

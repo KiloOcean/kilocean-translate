@@ -241,6 +241,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
     providerKeys[provider] = next;
     if (provider === currentProvider) {
       elements.apiKey.value = next;
+      // The key under test changed elsewhere: drop any in-flight result.
+      if (keyTestPendingOp && keyTestPendingOp === keyTestOp) {
+        renderStatus("Key 已在其他窗口更新", "如需验证，请重新点击「测试 API 连接」", "idle");
+      }
+      keyTestOp += 1;
     }
     renderKeyStatus();
   }
