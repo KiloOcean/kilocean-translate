@@ -166,6 +166,75 @@ function parseImportedSettings(parsed) {
   return imported;
 }
 
+// ---- Settings/key state model (pure core, DOM-free) ----
+
+// Storage fields the settings controls map to. The legacy apiKey mirror is
+// derived (the active provider's key) and never reconciled into a control.
+const SETTINGS_FIELDS = [
+  "provider",
+  "deepseekApiKey",
+  "kimiApiKey",
+  "model",
+  "targetLanguage",
+  "displayMode"
+];
+
+// Pure core of reconcile(): merge a storage view (a fresh full read or an
+// onChanged delta) into the model's snapshot and report the fields to apply
+// to the controls — every tracked field present in the view EXCEPT those
+// with a pending user edit (dirty fields keep the user's value).
+function reconcileModel(model, storageSnapshot) {
+  const applied = {};
+  for (const field of SETTINGS_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(storageSnapshot, field)) {
+      continue;
+    }
+    model.snapshot[field] = storageSnapshot[field];
+    if (!(field in model.edits)) {
+      applied[field] = model.snapshot[field];
+    }
+  }
+  return applied;
+}
+
+// Pure core of save(): collect the pending user edits (dirty fields) from
+// the current control values. Only values that differ from the last-known
+// snapshot are written; `fields` lists every dirty field considered so the
+// caller can clear its flag once the save lands (an edit that already
+// equals the stored value was never unsaved). The legacy apiKey mirror
+// follows the active provider's key whenever a provider/key field changes.
+function collectDirtyPatch(model, controlValues) {
+  const patch = {};
+  const fields = [];
+  for (const field of Object.keys(model.edits)) {
+    if (controlValues[field] === undefined) {
+      continue;
+    }
+    fields.push(field);
+    if (controlValues[field] !== model.snapshot[field]) {
+      patch[field] = controlValues[field];
+    }
+  }
+  const provider = PROVIDER_META[controlValues.provider] ? controlValues.provider : "deepseek";
+  if (patch.provider || patch.deepseekApiKey || patch.kimiApiKey) {
+    patch.apiKey = controlValues[PROVIDER_META[provider].keyField] ?? model.snapshot[PROVIDER_META[provider].keyField];
+  }
+  return { patch, fields };
+}
+
+// Pure: the fields a one-time storage upgrade (legacy apiKey →
+// deepseekApiKey, retired model name) must persist — exactly where the
+// migrated view differs from the raw stored read.
+function collectMigrationPatch(stored, migrated) {
+  const patch = {};
+  for (const field of [...SETTINGS_FIELDS, "apiKey"]) {
+    if (migrated[field] !== stored[field]) {
+      patch[field] = migrated[field];
+    }
+  }
+  return patch;
+}
+
 const elements = {
   provider: document.getElementById("provider"),
   apiKey: document.getElementById("api-key"),
@@ -202,21 +271,7 @@ let currentTab = null;
 let statusTimer = null;
 let currentDisplayMode = Utils.DISPLAY_MODES.bilingual;
 let initialized = false;
-// Last known stored values (from init, own writes, and storage.onChanged).
-let syncedSettings = {};
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local") {
-    return;
-  }
-  for (const [field, change] of Object.entries(changes)) {
-    syncedSettings[field] = change.newValue;
-  }
-});
 let displayModeOp = 0;
-// Active provider + per-provider keys so switching never mixes or clobbers
-// the two credentials; elements.apiKey always edits currentProvider's entry.
-let currentProvider = "deepseek";
-let providerKeys = { deepseek: "", kimi: "" };
 // Monotonic token for the paste-triggered key verification: a newer paste
 // (or manual test) invalidates the previous run's status write.
 let keyTestOp = 0;
@@ -225,83 +280,139 @@ let keyTestPendingOp = 0;
 /** @type {{ text: string, rangeId: string } | null} */
 let pendingSelection = null;
 
-const initializePromise = initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
+// ---- Settings/key state: single source of truth ----
+// settingsModel.snapshot is the last-known chrome.storage.local view; every
+// storage→view path (init read, storage.onChanged, own writes) merges into
+// it through reconcile(). settingsModel.edits holds the per-field dirty
+// flags: a field is dirty iff it has an entry, and the entry is the user's
+// unsaved value (banked on input/change events, cleared once a save writes
+// the field). Dirty controls keep the user's value when storage changes
+// underneath; saves write ONLY dirty fields, so a stale idle view can never
+// restore old values over newer ones.
+const settingsModel = {
+  snapshot: { ...DEFAULT_SETTINGS },
+  edits: {}
+};
 
-// Keep radiogroup in sync when content coerces original→bilingual mid-start.
-// Keep this view's key snapshot in sync with writes from other extension
-// views (popup vs. settings tab), so a later save here never restores a
-// stale key over a newer one.
+// Active provider as shown by the select — the select IS the provider
+// control, so no separate currentProvider copy can drift out of sync.
+function activeProvider() {
+  return PROVIDER_META[elements.provider.value] ? elements.provider.value : "deepseek";
+}
+
+// What a provider's key field would hold if saved right now: the user's
+// pending edit when one exists, otherwise the last-known stored key. This
+// is the only key lookup — no providerKeys mirror to keep in step.
+function providerKeyValue(provider) {
+  const field = PROVIDER_META[provider].keyField;
+  return field in settingsModel.edits
+    ? String(settingsModel.edits[field] || "").trim()
+    : String(settingsModel.snapshot[field] || "").trim();
+}
+
+// One value per tracked field, read from the controls. The single key input
+// edits the ACTIVE provider's key; the inactive provider's key resolves to
+// its banked edit (kept across a provider switch) or the stored value.
+function readControlValues() {
+  const provider = activeProvider();
+  const values = {
+    provider,
+    deepseekApiKey: providerKeyValue("deepseek"),
+    kimiApiKey: providerKeyValue("kimi"),
+    targetLanguage: elements.targetLanguage.value,
+    model: elements.model.value,
+    displayMode: Utils.normalizeDisplayMode(currentDisplayMode)
+  };
+  values[PROVIDER_META[provider].keyField] = elements.apiKey.value.trim();
+  return values;
+}
+
+// Bank the key input's current value as the active provider's pending edit.
+function markKeyEdit() {
+  settingsModel.edits[PROVIDER_META[activeProvider()].keyField] = elements.apiKey.value.trim();
+}
+
+// The single storage→view sync path: merge a storage view (a fresh full
+// read, an onChanged delta, or this view's own write) into the model, then
+// apply every NON-dirty field to its control — dirty controls keep the
+// user's value, while their fields still update in the snapshot so the next
+// save diffs against the newest stored state.
+function reconcile(storageSnapshot) {
+  const applied = reconcileModel(settingsModel, storageSnapshot);
+  applyFieldsToControls(applied);
+  if ("provider" in applied) {
+    // The provider behind any in-flight key test changed: drop its result.
+    keyTestOp += 1;
+  } else if (PROVIDER_META[activeProvider()].keyField in applied) {
+    // The key under test changed elsewhere: drop any in-flight result.
+    if (keyTestPendingOp && keyTestPendingOp === keyTestOp) {
+      renderStatus("Key 已在其他窗口更新", "如需验证，请重新点击「测试 API 连接」", "idle");
+    }
+    keyTestOp += 1;
+  }
+}
+
+// Apply reconciled storage values to the controls. Provider goes first: it
+// re-targets the key input and rebuilds the model options the model value
+// is validated against. Dirty fields never reach this function.
+function applyFieldsToControls(applied) {
+  if ("provider" in applied && PROVIDER_META[applied.provider] && elements.provider.value !== applied.provider) {
+    elements.provider.value = applied.provider;
+    applyProviderUi(applied.provider, { resetModel: false });
+  }
+  if ("model" in applied && [...elements.model.options].some((option) => option.value === applied.model)) {
+    elements.model.value = applied.model;
+  }
+  if ("targetLanguage" in applied) {
+    const langOptions = [...(elements.targetLanguage.options || [])];
+    if (!langOptions.length || langOptions.some((option) => option.value === applied.targetLanguage)) {
+      elements.targetLanguage.value = applied.targetLanguage;
+    }
+  }
+  if ("displayMode" in applied) {
+    const nextMode = Utils.normalizeDisplayMode(applied.displayMode);
+    if (nextMode !== currentDisplayMode) {
+      currentDisplayMode = nextMode;
+      renderDisplayMode();
+    }
+  }
+  // The key input mirrors the active provider's key — the post-swap one if
+  // a provider was just applied — unless the user is editing it.
+  const keyField = PROVIDER_META[activeProvider()].keyField;
+  if (!(keyField in settingsModel.edits)) {
+    const nextKey = String(settingsModel.snapshot[keyField] || "").trim();
+    if (elements.apiKey.value !== nextKey) {
+      elements.apiKey.value = nextKey;
+    }
+  }
+  renderKeyStatus();
+}
+
+// Deltas onChanged delivered while a full storage read was in flight.
+// Chrome commits a write before delivering its event, but a read that
+// started earlier may still resolve with the pre-write snapshot, so init
+// overlays these deltas on top of its read result (see initialize).
+let changesDuringRead = null;
+
+// Registered BEFORE any init read: changes arriving while initialization is
+// still awaiting merge into the model immediately, and init's closing fresh
+// read re-reconciles the same values — a stale first snapshot can never
+// overwrite an update received during initialization.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") {
     return;
   }
-  for (const [provider, meta] of Object.entries(PROVIDER_META)) {
-    const change = changes[meta.keyField];
-    if (!change) {
-      continue;
-    }
-    const next = String(change.newValue || "").trim();
-    if (providerKeys[provider] === next) {
-      continue;
-    }
-    // Skip only when the user has an actual unsaved edit of this key (input
-    // differs from the previously stored value) — focus alone is not an edit.
-    const dirtyLocalEdit =
-      provider === currentProvider &&
-      elements.apiKey.value.trim() !== String(change.oldValue || "").trim();
-    if (dirtyLocalEdit) {
-      continue;
-    }
-    providerKeys[provider] = next;
-    if (provider === currentProvider) {
-      elements.apiKey.value = next;
-      // The key under test changed elsewhere: drop any in-flight result.
-      if (keyTestPendingOp && keyTestPendingOp === keyTestOp) {
-        renderStatus("Key 已在其他窗口更新", "如需验证，请重新点击「测试 API 连接」", "idle");
-      }
-      keyTestOp += 1;
-    }
-    renderKeyStatus();
+  const delta = {};
+  for (const [field, change] of Object.entries(changes)) {
+    delta[field] = change?.newValue;
   }
+  if (changesDuringRead) {
+    Object.assign(changesDuringRead, delta);
+  }
+  reconcile(delta);
 });
 
-// Mirror provider / model / target language written by another view so this
-// view's controls (and any later explicit save) reflect the latest settings.
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !initialized) {
-    return;
-  }
-  if (changes.provider && PROVIDER_META[changes.provider.newValue] && changes.provider.newValue !== currentProvider) {
-    // Bank any pending local key edit under the provider it was typed for.
-    providerKeys[currentProvider] = elements.apiKey.value.trim();
-    keyTestOp += 1;
-    currentProvider = changes.provider.newValue;
-    elements.provider.value = currentProvider;
-    applyProviderUi(currentProvider, { resetModel: true });
-    elements.apiKey.value = providerKeys[currentProvider] || "";
-    renderKeyStatus();
-  }
-  const model = changes.model?.newValue;
-  if (model && [...elements.model.options].some((option) => option.value === model)) {
-    elements.model.value = model;
-  }
-  const lang = changes.targetLanguage?.newValue;
-  const langOptions = [...(elements.targetLanguage.options || [])];
-  if (lang && (!langOptions.length || langOptions.some((option) => option.value === lang))) {
-    elements.targetLanguage.value = lang;
-  }
-});
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes.displayMode) {
-    return;
-  }
-  const nextMode = Utils.normalizeDisplayMode(changes.displayMode.newValue);
-  if (nextMode !== currentDisplayMode) {
-    currentDisplayMode = nextMode;
-    renderDisplayMode();
-  }
-});
+const initializePromise = initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
 
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type !== "CONTENT_STATUS" || !message.status) {
@@ -377,6 +488,7 @@ function persistSettingsNow() {
 elements.apiKey.addEventListener("input", () => {
   // Any edit invalidates an in-flight connection test for the old value.
   keyTestOp += 1;
+  markKeyEdit();
   schedulePersistSettings();
   renderKeyStatus();
 });
@@ -391,22 +503,29 @@ elements.apiKey.addEventListener("paste", () => {
 });
 elements.provider.addEventListener("change", () => {
   const nextProvider = PROVIDER_META[elements.provider.value] ? elements.provider.value : "deepseek";
-  if (nextProvider === currentProvider) {
-    return;
-  }
-  // Bank the key shown in the input under the provider it belongs to, then
-  // swap the input to the newly selected provider's stored key.
-  providerKeys[currentProvider] = elements.apiKey.value.trim();
-  // Drop any in-flight connection test for the previous provider's key.
+  // Any unsaved edit of the previous provider's key is already banked in
+  // settingsModel.edits by its input events — switching neither loses nor
+  // mixes the two credentials. Drop any in-flight test for the old key.
   keyTestOp += 1;
-  currentProvider = nextProvider;
   applyProviderUi(nextProvider, { resetModel: true });
-  elements.apiKey.value = providerKeys[nextProvider];
+  // The switch (and the model reset above) are user edits this view owns.
+  settingsModel.edits.provider = nextProvider;
+  if (elements.model.value !== settingsModel.snapshot.model) {
+    settingsModel.edits.model = elements.model.value;
+  }
+  // Swap the key input to the new provider's pending-or-stored key.
+  elements.apiKey.value = providerKeyValue(nextProvider);
   renderKeyStatus();
   persistSettingsNow();
 });
-elements.targetLanguage.addEventListener("change", persistSettingsNow);
-elements.model.addEventListener("change", persistSettingsNow);
+elements.targetLanguage.addEventListener("change", () => {
+  settingsModel.edits.targetLanguage = elements.targetLanguage.value;
+  persistSettingsNow();
+});
+elements.model.addEventListener("change", () => {
+  settingsModel.edits.model = elements.model.value;
+  persistSettingsNow();
+});
 // Closing/hiding a view only flushes a still-pending debounced edit. Edits
 // are otherwise saved immediately, so an idle (possibly stale) view never
 // writes its snapshot back over newer settings from another view.
@@ -426,9 +545,14 @@ elements.modeButtons.forEach((button) => {
   button.addEventListener("click", async () => {
     const mode = Utils.normalizeDisplayMode(button.dataset.mode);
     const op = ++displayModeOp;
+    // User edit: dirty until the write lands, so a concurrent reconcile
+    // cannot fight the click.
+    settingsModel.edits.displayMode = mode;
     currentDisplayMode = mode;
     renderDisplayMode();
     await chrome.storage.local.set({ displayMode: mode });
+    settingsModel.snapshot.displayMode = mode;
+    delete settingsModel.edits.displayMode;
     if (op !== displayModeOp || mode !== currentDisplayMode) {
       return;
     }
@@ -594,34 +718,32 @@ elements.importFile.addEventListener("change", () => {
 });
 
 async function initialize() {
-  const [settings, tabs] = await Promise.all([
-    chrome.storage.local.get(DEFAULT_SETTINGS),
-    chrome.tabs.query({ active: true, currentWindow: true })
-  ]);
-
+  // Async reads that do not touch settings state come first, so the storage
+  // read below is the LAST read: any onChanged delivered while these were in
+  // flight already merged into the model, and this fresh read observes those
+  // same writes — a stale first snapshot can never roll a newer value back.
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   currentTab = tabs[0];
-  const migrated = migrateSettings(settings);
-  const provider = PROVIDER_META[migrated.provider] ? migrated.provider : "deepseek";
-  currentProvider = provider;
-  providerKeys = { deepseek: migrated.deepseekApiKey, kimi: migrated.kimiApiKey };
-  elements.provider.value = provider;
-  applyProviderUi(provider, { resetModel: false });
-  elements.apiKey.value = providerKeys[provider];
-  elements.targetLanguage.value = migrated.targetLanguage;
-  if ([...elements.model.options].some((o) => o.value === migrated.model)) {
-    elements.model.value = migrated.model;
+
+  changesDuringRead = {};
+  const read = await chrome.storage.local.get(DEFAULT_SETTINGS);
+  // Overlay deltas delivered while the read was in flight: the read may have
+  // resolved with a snapshot older than those already-applied writes.
+  const stored = { ...read, ...changesDuringRead };
+  changesDuringRead = null;
+
+  const migrated = migrateSettings(stored);
+  reconcile(migrated);
+  // Persist one-time storage upgrades (legacy apiKey → deepseekApiKey,
+  // retired model names) so the old values do not survive on disk; the
+  // model already holds the migrated view, and the onChanged this write
+  // triggers re-reconciles the same values.
+  const migrationPatch = collectMigrationPatch(stored, migrated);
+  if (Object.keys(migrationPatch).length) {
+    await chrome.storage.local.set(migrationPatch);
   }
-  currentDisplayMode = Utils.normalizeDisplayMode(migrated.displayMode);
-  renderDisplayMode();
-  renderKeyStatus();
-  // Baseline of what storage holds, so saves write only fields this view
-  // actually changed (never a stale full snapshot over another view's edits).
-  syncedSettings = { ...(await chrome.storage.local.get(DEFAULT_SETTINGS)) };
   // Controls now mirror storage — safe to persist on hide/unload.
   initialized = true;
-  if (migrated._didMigrate) {
-    await saveSettings();
-  }
 
   if (!currentTab?.id) {
     throw new Error("找不到当前标签页");
@@ -701,31 +823,30 @@ function applyProviderUi(providerId, { resetModel }) {
   }
 }
 
+// Save = flush the pending user edits ONLY. Fields the user never touched
+// (including newer values other views wrote underneath) are never written
+// from here, so a stale idle view cannot restore old values over new ones.
 async function saveSettings() {
-  const provider = PROVIDER_META[elements.provider.value] ? elements.provider.value : "deepseek";
-  providerKeys[provider] = elements.apiKey.value.trim();
-  const settings = {
-    provider,
-    deepseekApiKey: providerKeys.deepseek,
-    kimiApiKey: providerKeys.kimi,
-    // Legacy mirror for content.js's selection key gate.
-    apiKey: providerKeys[provider],
-    targetLanguage: elements.targetLanguage.value,
-    model: elements.model.value,
-    displayMode: Utils.normalizeDisplayMode(currentDisplayMode)
-  };
-  const changed = {};
-  for (const [field, value] of Object.entries(settings)) {
-    if (syncedSettings[field] !== value) {
-      changed[field] = value;
+  const controlValues = readControlValues();
+  const { patch, fields } = collectDirtyPatch(settingsModel, controlValues);
+  if (Object.keys(patch).length) {
+    await chrome.storage.local.set(patch);
+    for (const [field, value] of Object.entries(patch)) {
+      settingsModel.snapshot[field] = value;
     }
   }
-  if (Object.keys(changed).length) {
-    await chrome.storage.local.set(changed);
-    Object.assign(syncedSettings, changed);
+  // The collected edits resolve either way: written fields now match
+  // storage, and an edit that already equalled the stored value was never
+  // unsaved to begin with.
+  for (const field of fields) {
+    delete settingsModel.edits[field];
   }
   renderKeyStatus();
-  return settings;
+  return {
+    ...controlValues,
+    // Legacy mirror for content.js's selection key gate.
+    apiKey: controlValues[PROVIDER_META[controlValues.provider].keyField]
+  };
 }
 
 // ---- Persistent per-provider key status (top of the settings panel) ----
@@ -742,12 +863,13 @@ function renderKeyStatus() {
     { id: "deepseek", row: elements.keyStatusDeepseek, value: elements.keyStatusDeepseekValue },
     { id: "kimi", row: elements.keyStatusKimi, value: elements.keyStatusKimiValue }
   ];
+  const provider = activeProvider();
   for (const { id, row, value } of rows) {
     if (!row || !value) {
       continue;
     }
-    const key = String(providerKeys[id] || "").trim();
-    row.dataset.active = id === currentProvider ? "true" : "false";
+    const key = providerKeyValue(id);
+    row.dataset.active = id === provider ? "true" : "false";
     if (key) {
       const tail = keyTail(key);
       value.textContent = tail ? `已配置 · 尾号 ${tail}` : "已配置";
@@ -757,7 +879,7 @@ function renderKeyStatus() {
       row.dataset.tone = "missing";
     }
   }
-  const activeKey = String(providerKeys[currentProvider] || "").trim();
+  const activeKey = providerKeyValue(provider);
   if (activeKey && !apiKeyFormatReason(activeKey)) {
     elements.keyGuide.hidden = true;
     elements.keyGuide.classList.remove("highlight");
@@ -776,7 +898,9 @@ function revealKeyEntry() {
 // ---- Paste → auto-save + auto connection test ----
 
 async function handleApiKeyPasted() {
-  const label = PROVIDER_META[currentProvider]?.label || "API";
+  const label = PROVIDER_META[activeProvider()]?.label || "API";
+  // A paste is a user edit: bank it before the auto-save below.
+  markKeyEdit();
   persistSettingsNow();
   renderKeyStatus();
   const key = elements.apiKey.value.trim();
@@ -797,7 +921,7 @@ async function handleApiKeyPasted() {
 }
 
 async function runKeyConnectionTest() {
-  const label = PROVIDER_META[currentProvider]?.label || "API";
+  const label = PROVIDER_META[activeProvider()]?.label || "API";
   const op = ++keyTestOp;
   keyTestPendingOp = op;
   renderStatus(`正在验证 ${label} Key`, "发送一条最小测试请求", "loading");
@@ -872,10 +996,10 @@ function buildExportPayload(settings, includeKeys) {
     }
   };
   if (includeKeys) {
-    // providerKeys is keyed by provider id ("deepseek"/"kimi"); map each to
-    // its storage/export field name.
+    // providerKeyValue is keyed by provider id ("deepseek"/"kimi"); map each
+    // to its storage/export field name.
     for (const [provider, meta] of Object.entries(PROVIDER_META)) {
-      const key = String(providerKeys[provider] || "").trim();
+      const key = providerKeyValue(provider);
       if (key) {
         payload.settings[meta.keyField] = key;
       }
@@ -892,7 +1016,7 @@ async function exportSettingsFile() {
     settings = await saveSettings();
   } catch {
     settings = {
-      provider: currentProvider,
+      provider: activeProvider(),
       targetLanguage: elements.targetLanguage.value,
       model: elements.model.value,
       displayMode: Utils.normalizeDisplayMode(currentDisplayMode)
@@ -982,27 +1106,15 @@ async function applyImportedSettings(imported) {
   updates.apiKey = provider === "kimi" ? kimiApiKey : deepseekApiKey;
   await chrome.storage.local.set(updates);
 
+  // The file's values are the new truth for every field it carried: drop
+  // pending edits for those fields, then run the single sync path so the
+  // controls, key status and snapshot all follow storage.
+  for (const field of Object.keys(updates)) {
+    delete settingsModel.edits[field];
+  }
+  reconcile(updates);
   // Drop any in-flight connection test for the pre-import provider/key.
   keyTestOp += 1;
-  currentProvider = provider;
-  providerKeys = { deepseek: deepseekApiKey, kimi: kimiApiKey };
-  elements.provider.value = provider;
-  applyProviderUi(provider, { resetModel: false });
-  if (updates.model && [...elements.model.options].some((option) => option.value === updates.model)) {
-    elements.model.value = updates.model;
-  }
-  if (
-    updates.targetLanguage &&
-    [...elements.targetLanguage.options].some((option) => option.value === updates.targetLanguage)
-  ) {
-    elements.targetLanguage.value = updates.targetLanguage;
-  }
-  elements.apiKey.value = providerKeys[provider];
-  if (updates.displayMode) {
-    currentDisplayMode = Utils.normalizeDisplayMode(updates.displayMode);
-    renderDisplayMode();
-  }
-  renderKeyStatus();
   const detail = imported.deepseekApiKey || imported.kimiApiKey
     ? "已导入文件中的 API Key"
     : "文件不含 Key，已保留本机保存的 Key";

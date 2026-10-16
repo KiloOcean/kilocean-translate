@@ -2068,7 +2068,8 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
       saveSettings,
       migrateSettings,
       initializePromise,
-      getProviderKeys: () => providerKeys,
+      getProviderKeys: () => ({ deepseek: providerKeyValue("deepseek"), kimi: providerKeyValue("kimi") }),
+      getSettingsModel: () => settingsModel,
       renderTranslationStatus,
       runKeyConnectionTest,
       buildExportPayload
@@ -2384,7 +2385,11 @@ async function checkKeyMigrationGate() {
       const pendingView = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
       await pendingView.hooks.initializePromise;
       const EDITED = fakeKey("edited", 24);
-      pendingView.dom.get("api-key").value = EDITED; // local key edit not yet saved
+      const keyInput = pendingView.dom.get("api-key");
+      keyInput.value = EDITED; // local key edit not yet saved
+      for (const fn of keyInput.listeners.input || []) {
+        fn(); // a real user edit fires the input listener → dirty flag
+      }
       pendingView.emitStorageChange({ model: { oldValue: "deepseek-flash", newValue: "deepseek-v4-pro" }, targetLanguage: { oldValue: "zh-CN", newValue: "ko" } });
       await pendingView.hooks.saveSettings();
       assertEqual(pendingView.storage.deepseekApiKey, EDITED, "pending edit: local key edit is saved");
@@ -2591,6 +2596,264 @@ async function checkKeyMigrationGate() {
   }
   if (!/包含 API Key/.test(fs.readFileSync(path.join(ROOT, "popup.html"), "utf8"))) {
     fail("popup.html: export opt-in checkbox with the 明文保存 warning must exist");
+  }
+}
+
+// ---- Settings/key state: single source of truth (snapshot + dirty flags) ----
+// The pure core (reconcileModel / collectDirtyPatch) is extracted from
+// popup.js the same way toFriendlyPageError is; the popup head supplies
+// SETTINGS_FIELDS / PROVIDER_META. VM scenarios then drive the shipping
+// popup through init races, dirty-key conflicts, external updates and saves.
+async function checkSettingsStateModel() {
+  const require = createRequire(import.meta.url);
+  try {
+    require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for settings-model tests: ${error.message}`);
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  const reconcileSrc = extractTopLevelFunction("popup.js", "reconcileModel");
+  const patchSrc = extractTopLevelFunction("popup.js", "collectDirtyPatch");
+  const popupSource = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
+  const popupHead = popupSource.slice(0, popupSource.indexOf("const elements ="));
+  if (!popupHead || !reconcileSrc || !patchSrc) {
+    fail("popup.js: cannot extract reconcileModel/collectDirtyPatch for settings-model tests");
+    return;
+  }
+  let pure;
+  try {
+    pure = new Function(
+      `${popupHead}\n${reconcileSrc}\n${patchSrc}\nreturn { reconcileModel, collectDirtyPatch };`
+    )();
+  } catch (error) {
+    fail(`popup.js: reconcileModel/collectDirtyPatch are not runnable standalone: ${error.message}`);
+    return;
+  }
+
+  // reconcileModel: merges the storage view into the snapshot, reports every
+  // present tracked field EXCEPT dirty ones, and ignores the legacy mirror.
+  {
+    const model = {
+      snapshot: { provider: "deepseek", deepseekApiKey: "sk-a", kimiApiKey: "sk-b", model: "deepseek-flash", targetLanguage: "zh-CN", displayMode: "bilingual" },
+      edits: { deepseekApiKey: "sk-user-editing" }
+    };
+    const applied = pure.reconcileModel(model, {
+      provider: "kimi",
+      deepseekApiKey: "sk-rotated",
+      kimiApiKey: "sk-new-b",
+      model: "kimi-k3",
+      targetLanguage: "ja",
+      displayMode: "original",
+      apiKey: "sk-new-b"
+    });
+    assertTrue(!("deepseekApiKey" in applied), "reconcileModel: dirty key field is never applied");
+    assertEqual(applied.provider, "kimi", "reconcileModel: non-dirty provider is applied");
+    assertEqual(applied.kimiApiKey, "sk-new-b", "reconcileModel: non-dirty key is applied");
+    assertEqual(applied.model, "kimi-k3", "reconcileModel: non-dirty model is applied");
+    assertTrue(!("apiKey" in applied), "reconcileModel: legacy apiKey mirror is never applied");
+    assertEqual(model.snapshot.deepseekApiKey, "sk-rotated", "reconcileModel: snapshot still tracks the newer stored key behind the dirty edit");
+    assertEqual(model.edits.deepseekApiKey, "sk-user-editing", "reconcileModel: the user's edit is untouched");
+    // A delta (onChanged) only touches the fields it carries.
+    const deltaApplied = pure.reconcileModel(model, { model: "kimi-k2.6" });
+    assertEqual(deltaApplied, { model: "kimi-k2.6" }, "reconcileModel: an onChanged delta applies only the changed fields");
+    assertEqual(model.snapshot.targetLanguage, "ja", "reconcileModel: a delta merge never replaces the rest of the snapshot");
+  }
+
+  // collectDirtyPatch: writes only dirty fields that differ from the
+  // snapshot (+ the legacy mirror), and reports every considered field.
+  {
+    const model = {
+      snapshot: { provider: "deepseek", deepseekApiKey: "sk-a", kimiApiKey: "sk-b", model: "deepseek-flash", targetLanguage: "zh-CN", displayMode: "bilingual" },
+      edits: { deepseekApiKey: "sk-typed", targetLanguage: "zh-CN" }
+    };
+    const controlValues = {
+      provider: "deepseek",
+      deepseekApiKey: "sk-typed",
+      kimiApiKey: "sk-b",
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const { patch, fields } = pure.collectDirtyPatch(model, controlValues);
+    assertEqual(
+      patch,
+      { deepseekApiKey: "sk-typed", apiKey: "sk-typed" },
+      "collectDirtyPatch: only changed dirty fields (+ the mirror) are written"
+    );
+    assertEqual(
+      fields,
+      ["deepseekApiKey", "targetLanguage"],
+      "collectDirtyPatch: every dirty field is reported so its flag can clear"
+    );
+    // No dirty fields → no write at all (stale views never write back).
+    assertEqual(
+      pure.collectDirtyPatch({ snapshot: model.snapshot, edits: {} }, controlValues).patch,
+      {},
+      "collectDirtyPatch: a clean model writes nothing"
+    );
+  }
+
+  const DEEPSEEK_KEY = fakeKey("modeldeepseek", 21);
+  const KIMI_KEY = fakeKey("modelkimi", 25);
+  const EDITED = fakeKey("modelediting", 24);
+  const NEWER = fakeKey("modelrotated", 24);
+
+  const fire = (el, type) => {
+    for (const fn of el.listeners[type] || []) {
+      fn();
+    }
+  };
+  const recordSets = (popup) => {
+    const setCalls = [];
+    const originalSet = popup.sandbox.chrome.storage.local.set;
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      setCalls.push(updates);
+      await originalSet(updates);
+    };
+    return setCalls;
+  };
+
+  // (1) onChanged during init, then init completes: controls must show the
+  // newer value and no stale write-back may follow. The storage read is
+  // parked so the change lands between its snapshot and its resolution —
+  // the strongest form of the stale-first-snapshot race.
+  {
+    const storage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(storage);
+    let releaseRead;
+    const readGate = new Promise((resolve) => { releaseRead = resolve; });
+    const originalGet = popup.sandbox.chrome.storage.local.get;
+    popup.sandbox.chrome.storage.local.get = async (defaults) => {
+      const result = await originalGet(defaults);
+      popup.emitStorageChange({
+        targetLanguage: { oldValue: "zh-CN", newValue: "ja" },
+        model: { oldValue: "deepseek-flash", newValue: "deepseek-v4-pro" }
+      });
+      await readGate;
+      return result; // resolves with the pre-change snapshot on purpose
+    };
+    const initDone = popup.hooks.initializePromise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseRead();
+    await initDone;
+    assertEqual(popup.dom.get("target-language").value, "ja", "init race: control shows the value changed during init");
+    assertEqual(popup.dom.get("model").value, "deepseek-v4-pro", "init race: model control updated too");
+    assertEqual(popup.hooks.getSettingsModel().snapshot.targetLanguage, "ja", "init race: snapshot keeps the newer value after init completes");
+    const setCalls = recordSets(popup);
+    await popup.hooks.saveSettings();
+    assertEqual(setCalls.length, 0, "init race: save without edits must not write stale values back");
+    assertEqual(popup.storage.targetLanguage, "ja", "init race: storage keeps the newer value");
+  }
+
+  // (2) External key change while the user is editing the key (key dirty):
+  // the key control keeps the user's value, every other field updates.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    popup.emitStorageChange({
+      deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: NEWER },
+      model: { oldValue: "deepseek-flash", newValue: "deepseek-v4-pro" },
+      targetLanguage: { oldValue: "zh-CN", newValue: "ko" }
+    });
+    assertEqual(keyInput.value, EDITED, "dirty key: control keeps the user's value");
+    assertEqual(popup.dom.get("model").value, "deepseek-v4-pro", "dirty key: model still updates from storage");
+    assertEqual(popup.dom.get("target-language").value, "ko", "dirty key: language still updates from storage");
+    assertEqual(popup.hooks.getSettingsModel().snapshot.deepseekApiKey, NEWER, "dirty key: snapshot tracks the newer stored key");
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, EDITED, "dirty key: the pending edit survives");
+    // The user's edit is still saved (over the external value) once saved.
+    const setCalls = recordSets(popup);
+    await popup.hooks.saveSettings();
+    assertEqual(setCalls, [{ deepseekApiKey: EDITED, apiKey: EDITED }], "dirty key: saving flushes the user's edit");
+  }
+
+  // (3) External changes while nothing is being edited: controls update —
+  // including a provider switch retargeting the key input.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" });
+    await popup.hooks.initializePromise;
+    popup.emitStorageChange({ deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: NEWER } });
+    assertEqual(popup.dom.get("api-key").value, NEWER, "external key change applies when the key is not being edited");
+    popup.emitStorageChange({
+      provider: { oldValue: "deepseek", newValue: "kimi" },
+      model: { oldValue: "deepseek-flash", newValue: "kimi-k2.6" }
+    });
+    assertEqual(popup.dom.get("provider").value, "kimi", "external provider switch applies to the select");
+    assertEqual(popup.dom.get("model").value, "kimi-k2.6", "external provider switch applies the other view's model");
+    assertEqual(popup.dom.get("api-key").value, KIMI_KEY, "external provider switch retargets the key input");
+    assertEqual(popup.dom.get("key-status-kimi").dataset.active, "true", "external provider switch flips the key status rows");
+  }
+
+  // (4) Save writes ONLY dirty fields and clears their flags.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const setCalls = recordSets(popup);
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    await popup.hooks.saveSettings();
+    assertEqual(setCalls, [{ deepseekApiKey: EDITED, apiKey: EDITED }], "save: only the dirty key field (+ the mirror) is written");
+    assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "save: the inactive provider's stored key is untouched");
+    assertEqual(popup.storage.model, "deepseek-flash", "save: non-dirty fields are never written");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "save: dirty flags clear after the write");
+    await popup.hooks.saveSettings();
+    assertEqual(setCalls.length, 1, "save: a second save with clean flags writes nothing");
+    // A dirty non-key field flushes on its own, without dragging keys along.
+    const langSelect = popup.dom.get("target-language");
+    langSelect.value = "ja";
+    fire(langSelect, "change");
+    assertEqual(setCalls[1], { targetLanguage: "ja" }, "save: a language edit writes only the language (no key mirror)");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "save: language dirty flag cleared by the auto-save");
+  }
+
+  // Switching providers banks an unsaved key edit under the provider it was
+  // typed for; switching back restores it, and the inactive provider's
+  // stored key is never touched.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const setCalls = recordSets(popup);
+    const keyInput = popup.dom.get("api-key");
+    const providerSelect = popup.dom.get("provider");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    providerSelect.value = "kimi";
+    fire(providerSelect, "change");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(keyInput.value, KIMI_KEY, "provider switch: input swaps to the new provider's stored key");
+    assertEqual(
+      setCalls[0],
+      { deepseekApiKey: EDITED, provider: "kimi", model: "kimi-k2.6", apiKey: KIMI_KEY },
+      "provider switch: the banked edit saves under its own provider and the mirror follows the switch"
+    );
+    providerSelect.value = "deepseek";
+    fire(providerSelect, "change");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(keyInput.value, EDITED, "provider switch: switching back restores the banked edit");
+    assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "provider switch: the inactive provider's stored key is untouched");
   }
 }
 
@@ -4670,6 +4933,7 @@ async function main() {
   await checkFetchTimeoutCoverage();
   await checkModelMigrationAndRetryPolicy();
   await checkKeyMigrationGate();
+  await checkSettingsStateModel();
   await checkInflightCapAndRunCancellation();
   await checkSpaRefreshAndSelectionLifecycle();
   await checkSpaFlushRaceGuard();
@@ -4687,7 +4951,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest (incl. store key → extension ID), permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm), inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
+  console.log("OK: manifest (incl. store key → extension ID), permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm), settings state model (snapshot + dirty flags), inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
   process.exit(0);
 }
 
