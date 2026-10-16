@@ -251,6 +251,31 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
+// Mirror provider / model / target language written by another view so this
+// view's controls (and any later explicit save) reflect the latest settings.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !initialized || persistTimer) {
+    return;
+  }
+  if (changes.provider && PROVIDER_META[changes.provider.newValue] && changes.provider.newValue !== currentProvider) {
+    keyTestOp += 1;
+    currentProvider = changes.provider.newValue;
+    elements.provider.value = currentProvider;
+    applyProviderUi(currentProvider, { resetModel: true });
+    elements.apiKey.value = providerKeys[currentProvider] || "";
+    renderKeyStatus();
+  }
+  const model = changes.model?.newValue;
+  if (model && [...elements.model.options].some((option) => option.value === model)) {
+    elements.model.value = model;
+  }
+  const lang = changes.targetLanguage?.newValue;
+  const langOptions = [...(elements.targetLanguage.options || [])];
+  if (lang && (!langOptions.length || langOptions.some((option) => option.value === lang))) {
+    elements.targetLanguage.value = lang;
+  }
+});
+
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes.displayMode) {
     return;
@@ -366,10 +391,18 @@ elements.provider.addEventListener("change", () => {
 });
 elements.targetLanguage.addEventListener("change", persistSettingsNow);
 elements.model.addEventListener("change", persistSettingsNow);
-window.addEventListener("pagehide", persistSettingsNow);
+// Closing/hiding a view only flushes a still-pending debounced edit. Edits
+// are otherwise saved immediately, so an idle (possibly stale) view never
+// writes its snapshot back over newer settings from another view.
+function flushPendingPersist() {
+  if (persistTimer) {
+    persistSettingsNow();
+  }
+}
+window.addEventListener("pagehide", flushPendingPersist);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
-    persistSettingsNow();
+    flushPendingPersist();
   }
 });
 

@@ -2374,6 +2374,11 @@ async function checkKeyMigrationGate() {
     await stale.hooks.saveSettings();
     assertEqual(stale.storage.deepseekApiKey, NEWER, "stale view: save after an external key change keeps the newer key");
     assertEqual(stale.storage.kimiApiKey, KIMI_KEY, "stale view: other provider key untouched");
+    stale.emitStorageChange({ provider: { oldValue: "deepseek", newValue: "kimi" }, model: { oldValue: "deepseek-flash", newValue: "kimi-k2.6" }, targetLanguage: { oldValue: "zh-CN", newValue: "ja" } });
+    await stale.hooks.saveSettings();
+    assertEqual(stale.storage.provider, "kimi", "stale view: explicit save keeps provider changed in another view");
+    assertEqual(stale.storage.model, "kimi-k2.6", "stale view: explicit save keeps model changed in another view");
+    assertEqual(stale.storage.targetLanguage, "ja", "stale view: explicit save keeps target language changed in another view");
     let releaseStale;
     const staleGate = new Promise((resolve) => { releaseStale = resolve; });
     const racing = createPopupVm(
@@ -2549,6 +2554,9 @@ async function checkKeyMigrationGate() {
 
   // ---- Static: export uses blob + <a download>, never chrome.downloads ----
   const popupScan = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
+  if (!/addEventListener\("pagehide",\s*flushPendingPersist\)/.test(popupScan)) {
+    fail("popup.js: pagehide must only flush pending edits (no stale full-settings write)");
+  }
   // Import must not run its file chooser inside the transient action popup
   // (crbug 364825891): popup opens popup.html?view=settings as a tab.
   if (!/view=settings/.test(popupScan) || !/chrome\.tabs\.create\(/.test(popupScan) || !/IS_SETTINGS_TAB/.test(popupScan)) {

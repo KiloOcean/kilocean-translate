@@ -564,3 +564,9 @@ select:focus {
 body.settings-tab {
   margin: 24px auto;
 }
+/* The settings tab is not bound to a web page: hide page-bound controls. */
+body.settings-tab .actions,
+body.settings-tab .export-panel,
+body.settings-tab .selection-confirm-panel {
+  display: none !important;
+}
