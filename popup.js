@@ -43,6 +43,10 @@ const DEFAULT_SETTINGS = {
 // ---- Settings export / import (pure helpers, DOM-free) ----
 const SETTINGS_EXPORT_FORMAT = "kilocean-translate-settings";
 const SETTINGS_EXPORT_VERSION = 1;
+// A real backup is a few KB; anything megabyte-scale is not one of ours. The
+// guard runs on file.size before the file is read, so an oversized (or
+// hostile) pick is rejected with no read, no parse, and no storage write.
+const SETTINGS_IMPORT_MAX_BYTES = 1024 * 1024;
 const SETTINGS_IMPORT_FIELDS = new Set([
   "provider",
   "targetLanguage",
@@ -467,7 +471,55 @@ chrome.storage.onChanged.addListener((changes, area) => {
   reconcile(delta);
 });
 
-const initializePromise = initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
+// ---- Init gate: user actions never touch settings before they are loaded ----
+// The single init-ready promise, settled exactly once: resolved when
+// initialize() has merged storage into the settings model, REJECTED when
+// initialization failed. Every settings-touching user action awaits it via
+// whenReady() — awaiting actions must see the failure (and show its error)
+// instead of hanging forever or proceeding against the pre-init
+// DEFAULT_SETTINGS snapshot (Codex P1: Export clicked before init finished
+// shipped a backup of defaults with no keys). The handler below only renders
+// the failure status; it must not swallow the rejection.
+const initializePromise = initialize();
+let initSettled = false;
+let initError = null;
+initializePromise.then(
+  () => {
+    initSettled = true;
+  },
+  (error) => {
+    initSettled = true;
+    initError = error ?? new Error("初始化失败");
+    setStatus("无法初始化", initError.message || String(initError), "error");
+  }
+);
+
+// Wrap a user action so it runs only once initialization settled. While init
+// is pending, the model and the controls still hold DEFAULT_SETTINGS, so an
+// unguarded click could export/import/test/translate/save with defaults and
+// no keys. If init failed, the action re-surfaces init's error and stops.
+// Once init settled successfully the wrapper dispatches synchronously, so
+// listener behavior (and its storage writes) stays on the event's own tick.
+function whenReady(action) {
+  return (...args) => {
+    if (initSettled) {
+      if (initError) {
+        setStatus("无法初始化", initError.message || String(initError), "error");
+        return undefined;
+      }
+      return action(...args);
+    }
+    return (async () => {
+      try {
+        await initializePromise;
+      } catch (error) {
+        setStatus("无法初始化", error?.message || String(error), "error");
+        return undefined;
+      }
+      return action(...args);
+    })();
+  };
+}
 
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type !== "CONTENT_STATUS" || !message.status) {
@@ -495,14 +547,17 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 });
 
 
-elements.selectionConfirmBtn.addEventListener("click", () => {
-  void confirmPendingSelection();
-});
+elements.selectionConfirmBtn.addEventListener("click", whenReady(() => confirmPendingSelection()));
 
+// Not whenReady-gated (documented allowlist in scripts/ci-check.mjs):
+// dismissing only clears worker/page selection state and never reads or
+// writes settings — and the panel itself only appears after init.
 elements.selectionConfirmDismiss.addEventListener("click", () => {
   void dismissPendingSelection();
 });
 
+// Not whenReady-gated (allowlisted): pure input visibility toggle, no
+// settings access.
 elements.toggleKey.addEventListener("click", () => {
   const revealing = elements.apiKey.type === "password";
   elements.apiKey.type = revealing ? "text" : "password";
@@ -540,6 +595,10 @@ function persistSettingsNow() {
   void saveSettings();
 }
 
+// Not whenReady-gated (allowlisted): banking the edit pre-init is exactly
+// what must happen — a dirty field survives init's reconcile, and
+// initialize() flushes banked edits at its end. Only the SAVE is gated
+// (change/blur/paste below).
 elements.apiKey.addEventListener("input", () => {
   // Any edit invalidates an in-flight connection test for the old value.
   keyTestOp += 1;
@@ -547,13 +606,18 @@ elements.apiKey.addEventListener("input", () => {
   schedulePersistSettings();
   renderKeyStatus();
 });
-elements.apiKey.addEventListener("change", persistSettingsNow);
-elements.apiKey.addEventListener("blur", persistSettingsNow);
+elements.apiKey.addEventListener("change", whenReady(persistSettingsNow));
+elements.apiKey.addEventListener("blur", whenReady(persistSettingsNow));
 // Paste → auto-save + auto connection test. The pasted value lands after the
 // default paste action, so run on the next tick.
 elements.apiKey.addEventListener("paste", () => {
   setTimeout(() => {
-    void handleApiKeyPasted();
+    // Bank the pasted value BEFORE awaiting the init gate: reconcile() never
+    // overwrites a dirty field, so the paste survives initialize() applying
+    // the stored key to the input while the gate is still pending. The save
+    // and the connection test then run through the gate below.
+    markKeyEdit();
+    void whenReady(handleApiKeyPasted)();
   }, 0);
 });
 elements.provider.addEventListener("change", () => {
@@ -574,15 +638,18 @@ elements.provider.addEventListener("change", () => {
   // Swap the key input to the new provider's pending-or-stored key.
   elements.apiKey.value = providerKeyValue(nextProvider);
   renderKeyStatus();
-  persistSettingsNow();
+  // The edits banked above are pre-init-safe (dirty fields survive init's
+  // reconcile); only the SAVE waits for the init gate, so it diffs against
+  // the loaded snapshot — never the pre-init defaults.
+  void whenReady(persistSettingsNow)();
 });
 elements.targetLanguage.addEventListener("change", () => {
   settingsModel.edits.targetLanguage = elements.targetLanguage.value;
-  persistSettingsNow();
+  void whenReady(persistSettingsNow)();
 });
 elements.model.addEventListener("change", () => {
   settingsModel.edits.model = elements.model.value;
-  persistSettingsNow();
+  void whenReady(persistSettingsNow)();
 });
 // Closing/hiding a view flushes a still-pending debounced edit — and, once
 // init has completed, any other unsaved dirty edit (e.g. one banked before
@@ -594,6 +661,10 @@ function flushPendingPersist() {
     persistSettingsNow();
   }
 }
+// Not whenReady-gated (allowlisted): the flush must attempt at hide time,
+// synchronously — and it cannot fire early anyway: flushPendingPersist
+// no-ops before init (`initialized`), and initialize() flushes any edit
+// banked during its reads at its end.
 window.addEventListener("pagehide", flushPendingPersist);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
@@ -602,7 +673,10 @@ document.addEventListener("visibilitychange", () => {
 });
 
 elements.modeButtons.forEach((button) => {
-  button.addEventListener("click", async () => {
+  // Gated as a whole: the clicked mode is read from the button's static
+  // dataset (never from live control state), so parking the handler on the
+  // init gate cannot lose the click to init's own reconcile.
+  button.addEventListener("click", whenReady(async () => {
     const mode = Utils.normalizeDisplayMode(button.dataset.mode);
     const op = ++displayModeOp;
     // User edit: dirty until the write lands, so a concurrent reconcile
@@ -653,10 +727,10 @@ elements.modeButtons.forEach((button) => {
     } catch {
       // Page may not allow injection yet; mode is still saved for next translate.
     }
-  });
+  }));
 });
 
-elements.testConnection.addEventListener("click", async () => {
+elements.testConnection.addEventListener("click", whenReady(async () => {
   if (!validateApiKey()) {
     return;
   }
@@ -671,9 +745,9 @@ elements.testConnection.addEventListener("click", async () => {
     elements.testConnection.disabled = false;
     elements.testConnection.textContent = "测试 API 连接";
   }
-});
+}));
 
-elements.translate.addEventListener("click", async () => {
+elements.translate.addEventListener("click", whenReady(async () => {
   if (!validateApiKey()) {
     return;
   }
@@ -708,8 +782,10 @@ elements.translate.addEventListener("click", async () => {
   } finally {
     elements.translate.disabled = false;
   }
-});
+}));
 
+// Not whenReady-gated (allowlisted): restore only messages the page
+// (RESTORE_ORIGINAL) and renders its status — no settings read or write.
 elements.restore.addEventListener("click", async () => {
   try {
     await ensureContentScript(currentTab.id);
@@ -729,6 +805,8 @@ elements.restore.addEventListener("click", async () => {
   }
 });
 
+// Not whenReady-gated (allowlisted): the HTML export / print run inside the
+// content script from its own state; the popup reads no settings here.
 elements.exportHtml.addEventListener("click", async () => {
   await runExportAction(
     "EXPORT_HTML",
@@ -745,9 +823,7 @@ elements.printPdf.addEventListener("click", async () => {
   );
 });
 
-elements.exportSettings.addEventListener("click", () => {
-  void exportSettingsFile();
-});
+elements.exportSettings.addEventListener("click", whenReady(() => exportSettingsFile()));
 
 // Chromium (Linux, ~128–130, crbug 364825891) can destroy an action popup
 // when a file chooser opens, so the import never runs. Import therefore runs
@@ -761,6 +837,9 @@ const IS_SETTINGS_TAB = (() => {
   }
 })();
 
+// Not whenReady-gated (allowlisted): this only opens the file chooser (or
+// the settings tab); the import itself is the gated import-file change
+// handler below, which merges into the loaded model only.
 elements.importSettings.addEventListener("click", () => {
   if (IS_SETTINGS_TAB) {
     elements.importFile.click();
@@ -778,14 +857,14 @@ if (IS_SETTINGS_TAB) {
   }, 0);
 }
 
-elements.importFile.addEventListener("change", () => {
+elements.importFile.addEventListener("change", whenReady(() => {
   const file = elements.importFile.files && elements.importFile.files[0];
   elements.importFile.value = "";
   if (!file) {
-    return;
+    return undefined;
   }
-  void importSettingsFile(file);
-});
+  return importSettingsFile(file);
+}));
 
 async function initialize() {
   // Async reads that do not touch settings state come first, so the storage
@@ -1236,6 +1315,11 @@ async function exportSettingsFile() {
 }
 
 async function importSettingsFile(file) {
+  // Size gate first: file.size is checked before file.text() can run.
+  if (file?.size > SETTINGS_IMPORT_MAX_BYTES) {
+    setStatus("导入失败", "文件过大（超过 1 MB），请选择本扩展导出的设置文件", "error");
+    return;
+  }
   let text;
   try {
     text = await file.text();
