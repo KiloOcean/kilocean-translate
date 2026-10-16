@@ -2379,6 +2379,17 @@ async function checkKeyMigrationGate() {
     assertEqual(stale.storage.provider, "kimi", "stale view: explicit save keeps provider changed in another view");
     assertEqual(stale.storage.model, "kimi-k2.6", "stale view: explicit save keeps model changed in another view");
     assertEqual(stale.storage.targetLanguage, "ja", "stale view: explicit save keeps target language changed in another view");
+    {
+      const pendingView = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+      await pendingView.hooks.initializePromise;
+      const EDITED = fakeKey("edited", 24);
+      pendingView.dom.get("api-key").value = EDITED; // local key edit not yet saved
+      pendingView.emitStorageChange({ model: { oldValue: "deepseek-flash", newValue: "deepseek-v4-pro" }, targetLanguage: { oldValue: "zh-CN", newValue: "ko" } });
+      await pendingView.hooks.saveSettings();
+      assertEqual(pendingView.storage.deepseekApiKey, EDITED, "pending edit: local key edit is saved");
+      assertEqual(pendingView.storage.model, "deepseek-v4-pro", "pending edit: external model change survives the save");
+      assertEqual(pendingView.storage.targetLanguage, "ko", "pending edit: external language change survives the save");
+    }
     let releaseStale;
     const staleGate = new Promise((resolve) => { releaseStale = resolve; });
     const racing = createPopupVm(

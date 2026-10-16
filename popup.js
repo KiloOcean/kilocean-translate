@@ -202,6 +202,16 @@ let currentTab = null;
 let statusTimer = null;
 let currentDisplayMode = Utils.DISPLAY_MODES.bilingual;
 let initialized = false;
+// Last known stored values (from init, own writes, and storage.onChanged).
+let syncedSettings = {};
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") {
+    return;
+  }
+  for (const [field, change] of Object.entries(changes)) {
+    syncedSettings[field] = change.newValue;
+  }
+});
 let displayModeOp = 0;
 // Active provider + per-provider keys so switching never mixes or clobbers
 // the two credentials; elements.apiKey always edits currentProvider's entry.
@@ -254,10 +264,12 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // Mirror provider / model / target language written by another view so this
 // view's controls (and any later explicit save) reflect the latest settings.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !initialized || persistTimer) {
+  if (area !== "local" || !initialized) {
     return;
   }
   if (changes.provider && PROVIDER_META[changes.provider.newValue] && changes.provider.newValue !== currentProvider) {
+    // Bank any pending local key edit under the provider it was typed for.
+    providerKeys[currentProvider] = elements.apiKey.value.trim();
     keyTestOp += 1;
     currentProvider = changes.provider.newValue;
     elements.provider.value = currentProvider;
@@ -598,6 +610,9 @@ async function initialize() {
   currentDisplayMode = Utils.normalizeDisplayMode(migrated.displayMode);
   renderDisplayMode();
   renderKeyStatus();
+  // Baseline of what storage holds, so saves write only fields this view
+  // actually changed (never a stale full snapshot over another view's edits).
+  syncedSettings = { ...(await chrome.storage.local.get(DEFAULT_SETTINGS)) };
   // Controls now mirror storage — safe to persist on hide/unload.
   initialized = true;
   if (migrated._didMigrate) {
@@ -695,7 +710,16 @@ async function saveSettings() {
     model: elements.model.value,
     displayMode: Utils.normalizeDisplayMode(currentDisplayMode)
   };
-  await chrome.storage.local.set(settings);
+  const changed = {};
+  for (const [field, value] of Object.entries(settings)) {
+    if (syncedSettings[field] !== value) {
+      changed[field] = value;
+    }
+  }
+  if (Object.keys(changed).length) {
+    await chrome.storage.local.set(changed);
+    Object.assign(syncedSettings, changed);
+  }
   renderKeyStatus();
   return settings;
 }
