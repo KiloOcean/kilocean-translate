@@ -1911,6 +1911,7 @@ function createBackgroundVm(storageData, fetchImpl) {
 // Minimal DOM stub good enough to run the real popup.js load path (and the
 // settings import/export helpers) without a browser.
 function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok: false }) } = {}) {
+  const storageListeners = [];
   const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
   const popupSource = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
 
@@ -2046,7 +2047,7 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
           get: async (defaults) => ({ ...(defaults || {}), ...storageData }),
           set: async (updates) => { Object.assign(storageData, updates); }
         },
-        onChanged: { addListener() {} }
+        onChanged: { addListener(fn) { storageListeners.push(fn); } }
       },
       tabs: {
         query: async () => [{ id: 42 }],
@@ -2078,7 +2079,15 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
   return {
     storage: storageData,
     dom: byId,
-    hooks: sandbox.__popupHooks
+    hooks: sandbox.__popupHooks,
+    emitStorageChange(changes) {
+      for (const [field, change] of Object.entries(changes)) {
+        storageData[field] = change.newValue;
+      }
+      for (const fn of storageListeners) {
+        fn(changes, "local");
+      }
+    }
   };
 }
 
@@ -2353,6 +2362,18 @@ async function checkKeyMigrationGate() {
     assertEqual(pollPopup.dom.get("status-title").textContent, "Key 有效", "poll: key test result survives a concurrent poll");
     pollPopup.hooks.renderTranslationStatus({ active: false });
     assertEqual(pollPopup.dom.get("status-title").textContent, "准备就绪", "poll: passive updates resume after the test completes");
+  }
+
+  // ---- Stale view must not restore an old key over a newer one ----
+  {
+    const shared = { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" };
+    const stale = createPopupVm(shared);
+    await stale.hooks.initializePromise;
+    const NEWER = fakeKey("rotated", 24);
+    stale.emitStorageChange({ deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: NEWER } });
+    await stale.hooks.saveSettings();
+    assertEqual(stale.storage.deepseekApiKey, NEWER, "stale view: save after an external key change keeps the newer key");
+    assertEqual(stale.storage.kimiApiKey, KIMI_KEY, "stale view: other provider key untouched");
   }
 
   // ---- Settings import/export (popup vm): schema validation + no-wipe merge ----

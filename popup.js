@@ -218,6 +218,34 @@ let pendingSelection = null;
 const initializePromise = initialize().catch((error) => setStatus("无法初始化", error.message, "error"));
 
 // Keep radiogroup in sync when content coerces original→bilingual mid-start.
+// Keep this view's key snapshot in sync with writes from other extension
+// views (popup vs. settings tab), so a later save here never restores a
+// stale key over a newer one.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") {
+    return;
+  }
+  for (const [provider, meta] of Object.entries(PROVIDER_META)) {
+    const change = changes[meta.keyField];
+    if (!change) {
+      continue;
+    }
+    const next = String(change.newValue || "").trim();
+    if (providerKeys[provider] === next) {
+      continue;
+    }
+    const editingThis = provider === currentProvider && document.activeElement === elements.apiKey;
+    if (editingThis) {
+      continue;
+    }
+    providerKeys[provider] = next;
+    if (provider === currentProvider) {
+      elements.apiKey.value = next;
+    }
+    renderKeyStatus();
+  }
+});
+
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes.displayMode) {
     return;
