@@ -299,6 +299,8 @@ function persistSettingsNow() {
 }
 
 elements.apiKey.addEventListener("input", () => {
+  // Any edit invalidates an in-flight connection test for the old value.
+  keyTestOp += 1;
   schedulePersistSettings();
   renderKeyStatus();
 });
@@ -735,6 +737,31 @@ function friendlyKeyTestFailure(response, label) {
 // ---- Settings export / import ----
 
 // Blob + <a download>: works in the popup without the downloads permission.
+function buildExportPayload(settings, includeKeys) {
+  const payload = {
+    format: SETTINGS_EXPORT_FORMAT,
+    version: SETTINGS_EXPORT_VERSION,
+    createdAt: new Date().toISOString(),
+    settings: {
+      provider: settings.provider,
+      targetLanguage: settings.targetLanguage,
+      model: settings.model,
+      displayMode: settings.displayMode
+    }
+  };
+  if (includeKeys) {
+    // providerKeys is keyed by provider id ("deepseek"/"kimi"); map each to
+    // its storage/export field name.
+    for (const [provider, meta] of Object.entries(PROVIDER_META)) {
+      const key = String(providerKeys[provider] || "").trim();
+      if (key) {
+        payload.settings[meta.keyField] = key;
+      }
+    }
+  }
+  return payload;
+}
+
 // Keys are excluded unless the user opts in with the warning checkbox; empty
 // key fields are omitted so a re-import never sees a blank key value.
 async function exportSettingsFile() {
@@ -750,25 +777,7 @@ async function exportSettingsFile() {
     };
   }
   const includeKeys = Boolean(elements.exportIncludeKeys?.checked);
-  const payload = {
-    format: SETTINGS_EXPORT_FORMAT,
-    version: SETTINGS_EXPORT_VERSION,
-    createdAt: new Date().toISOString(),
-    settings: {
-      provider: settings.provider,
-      targetLanguage: settings.targetLanguage,
-      model: settings.model,
-      displayMode: settings.displayMode
-    }
-  };
-  if (includeKeys) {
-    for (const field of ["deepseekApiKey", "kimiApiKey"]) {
-      const key = String(providerKeys[field] || "").trim();
-      if (key) {
-        payload.settings[field] = key;
-      }
-    }
-  }
+  const payload = buildExportPayload(settings, includeKeys);
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   try {

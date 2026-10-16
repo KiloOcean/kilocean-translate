@@ -36,7 +36,7 @@ ID 必须等于上面的商店 ID，否则构建失败。本地也可以随时�
 ```bash
 node -e '
 const crypto = require("node:crypto");
-const manifest = require("../manifest.json");
+const manifest = require("./manifest.json");
 const hash = crypto.createHash("sha256")
   .update(Buffer.from(manifest.key, "base64")).digest();
 let id = "";

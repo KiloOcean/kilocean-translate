@@ -2062,7 +2062,8 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
       saveSettings,
       migrateSettings,
       initializePromise,
-      getProviderKeys: () => providerKeys
+      getProviderKeys: () => providerKeys,
+      buildExportPayload
     };`,
     context,
     { filename: "popup.js" }
@@ -2336,6 +2337,24 @@ async function checkKeyMigrationGate() {
     };
     const popup = createPopupVm(storage);
     await popup.hooks.initializePromise;
+
+    // Export: keys excluded by default; opt-in carries BOTH provider keys
+    // (regression: providerKeys is keyed by provider id, not field name).
+    {
+      const base = { provider: "deepseek", targetLanguage: "zh-CN", model: "deepseek-flash", displayMode: "bilingual" };
+      const noKeys = popup.hooks.buildExportPayload(base, false).settings;
+      if ("deepseekApiKey" in noKeys || "kimiApiKey" in noKeys) {
+        fail("export: keys must be excluded unless opted in");
+      }
+      const withKeys = popup.hooks.buildExportPayload(base, true).settings;
+      if (withKeys.deepseekApiKey !== DEEPSEEK_KEY || withKeys.kimiApiKey !== KIMI_KEY) {
+        fail("export: opt-in must include both stored provider keys");
+      }
+      const roundTrip = popup.hooks.parseImportedSettings(popup.hooks.buildExportPayload(base, true));
+      if (roundTrip.deepseekApiKey !== DEEPSEEK_KEY || roundTrip.kimiApiKey !== KIMI_KEY) {
+        fail("export→import round trip must preserve opted-in keys");
+      }
+    }
 
     // parseImportedSettings: happy paths and every rejection reason.
     const goodFile = {
