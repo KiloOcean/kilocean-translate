@@ -1231,8 +1231,13 @@ async function checkFetchTimeoutCoverage() {
     fail("popup.js: toFriendlyPageError must surface the timeout message verbatim");
   }
   const popup = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
-  if (!/setStatus\("连接失败",\s*error\.message/.test(popup)) {
-    fail("popup.js: connection-test failure must surface error.message");
+  // Manual + paste tests share runKeyConnectionTest: thrown errors go through
+  // toFriendlyPageError (timeout verbatim), API errors fall back to response.error.
+  if (
+    !/renderStatus\("网络错误",\s*toFriendlyPageError\(error\)/.test(popup) ||
+    !/response\?\.error \|\| "连接测试失败/.test(popup)
+  ) {
+    fail("popup.js: connection-test failure must surface the error message");
   }
   if (!/setStatus\("翻译失败",\s*status\.error/.test(popup)) {
     fail("popup.js: page translation failure must surface status.error");

@@ -383,25 +383,12 @@ elements.testConnection.addEventListener("click", async () => {
     return;
   }
 
+  // Same tokenized path as paste validation: a newer test (manual or
+  // paste) or any other status supersedes an older completion.
   elements.testConnection.disabled = true;
   elements.testConnection.textContent = "正在测试…";
-  setStatus(`正在连接 ${PROVIDER_META[elements.provider.value]?.label || "API"}`, "发送一条最小测试请求", "loading");
-
   try {
-    const settings = await saveSettings();
-    const response = await chrome.runtime.sendMessage({
-      type: "TEST_CONNECTION",
-      provider: settings.provider,
-      targetLanguage: settings.targetLanguage,
-      model: settings.model
-    });
-
-    if (!response?.ok) {
-      throw new Error(response?.error || "连接测试失败");
-    }
-    setStatus("连接成功", "API Key 与模型均可正常使用", "success");
-  } catch (error) {
-    setStatus("连接失败", error.message, "error");
+    await runKeyConnectionTest();
   } finally {
     elements.testConnection.disabled = false;
     elements.testConnection.textContent = "测试 API 连接";
