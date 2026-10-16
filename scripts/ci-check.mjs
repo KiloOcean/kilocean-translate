@@ -1912,6 +1912,9 @@ function createBackgroundVm(storageData, fetchImpl) {
 // settings import/export helpers) without a browser.
 function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok: false }) } = {}) {
   const storageListeners = [];
+  const runtimeMessageListeners = [];
+  const windowListeners = {};
+  const documentListeners = {};
   const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
   const popupSource = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
 
@@ -2042,20 +2045,26 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
     clearTimeout,
     setInterval,
     clearInterval,
-    addEventListener() {},
+    // Recorded (unlike a no-op) so tests can fire pagehide, and swapped per
+    // test when a scenario needs to capture the 700 ms status-poll interval.
+    addEventListener(type, fn) {
+      (windowListeners[type] = windowListeners[type] || []).push(fn);
+    },
     document: {
       getElementById: (id) => byId.get(id) || null,
       querySelector: (selector) => (selector === ".status-card" ? statusCard : null),
       querySelectorAll: (selector) => (selector === ".mode-button" ? modeButtons : []),
       createElement: () => makeElement(),
       body: makeElement(),
-      addEventListener() {},
+      addEventListener(type, fn) {
+        (documentListeners[type] = documentListeners[type] || []).push(fn);
+      },
       visibilityState: "visible"
     },
     chrome: {
       runtime: {
         getManifest: () => ({ version: "1.4.3" }),
-        onMessage: { addListener() {} },
+        onMessage: { addListener(fn) { runtimeMessageListeners.push(fn); } },
         sendMessage: (message) => runtimeMessageHandler(message)
       },
       storage: {
@@ -2088,7 +2097,8 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
       getSettingsModel: () => settingsModel,
       renderTranslationStatus,
       runKeyConnectionTest,
-      buildExportPayload
+      buildExportPayload,
+      getKeyTestState: () => ({ op: keyTestOp, pendingOp: keyTestPendingOp })
     };`,
     context,
     { filename: "popup.js" }
@@ -2105,6 +2115,26 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
       for (const fn of storageListeners) {
         fn(changes, "local");
       }
+    },
+    // Deliver a chrome.runtime.onMessage to the popup's own listener (e.g. a
+    // CONTENT_STATUS update from the current tab).
+    emitRuntimeMessage(message, sender = { tab: { id: 42 } }) {
+      for (const fn of runtimeMessageListeners) {
+        fn(message, sender);
+      }
+    },
+    // The unload/hide paths popup.js flushes pending debounced edits on.
+    firePageHide() {
+      for (const fn of windowListeners.pagehide || []) {
+        fn();
+      }
+    },
+    fireVisibilityHidden() {
+      sandbox.document.visibilityState = "hidden";
+      for (const fn of documentListeners.visibilitychange || []) {
+        fn();
+      }
+      sandbox.document.visibilityState = "visible";
     }
   };
 }
@@ -2380,6 +2410,48 @@ async function checkKeyMigrationGate() {
     assertEqual(pollPopup.dom.get("status-title").textContent, "Key 有效", "poll: key test result survives a concurrent poll");
     pollPopup.hooks.renderTranslationStatus({ active: false });
     assertEqual(pollPopup.dom.get("status-title").textContent, "准备就绪", "poll: passive updates resume after the test completes");
+  }
+
+  // ---- The real 700 ms poll (CONTENT_STATUS → startStatusPolling →
+  // GET_STATUS → renderTranslationStatus/passiveStatus) during a pending key
+  // test: it must neither bump keyTestOp (which would drop the test's own
+  // result as stale) nor replace the test's status line ----
+  {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const pollPopup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" },
+      { runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? gate : { ok: false }) }
+    );
+    await pollPopup.hooks.initializePromise;
+    // Capture the poll callback instead of sleeping real 700 ms ticks.
+    let pollTick = null;
+    pollPopup.sandbox.setInterval = (fn) => {
+      pollTick = fn;
+      return 1;
+    };
+    pollPopup.sandbox.clearInterval = () => {};
+    const translating = { active: true, phase: "translating", translated: 3, total: 9, failed: 0, displayMode: "bilingual" };
+    pollPopup.sandbox.chrome.tabs.sendMessage = async () => ({ ok: true, status: translating });
+    pollPopup.emitRuntimeMessage({ type: "CONTENT_STATUS", status: translating });
+    assertTrue(typeof pollTick === "function", "poll interval: an active CONTENT_STATUS starts the 700 ms status poll");
+    assertEqual(pollPopup.dom.get("status-title").textContent, "正在翻译", "poll interval: translation status renders before the key test");
+
+    const testDone = pollPopup.hooks.runKeyConnectionTest();
+    const opAtStart = pollPopup.hooks.getKeyTestState();
+    await pollTick(); // one 700 ms poll lands while the test is pending
+    assertEqual(
+      pollPopup.hooks.getKeyTestState(),
+      opAtStart,
+      "poll interval: a status poll during a pending key test neither bumps keyTestOp nor clears keyTestPendingOp"
+    );
+    assertTrue(
+      String(pollPopup.dom.get("status-title").textContent).startsWith("正在验证"),
+      "poll interval: the 700 ms poll cannot replace the pending key test's status"
+    );
+    release({ ok: true });
+    await testDone;
+    assertEqual(pollPopup.dom.get("status-title").textContent, "Key 有效", "poll interval: the key test result survives concurrent 700 ms polls");
   }
 
   // ---- Stale view must not restore an old key over a newer one ----
@@ -3086,6 +3158,79 @@ async function checkSettingsStateModel() {
     await new Promise((resolve) => setTimeout(resolve, 0));
     assertEqual(keyInput.value, EDITED, "provider switch: switching back restores the banked edit");
     assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "provider switch: the inactive provider's stored key is untouched");
+  }
+
+  // Hiding/unloading a STALE IDLE view (pagehide / visibilitychange=hidden)
+  // must write NOTHING: with no pending debounced edit there is no flush, so
+  // newer values another view wrote underneath survive untouched — a stale
+  // view can never restore its older keys over them.
+  {
+    const storage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(storage);
+    await popup.hooks.initializePromise;
+    const setCalls = recordSets(popup);
+    const ROTATED_DEEPSEEK = fakeKey("hidedeepseek", 24);
+    const ROTATED_KIMI = fakeKey("hidekimi", 23);
+    // Another view rotates BOTH keys while this view sits idle (no edits).
+    popup.emitStorageChange({
+      deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: ROTATED_DEEPSEEK },
+      kimiApiKey: { oldValue: KIMI_KEY, newValue: ROTATED_KIMI },
+      apiKey: { oldValue: DEEPSEEK_KEY, newValue: ROTATED_DEEPSEEK }
+    });
+    popup.firePageHide();
+    popup.fireVisibilityHidden();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(setCalls.length, 0, "stale idle hide: pagehide/visibilitychange=hidden write nothing to storage");
+    assertEqual(popup.storage.deepseekApiKey, ROTATED_DEEPSEEK, "stale idle hide: the newer DeepSeek key survives");
+    assertEqual(popup.storage.kimiApiKey, ROTATED_KIMI, "stale idle hide: the newer Kimi key survives");
+  }
+
+  // A view hidden with a PENDING DEBOUNCED key edit flushes ONLY that dirty
+  // field through the serialized write queue (+ the legacy apiKey mirror) —
+  // never the other provider's key, even though this view's snapshot of it
+  // is stale relative to what another view has since written.
+  {
+    const storage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(storage);
+    await popup.hooks.initializePromise;
+    const setCalls = recordSets(popup);
+    const keyInput = popup.dom.get("api-key");
+    const FLUSHED_KEY = fakeKey("hideflush", 24);
+    const ROTATED_KIMI = fakeKey("hidekimi", 23);
+    keyInput.value = FLUSHED_KEY;
+    fire(keyInput, "input"); // banks the edit + schedules the 200 ms debounce
+    // Another view rotates the INACTIVE provider's key before the debounce fires.
+    popup.emitStorageChange({ kimiApiKey: { oldValue: KIMI_KEY, newValue: ROTATED_KIMI } });
+    popup.fireVisibilityHidden(); // hidden mid-debounce: flush now
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(
+      setCalls,
+      [{ deepseekApiKey: FLUSHED_KEY, apiKey: FLUSHED_KEY }],
+      "hide flush: only the pending dirty key (+ the legacy mirror) is written"
+    );
+    assertEqual(popup.storage.kimiApiKey, ROTATED_KIMI, "hide flush: the other provider's newer key is never overwritten with the stale one");
+    assertEqual(popup.storage.targetLanguage, "zh-CN", "hide flush: untouched fields are never written");
+    // The debounce timer is gone with the edit settled: a later pagehide
+    // must not write anything more.
+    popup.firePageHide();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(setCalls.length, 1, "hide flush: a second hide after the flush writes nothing");
   }
 }
 
