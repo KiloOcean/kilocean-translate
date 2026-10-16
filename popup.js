@@ -244,8 +244,12 @@ chrome.storage.onChanged.addListener((changes, area) => {
     if (providerKeys[provider] === next) {
       continue;
     }
-    const editingThis = provider === currentProvider && document.activeElement === elements.apiKey;
-    if (editingThis) {
+    // Skip only when the user has an actual unsaved edit of this key (input
+    // differs from the previously stored value) — focus alone is not an edit.
+    const dirtyLocalEdit =
+      provider === currentProvider &&
+      elements.apiKey.value.trim() !== String(change.oldValue || "").trim();
+    if (dirtyLocalEdit) {
       continue;
     }
     providerKeys[provider] = next;

@@ -2080,6 +2080,7 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
     storage: storageData,
     dom: byId,
     hooks: sandbox.__popupHooks,
+    sandbox,
     emitStorageChange(changes) {
       for (const [field, change] of Object.entries(changes)) {
         storageData[field] = change.newValue;
@@ -2389,6 +2390,15 @@ async function checkKeyMigrationGate() {
       assertEqual(pendingView.storage.deepseekApiKey, EDITED, "pending edit: local key edit is saved");
       assertEqual(pendingView.storage.model, "deepseek-v4-pro", "pending edit: external model change survives the save");
       assertEqual(pendingView.storage.targetLanguage, "ko", "pending edit: external language change survives the save");
+    }
+    {
+      const focused = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" });
+      await focused.hooks.initializePromise;
+      focused.sandbox.document.activeElement = focused.dom.get("api-key"); // focus, no edit
+      const ROTATED2 = fakeKey("rotatedtwo", 24);
+      focused.emitStorageChange({ deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: ROTATED2 } });
+      await focused.hooks.saveSettings(); // e.g. blur
+      assertEqual(focused.storage.deepseekApiKey, ROTATED2, "focus only: external key update applies and blur-save keeps it");
     }
     let releaseStale;
     const staleGate = new Promise((resolve) => { releaseStale = resolve; });
