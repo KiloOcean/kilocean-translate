@@ -690,7 +690,7 @@ async function handleApiKeyPasted() {
 async function runKeyConnectionTest() {
   const label = PROVIDER_META[currentProvider]?.label || "API";
   const op = ++keyTestOp;
-  setStatus(`正在验证 ${label} Key`, "发送一条最小测试请求", "loading");
+  renderStatus(`正在验证 ${label} Key`, "发送一条最小测试请求", "loading");
   try {
     const settings = await saveSettings();
     const response = await chrome.runtime.sendMessage({
@@ -703,16 +703,16 @@ async function runKeyConnectionTest() {
       return;
     }
     if (response?.ok) {
-      setStatus("Key 有效", `${label} 连接成功，可以开始翻译`, "success");
+      renderStatus("Key 有效", `${label} 连接成功，可以开始翻译`, "success");
       return;
     }
     const [title, detail] = friendlyKeyTestFailure(response, label);
-    setStatus(title, detail, "error");
+    renderStatus(title, detail, "error");
   } catch (error) {
     if (op !== keyTestOp) {
       return;
     }
-    setStatus("网络错误", toFriendlyPageError(error), "error");
+    renderStatus("网络错误", toFriendlyPageError(error), "error");
   }
 }
 
@@ -1015,7 +1015,14 @@ function updateExportAvailability(status) {
   elements.printPdf.disabled = !canExport;
 }
 
+// Any status from another action supersedes a pending key connection test,
+// so a late validation result can't overwrite it.
 function setStatus(title, detail, tone) {
+  keyTestOp += 1;
+  renderStatus(title, detail, tone);
+}
+
+function renderStatus(title, detail, tone) {
   elements.statusTitle.textContent = title;
   elements.statusDetail.textContent = detail;
   elements.statusCard.dataset.tone = tone;
