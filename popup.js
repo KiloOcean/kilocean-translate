@@ -862,6 +862,8 @@ async function applyImportedSettings(imported) {
   updates.apiKey = provider === "kimi" ? kimiApiKey : deepseekApiKey;
   await chrome.storage.local.set(updates);
 
+  // Drop any in-flight connection test for the pre-import provider/key.
+  keyTestOp += 1;
   currentProvider = provider;
   providerKeys = { deepseek: deepseekApiKey, kimi: kimiApiKey };
   elements.provider.value = provider;
