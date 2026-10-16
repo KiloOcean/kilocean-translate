@@ -580,7 +580,7 @@ function schedulePersistSettings() {
     if (!initialized) {
       return;
     }
-    void saveSettings();
+    persistSettingsInBackground();
   }, 200);
 }
 
@@ -592,7 +592,18 @@ function persistSettingsNow() {
     clearTimeout(persistTimer);
     persistTimer = null;
   }
-  void saveSettings();
+  persistSettingsInBackground();
+}
+
+// The sanctioned fire-and-forget save shape (the ONLY one — ci-check's
+// static pass rejects un-awaited, un-caught saveSettings() calls): debounce
+// ticks, change/blur persists and init's closing flush have no caller left
+// to await the stable save, but a failed write must still surface a status
+// instead of dying as an unhandled rejection.
+function persistSettingsInBackground() {
+  saveSettings().catch((error) => {
+    setStatus("保存设置失败", error?.message || String(error), "error");
+  });
 }
 
 // Not whenReady-gated (allowlisted): banking the edit pre-init is exactly
@@ -656,6 +667,11 @@ elements.model.addEventListener("change", () => {
 // initialization finished, which never got a debounce). Still dirty-only:
 // edits are otherwise saved immediately, so an idle (possibly stale) view
 // never writes its snapshot back over newer settings from another view.
+// Intentionally not awaited (documented fire-and-forget): pagehide cannot
+// await anything — the page is going away — so the write just goes through
+// the serialized queue; its rejection is still .catch-handled with a status
+// render (persistSettingsInBackground), which matters for the
+// visibilitychange path, where the page stays alive.
 function flushPendingPersist() {
   if (persistTimer || (initialized && Object.keys(settingsModel.edits).length)) {
     persistSettingsNow();
@@ -687,7 +703,14 @@ elements.modeButtons.forEach((button) => {
     // Through the serialized save path (never a direct storage write): a
     // newer click while this write is pending stays dirty and settles via
     // the follow-up save instead of being un-banked unconditionally.
-    await saveSettings();
+    try {
+      await saveSettings();
+    } catch (error) {
+      // The mode stays banked as a dirty edit; the page is not messaged
+      // with a mode that never reached storage.
+      setStatus("保存设置失败", toFriendlyPageError(error), "error");
+      return;
+    }
     if (op !== displayModeOp) {
       return;
     }
@@ -756,7 +779,16 @@ elements.translate.addEventListener("click", whenReady(async () => {
   setStatus("正在启动翻译", "识别当前页面中的段落内容", "loading");
 
   try {
-    const settings = await saveSettings();
+    let settings;
+    try {
+      // Resolves only when the save is STABLE (all follow-up writes
+      // committed, no dirty edit left) — the page must never start
+      // translating against settings still being written.
+      settings = await saveSettings();
+    } catch (error) {
+      setStatus("保存设置失败", toFriendlyPageError(error), "error");
+      return;
+    }
     await ensureContentScript(currentTab.id);
     const response = await chrome.tabs.sendMessage(currentTab.id, {
       type: "START_TRANSLATION",
@@ -900,8 +932,11 @@ async function initialize() {
   // Edits banked while the reads above were still pending never got their
   // debounce (schedulePersistSettings is a no-op before init): flush them now
   // through the serialized queue, or closing this view would drop them.
+  // Intentionally fire-and-forget (documented): init itself must complete so
+  // gated user actions can run — the flush is serialized and .catch-handled
+  // by persistSettingsInBackground, and gated actions coalesce behind it.
   if (Object.keys(settingsModel.edits).length) {
-    void saveSettings();
+    persistSettingsInBackground();
   }
 
   if (!currentTab?.id) {
@@ -989,9 +1024,11 @@ function applyProviderUi(providerId, { resetModel }) {
 // ---- Serialized settings saves ----
 // At most one chrome.storage.local.set from this view runs at a time: two
 // concurrent writes could land out of order and let an older save's value
-// overwrite a newer edit. saveSettings() calls that arrive while a write is
-// in flight coalesce into ONE follow-up save started once that write
-// settles — every queued caller awaits that same follow-up.
+// overwrite a newer edit. saveSettings() calls that arrive while a save is in
+// flight coalesce into ONE follow-up save started once that save settles —
+// every queued caller awaits that same follow-up. A save that FAILS rejects
+// for the initiating caller and for every coalesced caller alike (the dirty
+// edits stay dirty, so the next action retries them).
 let settingsSaveInFlight = null;
 let settingsSaveFollowUp = null;
 
@@ -1041,10 +1078,19 @@ function saveSettings() {
     return runSettingsSave();
   }
   if (!settingsSaveFollowUp) {
-    settingsSaveFollowUp = settingsSaveInFlight.then(() => {
-      settingsSaveFollowUp = null;
-      return saveSettings();
-    });
+    settingsSaveFollowUp = settingsSaveInFlight.then(
+      () => {
+        settingsSaveFollowUp = null;
+        return saveSettings();
+      },
+      (error) => {
+        // Reset the slot on failure too, or a later save would hand every
+        // new caller this stale rejection forever; rethrow so every caller
+        // coalesced behind the failed write sees the same failure.
+        settingsSaveFollowUp = null;
+        throw error;
+      }
+    );
   }
   return settingsSaveFollowUp;
 }
@@ -1055,10 +1101,42 @@ async function runSettingsSave() {
     settle = resolve;
   });
   try {
-    return await performSettingsSave();
+    return await performSettingsSaveUntilStable();
   } finally {
     settle();
     settingsSaveInFlight = null;
+  }
+}
+
+// Safety valve: one saveSettings() call may not chase mid-write edits
+// forever. Convergence is structural — an edit settles once it equals what a
+// save established, and every dirty field is collected every round — so
+// rounds only continue while edits keep arriving mid-write. The cap turns a
+// pathological non-converging case into a rejection instead of a hang (the
+// edits stay dirty either way, so the next action retries them).
+const SETTINGS_SAVE_MAX_ROUNDS = 10;
+
+// Codex P1: a save used to resolve when ITS OWN write finished, while the
+// follow-up write a mid-flight retype forced was fire-and-forget — translate,
+// key test, selection confirm and import could then run with newer edits
+// still unsaved. One saveSettings() call now spans save → settle → follow-up
+// save → … until the view is STABLE: this call's writes all committed, in
+// order, through the serialized queue (nothing else can enqueue behind them —
+// every other writer coalesces into this very call), and no dirty edit
+// remains pending. Any write failure rejects here and reaches the initiating
+// caller AND every coalesced caller. Callers that need persisted settings
+// (translate, selection confirm, key test, import, export, display-mode send)
+// await exactly this promise.
+async function performSettingsSaveUntilStable() {
+  let last;
+  for (let round = 0; ; round += 1) {
+    if (round >= SETTINGS_SAVE_MAX_ROUNDS) {
+      throw new Error(`保存设置未能收敛（已连续 ${SETTINGS_SAVE_MAX_ROUNDS} 轮），请稍后重试`);
+    }
+    last = await performSettingsSave();
+    if (!last.followUpNeeded && Object.keys(settingsModel.edits).length === 0) {
+      return last.settings;
+    }
   }
 }
 
@@ -1091,7 +1169,9 @@ async function performSettingsSave() {
   }
   // The collected edits resolve only when they still equal what this save
   // established in storage: an edit retyped while the write was in flight
-  // stays dirty (the control keeps it) and gets one follow-up save.
+  // stays dirty (the control keeps it) and gets one follow-up round — driven
+  // by the caller's loop in performSettingsSaveUntilStable, never a
+  // fire-and-forget save.
   const followUpNeeded = settleSavedEdits(settingsModel, savedValues);
   // An overtaken field now holds another view's newer value in the snapshot;
   // its control could not take that value when it arrived (the field was
@@ -1102,21 +1182,18 @@ async function performSettingsSave() {
       applyFieldsToControls({ [field]: settingsModel.snapshot[field] });
     }
   }
-  if (followUpNeeded) {
-    // Through the serializer, so this coalesces with any save already
-    // queued behind the in-flight one; a rejected write is owned by that
-    // follow-up's callers, and the edit stays dirty either way.
-    void saveSettings();
-  }
   renderKeyStatus();
   // Post-save actions (translate start, key test, export) read the view as
   // it stands AFTER the write, so a field another view updated mid-flight
   // reports the newer effective value, never the stale one this save carried.
   const effectiveValues = readControlValues();
   return {
-    ...effectiveValues,
-    // Legacy mirror for content.js's selection key gate.
-    apiKey: effectiveValues[PROVIDER_META[effectiveValues.provider].keyField]
+    followUpNeeded,
+    settings: {
+      ...effectiveValues,
+      // Legacy mirror for content.js's selection key gate.
+      apiKey: effectiveValues[PROVIDER_META[effectiveValues.provider].keyField]
+    }
   };
 }
 
@@ -1206,8 +1283,19 @@ async function runKeyConnectionTest() {
 }
 
 async function runKeyConnectionTestInner(op, label) {
+  let settings;
   try {
-    const settings = await saveSettings();
+    // Stable save (all follow-up writes committed) before the network call:
+    // the tested key is the one storage will hand the worker.
+    settings = await saveSettings();
+  } catch (error) {
+    if (op !== keyTestOp) {
+      return;
+    }
+    renderStatus("保存设置失败", toFriendlyPageError(error), "error");
+    return;
+  }
+  try {
     const response = await chrome.runtime.sendMessage({
       type: "TEST_CONNECTION",
       provider: settings.provider,
@@ -1284,6 +1372,10 @@ function buildExportPayload(settings, includeKeys) {
 async function exportSettingsFile() {
   let settings;
   try {
+    // Awaits the STABLE save (follow-up writes included) so the backup
+    // matches storage; if the save failed, fall back to the current
+    // controls — the export then still reflects what this view shows, and
+    // no write failure can block the backup itself.
     settings = await saveSettings();
   } catch {
     settings = {
@@ -1397,6 +1489,9 @@ async function applyImportedSettings(imported) {
   renderKeyStatus();
   // Drop any in-flight connection test for the pre-import provider/key.
   keyTestOp += 1;
+  // Awaited to STABILITY: the caller renders 设置已导入 only after every
+  // follow-up write committed — including one carrying an edit the user made
+  // to an imported field while this save was in flight.
   await saveSettings();
   const detail = imported.deepseekApiKey || imported.kimiApiKey
     ? "已导入文件中的 API Key"
@@ -1600,7 +1695,17 @@ async function confirmPendingSelection() {
   setStatus("正在翻译划词", "扩展内确认后发送选中文本", "loading");
 
   try {
-    await saveSettings();
+    try {
+      // Stable save (all follow-up writes committed) before confirming: the
+      // page's key gate reads storage the moment the batch is sent.
+      await saveSettings();
+    } catch (error) {
+      // Keep the pending selection and the panel — the confirm stays
+      // retryable once the save works. Only a confirmed/expired selection
+      // (the outer catch) clears them.
+      setStatus("保存设置失败", toFriendlyPageError(error), "error");
+      return;
+    }
     // Bind the confirm to the previewed snapshot: the worker rejects if the
     // stored pending was replaced by a newer selection the popup never showed.
     const confirm = await chrome.runtime.sendMessage({

@@ -3281,17 +3281,18 @@ async function checkSettingsStateModel() {
   // edit A is gated in flight; the user retypes B on the same field, the
   // onChanged echo of our own write of A arrives, then the write completes —
   // B must stay dirty, the control must keep showing it, and one follow-up
-  // save must write B before clearing the flag.
+  // round must write B before the initiating saveSettings() promise resolves
+  // (Codex P1: the promise used to resolve after A's write alone, with B's
+  // follow-up write still fire-and-forget). Each write gets its own release.
   {
     const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
     await popup.hooks.initializePromise;
     const setCalls = [];
     const trueSet = popup.sandbox.chrome.storage.local.set;
-    let releaseWrite;
-    const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+    const writeReleases = [];
     popup.sandbox.chrome.storage.local.set = async (updates) => {
       setCalls.push(updates);
-      await writeGate;
+      await new Promise((resolve) => writeReleases.push(resolve));
       await trueSet(updates);
     };
     const keyInput = popup.dom.get("api-key");
@@ -3308,14 +3309,19 @@ async function checkSettingsStateModel() {
     });
     assertEqual(keyInput.value, NEWER, "pending edit: the control keeps edit B through the echo of A");
     assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, NEWER, "pending edit: edit B stays banked through the echo");
-    releaseWrite();
-    await saving;
-    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, NEWER, "pending edit: completion keeps B dirty (it never matched the saved A)");
-    assertEqual(keyInput.value, NEWER, "pending edit: the control still shows B after the save completes");
+    writeReleases[0]();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assertEqual(setCalls.length, 2, "pending edit: exactly one follow-up save runs");
-    assertEqual(setCalls[1], { deepseekApiKey: NEWER, apiKey: NEWER }, "pending edit: the follow-up save writes B");
-    assertEqual(popup.hooks.getSettingsModel().edits, {}, "pending edit: the follow-up save clears the dirty flag");
+    assertEqual(setCalls.length, 2, "pending edit: exactly one follow-up round runs");
+    assertEqual(setCalls[1], { deepseekApiKey: NEWER, apiKey: NEWER }, "pending edit: the follow-up round writes B");
+    assertEqual(keyInput.value, NEWER, "pending edit: the control still shows B while its write is in flight");
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, NEWER, "pending edit: B is still dirty while its write is in flight");
+    let resolved = false;
+    saving.then(() => { resolved = true; }, () => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertTrue(resolved === false, "pending edit: the initiating save promise stays pending until B's write commits");
+    writeReleases[1]();
+    await saving;
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "pending edit: the follow-up round clears the dirty flag before the promise resolves");
     assertEqual(popup.storage.deepseekApiKey, NEWER, "pending edit: storage ends at B");
   }
 
@@ -3563,12 +3569,24 @@ async function checkSettingsWriteQueueConcurrency() {
   // (2) Import is a batch of edits on the same queue: an edit made to an
   // imported field WHILE the import's write is pending survives it (the old
   // code deleted edits for imported fields after its own unserialized write).
+  // And the Codex P1 fix: the import's save resolves only once STABLE, so the
+  // 设置已导入 status cannot render before that concurrent edit is persisted.
   {
     const popup = createPopupVm(seededStorage());
     await popup.hooks.initializePromise;
     const gate = gateStorage(popup);
     const langSelect = popup.dom.get("target-language");
-    const importing = popup.hooks.applyImportedSettings({ provider: "kimi", model: "kimi-k3", targetLanguage: "ja" });
+    const file = {
+      size: 256,
+      text: async () =>
+        JSON.stringify({
+          format: "kilocean-translate-settings",
+          version: 1,
+          settings: { provider: "kimi", model: "kimi-k3", targetLanguage: "ja" }
+        })
+    };
+    const importing = popup.hooks.importSettingsFile(file);
+    await tick(); // file.text() + parse before the import's write is queued
     assertEqual(gate.writes.length, 1, "import: the import enqueues exactly one write");
     assertEqual(
       gate.writes[0].updates,
@@ -3579,12 +3597,16 @@ async function checkSettingsWriteQueueConcurrency() {
     langSelect.value = "ko";
     fire(langSelect, "change");
     gate.writes[0].release();
-    await importing;
     await tick();
     assertEqual(gate.writes.length, 2, "import: the mid-write edit gets exactly one follow-up write");
     assertEqual(gate.writes[1].updates, { targetLanguage: "ko" }, "import: the follow-up writes only the edited field");
+    assertTrue(
+      popup.dom.get("status-title").textContent !== "设置已导入",
+      "import: no 设置已导入 status while the concurrent edit's write is still pending"
+    );
     gate.writes[1].release();
-    await tick();
+    await importing;
+    assertEqual(popup.dom.get("status-title").textContent, "设置已导入", "import: the success status renders only after every follow-up write committed");
     assertEqual(popup.storage.targetLanguage, "ko", "import: the edit made during the pending import ends in storage");
     assertEqual(popup.storage.provider, "kimi", "import: the imported provider survives the concurrent edit");
     assertEqual(popup.storage.model, "kimi-k3", "import: the imported model survives the concurrent edit");
@@ -3809,6 +3831,206 @@ async function checkSettingsWriteQueueConcurrency() {
     assertTrue(gate.maxInFlight === 1, "overtaken language: at most one write in flight at a time");
   }
 
+  // (8) Codex P1 regression — translate: hold the FIRST storage.set, retype
+  // the key mid-write, then release both writes. The save that initiated the
+  // click must not let the page start translating until the FOLLOW-UP write
+  // (the one carrying the retyped key) committed, and by then storage holds
+  // the NEW key + mirror — the page's key gate reads storage, not the popup.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    popup.sandbox.setInterval = () => 1; // never start a real 700 ms poll
+    popup.sandbox.clearInterval = () => {};
+    const gate = gateStorage(popup);
+    const tabMessages = [];
+    const storageAtMessage = [];
+    const originalSend = popup.sandbox.chrome.tabs.sendMessage;
+    popup.sandbox.chrome.tabs.sendMessage = async (tabId, message) => {
+      tabMessages.push(message);
+      if (message?.type === "START_TRANSLATION") {
+        storageAtMessage.push({ ...popup.storage });
+      }
+      return originalSend(tabId, message);
+    };
+    const keyInput = popup.dom.get("api-key");
+    const TYPED_KEY = fakeKey("p1typed", 20);
+    const RETYPED_KEY = fakeKey("p1retyped", 22);
+    keyInput.value = TYPED_KEY;
+    fire(keyInput, "input");
+    const clicked = popup.dom.get("translate").listeners.click[0]();
+    assertEqual(gate.writes.length, 1, "translate follow-up: the typed key's save parks as the only write");
+    assertEqual(
+      gate.writes[0].updates,
+      { deepseekApiKey: TYPED_KEY, apiKey: TYPED_KEY },
+      "translate follow-up: the pending write carries the typed key"
+    );
+    // The user retypes the key while that write is parked.
+    keyInput.value = RETYPED_KEY;
+    fire(keyInput, "input");
+    fire(keyInput, "change"); // immediate persist coalesces behind the in-flight save
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "translate follow-up: the retype gets exactly one follow-up write");
+    assertEqual(
+      gate.writes[1].updates,
+      { deepseekApiKey: RETYPED_KEY, apiKey: RETYPED_KEY },
+      "translate follow-up: the follow-up write carries the retyped key"
+    );
+    assertEqual(
+      tabMessages.filter((message) => message?.type === "START_TRANSLATION").length,
+      0,
+      "translate follow-up: no START_TRANSLATION before the follow-up write committed"
+    );
+    gate.writes[1].release();
+    await clicked;
+    const starts = tabMessages.filter((message) => message?.type === "START_TRANSLATION");
+    assertEqual(starts.length, 1, "translate follow-up: the page starts exactly once, after the follow-up write committed");
+    assertEqual(
+      starts[0].options,
+      { provider: "deepseek", targetLanguage: "zh-CN", model: "deepseek-flash", displayMode: "bilingual" },
+      "translate follow-up: the page is started with the settled settings"
+    );
+    assertEqual(storageAtMessage[0].deepseekApiKey, RETYPED_KEY, "translate follow-up: storage already holds the NEW key when the page is told to translate");
+    assertEqual(storageAtMessage[0].apiKey, RETYPED_KEY, "translate follow-up: the legacy mirror carries the NEW key too");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "translate follow-up: every edit settled before the action ran");
+    assertTrue(gate.maxInFlight === 1, "translate follow-up: at most one write in flight at a time");
+  }
+
+  // (8b) Same race through the manual connection test: TEST_CONNECTION must
+  // leave only after the follow-up write committed, and the worker must read
+  // the NEW key from storage when it fires.
+  {
+    const seed = seededStorage();
+    const testFired = [];
+    const popup = createPopupVm(seed, {
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          testFired.push({ message, storage: { ...seed } });
+        }
+        return { ok: true };
+      }
+    });
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const keyInput = popup.dom.get("api-key");
+    const TYPED_KEY = fakeKey("p1testtyped", 24);
+    const RETYPED_KEY = fakeKey("p1testretyped", 26);
+    keyInput.value = TYPED_KEY;
+    fire(keyInput, "input");
+    const clicked = popup.dom.get("test-connection").listeners.click[0]();
+    assertEqual(gate.writes.length, 1, "key test follow-up: the typed key's save parks as the only write");
+    keyInput.value = RETYPED_KEY;
+    fire(keyInput, "input");
+    fire(keyInput, "change");
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "key test follow-up: the retype gets exactly one follow-up write");
+    assertEqual(testFired.length, 0, "key test follow-up: no TEST_CONNECTION before the follow-up write committed");
+    gate.writes[1].release();
+    await clicked;
+    assertEqual(testFired.length, 1, "key test follow-up: the connection test fires once, after the follow-up write committed");
+    assertEqual(
+      testFired[0].storage.deepseekApiKey,
+      RETYPED_KEY,
+      "key test follow-up: storage holds the NEW key when the worker is asked to test it"
+    );
+    // The mid-write retype invalidated the run (keyTestOp bumped by its input
+    // event), so the result is dropped by design — only the button returns.
+    assertEqual(
+      popup.dom.get("status-title").textContent,
+      "正在验证 DeepSeek Key",
+      "key test follow-up: the retyped key invalidates the in-flight run's status write (documented popup behavior)"
+    );
+    assertEqual(popup.dom.get("test-connection").disabled, false, "key test follow-up: the button re-enables after the stable save");
+    assertTrue(gate.maxInFlight === 1, "key test follow-up: at most one write in flight at a time");
+  }
+
+  // (9) Codex P1 failure path: a rejected storage write must reject the
+  // initiating save promise (and every coalesced caller), render an error,
+  // leave the edits dirty, and stop the action — translate never starts, the
+  // connection test never fires — and a later save retries the dirty edit.
+  {
+    const seed = seededStorage();
+    const popup = createPopupVm(seed);
+    await popup.hooks.initializePromise;
+    popup.sandbox.setInterval = () => 1;
+    popup.sandbox.clearInterval = () => {};
+    const tabMessages = [];
+    const originalSend = popup.sandbox.chrome.tabs.sendMessage;
+    popup.sandbox.chrome.tabs.sendMessage = async (tabId, message) => {
+      tabMessages.push(message);
+      return originalSend(tabId, message);
+    };
+    let failWrites = false;
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      if (failWrites) {
+        throw new Error("quota-boom");
+      }
+      Object.assign(popup.storage, updates);
+    };
+    const keyInput = popup.dom.get("api-key");
+    const PENDING_KEY = fakeKey("p1failedit", 24);
+    keyInput.value = PENDING_KEY;
+    fire(keyInput, "input");
+    failWrites = true;
+    const clicked = popup.dom.get("translate").listeners.click[0]();
+    await clicked;
+    assertEqual(
+      tabMessages.filter((message) => message?.type === "START_TRANSLATION").length,
+      0,
+      "write failure: translate never starts when the save rejects"
+    );
+    assertEqual(popup.dom.get("status-title").textContent, "保存设置失败", "write failure: the failed save renders a dedicated error");
+    assertEqual(popup.dom.get("status-detail").textContent, "quota-boom", "write failure: the surfaced detail is the storage error");
+    assertEqual(popup.dom.get("translate").disabled, false, "write failure: the translate button re-enables");
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, PENDING_KEY, "write failure: the edit stays dirty for a retry");
+    assertEqual(seed.deepseekApiKey, DEEPSEEK_KEY, "write failure: storage keeps the pre-save key");
+
+    // The initiating caller and callers coalesced behind it all reject with
+    // the storage error — and the follow-up slot is freed, so the NEXT save
+    // is a fresh attempt (no stale rejection stuck in it).
+    const first = popup.hooks.saveSettings();
+    const second = popup.hooks.saveSettings();
+    let firstError = null;
+    let secondError = null;
+    await first.catch((error) => { firstError = error; });
+    await second.catch((error) => { secondError = error; });
+    assertTrue(/quota-boom/.test(String(firstError?.message)), "write failure: the initiating save rejects with the storage error");
+    assertTrue(/quota-boom/.test(String(secondError?.message)), "write failure: a caller coalesced behind the failed save sees the same failure");
+    failWrites = false;
+    await popup.hooks.saveSettings();
+    assertEqual(seed.deepseekApiKey, PENDING_KEY, "write failure recovery: a later save retries the still-dirty edit");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "write failure recovery: the retried edit settles once writes work again");
+  }
+
+  // (9b) Same failure through the connection test button: no network call,
+  // a dedicated error status, and the button comes back enabled.
+  {
+    const runtimeMessages = [];
+    const popup = createPopupVm(seededStorage(), {
+      runtimeMessageHandler: async (message) => {
+        runtimeMessages.push(message);
+        return { ok: true };
+      }
+    });
+    await popup.hooks.initializePromise;
+    popup.sandbox.chrome.storage.local.set = async () => {
+      throw new Error("quota-boom");
+    };
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = fakeKey("p1failtest", 22);
+    fire(keyInput, "input");
+    const clicked = popup.dom.get("test-connection").listeners.click[0]();
+    await clicked;
+    assertEqual(
+      runtimeMessages.filter((message) => message?.type === "TEST_CONNECTION").length,
+      0,
+      "write failure: no TEST_CONNECTION when the save rejects"
+    );
+    assertEqual(popup.dom.get("status-title").textContent, "保存设置失败", "write failure: the connection test renders the save error");
+    assertEqual(popup.dom.get("test-connection").disabled, false, "write failure: the test button re-enables");
+  }
+
   // Static: exactly one chrome.storage.local.set call site — the queue — and
   // no other direct (or remove-) write path anywhere in popup.js.
   const popupScan = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
@@ -3821,6 +4043,77 @@ async function checkSettingsWriteQueueConcurrency() {
   }
   if (!/enqueueSettingsWrite\(/.test(popupScan)) {
     fail("popup.js: the serialized write queue entrypoint enqueueSettingsWrite must exist");
+  }
+
+  // Static (Codex P1): no un-awaited, un-caught saveSettings() /
+  // enqueueSettingsWrite() call sites in popup.js. A save promise nobody owns
+  // is exactly how the follow-up write used to be fire-and-forget (translate,
+  // key test, selection confirm and import ran before newer edits were
+  // persisted) and how a rejected write would die as an unhandled rejection.
+  // Every call must be awaited, returned into its caller or a promise chain,
+  // or explicitly .catch-handled; anything else needs an entry in the
+  // documented allowlist below with a reason.
+  const SAVE_CALL_ALLOWLIST = new Map([
+    // Intentionally empty: persistSettingsInBackground — the single
+    // fire-and-forget shape (debounce ticks, change/blur persists, init's
+    // closing flush, the hide-time flush) — already qualifies via its .catch.
+  ]);
+  const skipStringLiteral = (text, index) => {
+    const quote = text[index];
+    let i = index + 1;
+    while (i < text.length && text[i] !== quote) {
+      if (text[i] === "\\") {
+        i += 1;
+      }
+      i += 1;
+    }
+    return i; // index of the closing quote
+  };
+  const findMatchingParen = (text, openIndex) => {
+    let depth = 0;
+    for (let i = openIndex; i < text.length; i += 1) {
+      const ch = text[i];
+      if (ch === '"' || ch === "'" || ch === "`") {
+        i = skipStringLiteral(text, i);
+      } else if (ch === "(") {
+        depth += 1;
+      } else if (ch === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          return i;
+        }
+      }
+    }
+    return -1;
+  };
+  const saveCallRe = /\b(saveSettings|enqueueSettingsWrite)\s*\(/g;
+  const exemptedSaveCalls = new Set();
+  let saveCallMatch;
+  while ((saveCallMatch = saveCallRe.exec(popupScan)) !== null) {
+    const name = saveCallMatch[1];
+    const before = popupScan.slice(0, saveCallMatch.index);
+    if (/(?:^|[^\w$])(?:async\s+)?function\s*$/.test(before)) {
+      continue; // the function's own declaration
+    }
+    if (/(?:^|[^\w$.])(?:await|return)\s*$/.test(before)) {
+      continue; // awaited by this caller, or returned into its caller/chain
+    }
+    const openIndex = popupScan.indexOf("(", saveCallMatch.index);
+    const closeIndex = findMatchingParen(popupScan, openIndex);
+    if (closeIndex >= 0 && /^\s*\.catch\s*\(/.test(popupScan.slice(closeIndex + 1))) {
+      continue; // explicitly .catch-handled fire-and-forget
+    }
+    const key = `${name}@${before.split("\n").length}`;
+    if (SAVE_CALL_ALLOWLIST.has(key)) {
+      exemptedSaveCalls.add(key);
+      continue;
+    }
+    fail(`popup.js: ${key} is an un-awaited, un-caught ${name}() call — await it, return it, or attach .catch (or document it in SAVE_CALL_ALLOWLIST in scripts/ci-check.mjs)`);
+  }
+  for (const key of SAVE_CALL_ALLOWLIST.keys()) {
+    if (!exemptedSaveCalls.has(key)) {
+      fail(`scripts/ci-check.mjs: stale save-call allowlist entry "${key}" — the call site no longer exists in popup.js`);
+    }
   }
 }
 
