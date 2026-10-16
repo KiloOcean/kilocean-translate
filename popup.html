@@ -22,6 +22,17 @@
           <a id="get-key-link" href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">获取 Key</a>
         </div>
 
+        <div class="key-status" aria-live="polite">
+          <div class="key-status-row" id="key-status-deepseek">
+            <span class="key-status-label">DeepSeek</span>
+            <span class="key-status-value" id="key-status-deepseek-value">未配置</span>
+          </div>
+          <div class="key-status-row" id="key-status-kimi">
+            <span class="key-status-label">Kimi</span>
+            <span class="key-status-value" id="key-status-kimi-value">未配置</span>
+          </div>
+        </div>
+
         <label class="field">
           <span>服务商</span>
           <select id="provider">
@@ -37,6 +48,16 @@
             <button id="toggle-key" class="icon-button" type="button" aria-label="显示 API Key">显示</button>
           </span>
         </label>
+
+        <div id="key-guide" class="key-guide" hidden>
+          <p class="key-guide-title">翻译前需要先配置 API Key（二选一即可，Key 只保存在本机）：</p>
+          <div class="key-guide-links">
+            <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">DeepSeek · 创建 API Key</a>
+            <a href="https://platform.moonshot.cn/console/api-keys" target="_blank" rel="noreferrer">Kimi（Moonshot）· 创建 API Key</a>
+          </div>
+          <p class="key-guide-help">粘贴到上方输入框即可自动保存并验证。</p>
+          <p class="key-guide-help">如果你之前以「开发者模式 / 加载已解压」方式使用 1.4.2 及更早版本：1.4.3 起扩展 ID 已与商店统一，旧 ID 下的本机设置无法自动带过来，需要重新粘贴一次 Key，之后安装/更新都不再需要。商店安装的用户不受影响。</p>
+        </div>
 
         <div class="field-grid">
           <label class="field">
@@ -116,6 +137,23 @@
           <button id="print-pdf" class="utility-button" type="button" disabled>打印 / 保存 PDF</button>
         </div>
         <p>HTML 会保留当前译文和原页面样式；PDF 将打开 Chrome 打印窗口。</p>
+      </section>
+
+      <section class="panel settings-io-panel" aria-labelledby="settings-io-title">
+        <div class="section-heading">
+          <h2 id="settings-io-title">设置备份</h2>
+          <span class="hint">默认不含 API Key</span>
+        </div>
+        <label class="include-keys-toggle">
+          <input type="checkbox" id="export-include-keys">
+          <span>包含 API Key<span class="warn">（明文保存，勿分享）</span></span>
+        </label>
+        <div class="settings-io-actions">
+          <button id="export-settings" class="utility-button" type="button">导出设置</button>
+          <button id="import-settings" class="utility-button" type="button">导入设置</button>
+          <input id="import-file" type="file" accept="application/json,.json" hidden>
+        </div>
+        <p class="settings-io-help">导出为 JSON 文件（服务商、语言、模型、显示模式）。导入只覆盖文件中出现的字段；文件不含 Key 时保留本机已保存的 Key。</p>
       </section>
 
       <p class="privacy-note">API Key 仅保存在本机 Chrome 中。网页文本会发送至你选择的服务商（DeepSeek 或 Kimi）完成翻译。无登录、无会员墙。</p>

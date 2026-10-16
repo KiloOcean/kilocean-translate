@@ -1,0 +1,14 @@
+# Extend gitleaks defaults; one narrow exception only.
+[extend]
+useDefault = true
+
+# manifest.json `key` is the Chrome Web Store item's PUBLIC key (RSA
+# SubjectPublicKeyInfo), required to pin extension ID
+# lmdbhjngjhlgbpmbjfffegjalchblpke. It is not a secret (it ships in every CRX).
+# Scoped to manifest.json and the `"key": "MIIBIjAN...` line only.
+[[allowlists]]
+description = "Chrome Web Store public key in manifest.json"
+condition = "AND"
+paths = ['''^manifest\.json$''']
+regexTarget = "line"
+regexes = ['''^\s*"key":\s*"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA[A-Za-z0-9+/=]+",?\s*$''']

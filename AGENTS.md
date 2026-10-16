@@ -15,6 +15,11 @@ No package.json. Load unpacked extension from repo root in chrome://extensions.
 - Keep PRs small; one issue → one focused PR.
 - Preserve permissions: activeTab, scripting, storage; host only https://api.deepseek.com/*.
 - Watch selection race tokens and displayMode vs chrome.storage sync.
+- Route every popup.js storage write through the serialized write queue (`enqueueSettingsWrite` / `saveSettings`) — CI enforces exactly one `chrome.storage.local.set` call site.
+- Await the STABLE save (`await saveSettings()` resolves only after every follow-up write committed and no dirty edit remains; it rejects on write failure) in every popup action that needs persisted settings (translate, selection confirm, key test, import, export, display-mode send). CI statically rejects un-awaited, un-caught `saveSettings()`/`enqueueSettingsWrite()` calls — the only sanctioned fire-and-forget shape is `persistSettingsInBackground()` (`.catch`-handled: debounce ticks, change/blur persists, init's closing flush, the hide-time flush).
+- Make every popup user action that reads or writes settings await the single init-ready promise via the `whenReady(...)` listener wrapper — acting before `initialize()` finishes uses the DEFAULT_SETTINGS snapshot (Codex P1: pre-init Export shipped defaults with no keys). Handlers that bank edits pre-init keep the bank synchronous and gate only their save. CI statically enforces wrapped listeners plus a documented allowlist.
+- For any new gated popup action, add a held-initial-storage-read test: park the first `chrome.storage.local.get`, fire the action, assert nothing happened, release, assert it used the stored values (see `checkPopupActionInitGate` in scripts/ci-check.mjs).
+- Add concurrency tests (controlled fake storage whose `set()` resolves manually) for any new popup.js write path.
 - Fill the PR template; call out content-script / permission risk.
 - Prefer **ready-for-review** (not forever-draft) when CI should auto-merge.
 
@@ -22,6 +27,9 @@ No package.json. Load unpacked extension from repo root in chrome://extensions.
 
 - Commit API keys or expand host permissions without an explicit ask.
 - Drive-by rewrite of content.js / background.js.
+- Call `chrome.storage.local.set` (or `.remove`) directly in popup.js — bypassing the queue reintroduces the mid-write edit races.
+- Register a popup settings/button handler that touches settings without `whenReady(...)` (and without a documented allowlist entry + reason in scripts/ci-check.mjs) — pre-init clicks act on defaults, and the static gate fails CI.
+- Ship a new popup.js write path without a gated-storage concurrency test.
 - Skip `node scripts/ci-check.mjs`.
 - Urge merge on Build green alone.
 

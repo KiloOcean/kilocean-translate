@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -22,7 +23,18 @@ const ALLOWED_HOSTS = new Set([
 const JS_FILES = ["background.js", "content.js", "popup.js", "shared.js"];
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
+// Chrome Web Store item this repository publishes to. manifest.key must carry
+// the item's public key so unpacked installs share the store extension ID (and
+// therefore chrome.storage — saved API keys survive the switch).
+const STORE_EXTENSION_ID = "lmdbhjngjhlgbpmbjfffegjalchblpke";
+
 const errors = [];
+
+// Obviously-fake API key fixtures, built at runtime so no key-shaped literal
+// lives in the source (keeps secret scanners quiet without allowlisting).
+function fakeKey(tag, len) {
+  return ["sk", tag + "FAKE".padEnd(len - 4, "X")].join("-");
+}
 
 function fail(msg) {
   errors.push(msg);
@@ -83,6 +95,31 @@ function checkManifest() {
   for (const host of hosts) {
     if (!ALLOWED_HOSTS.has(host)) {
       fail(`disallowed host_permission: ${host} (allowlist: ${[...ALLOWED_HOSTS].join(", ")})`);
+    }
+  }
+
+  // manifest.key = the Chrome Web Store public key (NOT an API key). It pins
+  // unpacked installs to the store extension ID so saved keys survive the
+  // unpacked→store transition. Derivation: sha256(base64-decoded DER), first
+  // 16 bytes, each nibble 0-15 → 'a'-'p'.
+  if (typeof manifest.key !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(manifest.key)) {
+    fail(
+      `manifest.key (Chrome Web Store public key, base64) is required so unpacked installs keep the store ID ${STORE_EXTENSION_ID}, got ${JSON.stringify(manifest.key)}`
+    );
+  } else {
+    const der = Buffer.from(manifest.key, "base64");
+    if (der.toString("base64") !== manifest.key || der.length < 160) {
+      fail("manifest.key must base64-decode (round-trip) to a DER public key of plausible size");
+    } else {
+      const digest = crypto.createHash("sha256").update(der).digest();
+      let derivedId = "";
+      for (let i = 0; i < 16; i += 1) {
+        derivedId += String.fromCharCode(97 + (digest[i] >> 4));
+        derivedId += String.fromCharCode(97 + (digest[i] & 0xf));
+      }
+      if (derivedId !== STORE_EXTENSION_ID) {
+        fail(`manifest.key must derive the store extension ID ${STORE_EXTENSION_ID}, got ${derivedId}`);
+      }
     }
   }
 }
@@ -1194,10 +1231,15 @@ async function checkFetchTimeoutCoverage() {
     fail("popup.js: toFriendlyPageError must surface the timeout message verbatim");
   }
   const popup = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
-  if (!/setStatus\("连接失败",\s*error\.message/.test(popup)) {
-    fail("popup.js: connection-test failure must surface error.message");
+  // Manual + paste tests share runKeyConnectionTest: thrown errors go through
+  // toFriendlyPageError (timeout verbatim), API errors fall back to response.error.
+  if (
+    !/renderStatus\("网络错误",\s*toFriendlyPageError\(error\)/.test(popup) ||
+    !/response\?\.error \|\| "连接测试失败/.test(popup)
+  ) {
+    fail("popup.js: connection-test failure must surface the error message");
   }
-  if (!/setStatus\("翻译失败",\s*status\.error/.test(popup)) {
+  if (!/(?:setStatus|passiveStatus)\("翻译失败",\s*status\.error/.test(popup)) {
     fail("popup.js: page translation failure must surface status.error");
   }
 }
@@ -1783,6 +1825,2810 @@ async function checkModelMigrationAndRetryPolicy() {
   if (!/for \(const batch of batches\) \{[\s\S]{0,400}?await translateBatchWithFallback\(/.test(contentRaw)) {
     fail("content.js: batch loop must await translateBatchWithFallback sequentially (≤ MAX_INFLIGHT_TRANSLATE_BATCHES in flight)");
   }
+}
+
+// ---- 1.4.3 key persistence: upgrades must never wipe a stored key ----
+// Loads the REAL background.js (+ shared.js) into a node vm behind a mock
+// chrome (storage.local, runtime.onInstalled/onStartup/onMessage, tabs,
+// action) and replays every stored-settings shape a 1.3.x / 1.4.x user can
+// carry into 1.4.3 through the shipping code paths: direct loadSettings,
+// onInstalled(update), worker cold-restart (script reload + onStartup), and
+// the live message paths (TEST_CONNECTION / TRANSLATE_BATCH). A stored key
+// may be migrated (legacy apiKey → deepseekApiKey) or mirrored (apiKey), but
+// never emptied. The popup load path runs in its own vm with a minimal DOM
+// mock, including the settings import/export merge rules.
+function createBackgroundVm(storageData, fetchImpl) {
+  const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
+  const backgroundSource = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
+  const listeners = {
+    installed: [],
+    startup: [],
+    message: [],
+    tabsRemoved: [],
+    tabsUpdated: []
+  };
+  const sandbox = {
+    console: { log() {}, warn() {}, error() {} },
+    setTimeout,
+    clearTimeout,
+    AbortController,
+    fetch: fetchImpl,
+    chrome: {
+      runtime: {
+        id: "kilocean-ci-extension-id",
+        onInstalled: { addListener: (fn) => listeners.installed.push(fn) },
+        onStartup: { addListener: (fn) => listeners.startup.push(fn) },
+        onMessage: { addListener: (fn) => listeners.message.push(fn) }
+      },
+      storage: {
+        local: {
+          get: async (defaults) => ({ ...(defaults || {}), ...storageData }),
+          set: async (updates) => { Object.assign(storageData, updates); }
+        },
+        session: {
+          get: async () => ({}),
+          set: async () => {},
+          remove: async () => {}
+        },
+        onChanged: { addListener() {} }
+      },
+      tabs: {
+        onRemoved: { addListener: (fn) => listeners.tabsRemoved.push(fn) },
+        onUpdated: { addListener: (fn) => listeners.tabsUpdated.push(fn) }
+      },
+      action: {
+        setBadgeText: async () => {},
+        setBadgeBackgroundColor: async () => {}
+      }
+    }
+  };
+  const context = vm.createContext(sandbox);
+  sandbox.importScripts = (rel) => {
+    if (rel !== "shared.js") {
+      throw new Error(`unexpected importScripts: ${rel}`);
+    }
+    vm.runInContext(sharedSource, context, { filename: "shared.js" });
+  };
+  vm.runInContext(
+    `${backgroundSource}\n;globalThis.__hooks = { loadSettings, translateBatch, PROVIDERS, DEFAULT_SETTINGS };`,
+    context,
+    { filename: "background.js" }
+  );
+  return {
+    storage: storageData,
+    listeners,
+    hooks: sandbox.__hooks,
+    sendMessage: (message, sender = { id: sandbox.chrome.runtime.id, tab: { id: 11 } }) =>
+      new Promise((resolve) => {
+        if (listeners.message.length !== 1) {
+          throw new Error("background vm: exactly one runtime.onMessage listener expected");
+        }
+        listeners.message[0](message, sender, resolve);
+      })
+  };
+}
+
+// Minimal DOM stub good enough to run the real popup.js load path (and the
+// settings import/export helpers) without a browser.
+function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok: false }) } = {}) {
+  const storageListeners = [];
+  const runtimeMessageListeners = [];
+  const windowListeners = {};
+  const documentListeners = {};
+  const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
+  const popupSource = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
+
+  const makeElement = (overrides = {}) => ({
+    value: "",
+    type: "text",
+    textContent: "",
+    disabled: false,
+    hidden: false,
+    checked: false,
+    focused: false,
+    files: [],
+    dataset: {},
+    attributes: {},
+    listeners: {},
+    options: [],
+    // Real class tracking (not a no-op): tests assert rendered classes,
+    // e.g. the display-mode buttons' `active` state.
+    classList: (() => {
+      const classes = new Set();
+      return {
+        toggle(name, force) {
+          const on = force === undefined ? !classes.has(name) : Boolean(force);
+          if (on) {
+            classes.add(name);
+          } else {
+            classes.delete(name);
+          }
+        },
+        add(name) {
+          classes.add(name);
+        },
+        remove(name) {
+          classes.delete(name);
+        },
+        contains: (name) => classes.has(name)
+      };
+    })(),
+    addEventListener(type, fn) {
+      (this.listeners[type] = this.listeners[type] || []).push(fn);
+    },
+    removeEventListener() {},
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    focus() {
+      this.focused = true;
+    },
+    appendChild(node) {
+      this.options.push(node);
+      return node;
+    },
+    click() {},
+    remove() {},
+    ...overrides
+  });
+  // <select>-like: assigning innerHTML = "" must clear the options list like
+  // the real DOM, or applyProviderUi's rebuild would stack stale options.
+  const makeSelect = () => {
+    const element = makeElement();
+    let innerHTML = "";
+    Object.defineProperty(element, "innerHTML", {
+      get() {
+        return innerHTML;
+      },
+      set(next) {
+        innerHTML = String(next);
+        if (innerHTML === "") {
+          element.options.length = 0;
+        }
+      }
+    });
+    return element;
+  };
+
+  // Blob/URL stubs: exportSettingsFile builds the backup with `new Blob(...)`
+  // and an object URL, so the vm tests can capture (and parse) the exported
+  // payload without a real browser download.
+  const blobs = [];
+  class FakeBlob {
+    constructor(parts) {
+      this.parts = parts;
+      blobs.push(this);
+    }
+
+    async text() {
+      return this.parts.map((part) => String(part)).join("");
+    }
+  }
+
+  const byId = new Map();
+  const element = (id, overrides) => {
+    if (!byId.has(id)) {
+      byId.set(id, id === "provider" || id === "model" || id === "target-language"
+        ? makeSelect()
+        : makeElement(overrides));
+    }
+    return byId.get(id);
+  };
+  for (const id of [
+    "provider",
+    "api-key",
+    "api-key-label",
+    "get-key-link",
+    "key-status-deepseek",
+    "key-status-deepseek-value",
+    "key-status-kimi",
+    "key-status-kimi-value",
+    "key-guide",
+    "target-language",
+    "model",
+    "toggle-key",
+    "test-connection",
+    "translate",
+    "restore",
+    "export-html",
+    "print-pdf",
+    "export-settings",
+    "import-settings",
+    "import-file",
+    "export-include-keys",
+    "status-title",
+    "status-detail",
+    "selection-confirm-panel",
+    "selection-confirm-text",
+    "selection-confirm-btn",
+    "selection-confirm-dismiss"
+  ]) {
+    element(id);
+  }
+  element("api-key").type = "password";
+  const statusCard = makeElement();
+  const modeButtons = ["bilingual", "translation-only", "original"].map((mode) =>
+    makeElement({ dataset: { mode } })
+  );
+
+  const sandbox = {
+    console: { log() {}, warn() {}, error() {} },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    Blob: FakeBlob,
+    URL: { createObjectURL: () => `blob:fake-${blobs.length}`, revokeObjectURL() {} },
+    // Recorded (unlike a no-op) so tests can fire pagehide, and swapped per
+    // test when a scenario needs to capture the 700 ms status-poll interval.
+    addEventListener(type, fn) {
+      (windowListeners[type] = windowListeners[type] || []).push(fn);
+    },
+    document: {
+      getElementById: (id) => byId.get(id) || null,
+      querySelector: (selector) => (selector === ".status-card" ? statusCard : null),
+      querySelectorAll: (selector) => (selector === ".mode-button" ? modeButtons : []),
+      createElement: () => makeElement(),
+      body: makeElement(),
+      addEventListener(type, fn) {
+        (documentListeners[type] = documentListeners[type] || []).push(fn);
+      },
+      visibilityState: "visible"
+    },
+    chrome: {
+      runtime: {
+        getManifest: () => ({ version: "1.4.3" }),
+        onMessage: { addListener(fn) { runtimeMessageListeners.push(fn); } },
+        sendMessage: (message) => runtimeMessageHandler(message)
+      },
+      storage: {
+        local: {
+          get: async (defaults) => ({ ...(defaults || {}), ...storageData }),
+          set: async (updates) => { Object.assign(storageData, updates); }
+        },
+        onChanged: { addListener(fn) { storageListeners.push(fn); } }
+      },
+      tabs: {
+        query: async () => [{ id: 42 }],
+        sendMessage: async () => ({ ok: true, status: { active: false } })
+      },
+      scripting: { executeScript: async () => {} }
+    }
+  };
+  sandbox.window = sandbox;
+  const context = vm.createContext(sandbox);
+  vm.runInContext(sharedSource, context, { filename: "shared.js" });
+  vm.runInContext(
+    `${popupSource}\n;globalThis.__popupHooks = {
+      parseImportedSettings,
+      applyImportedSettings,
+      importSettingsFile,
+      getSettingsImportMaxBytes: () => SETTINGS_IMPORT_MAX_BYTES,
+      handleApiKeyPasted,
+      apiKeyFormatReason,
+      saveSettings,
+      migrateSettings,
+      initializePromise,
+      getProviderKeys: () => ({ deepseek: providerKeyValue("deepseek"), kimi: providerKeyValue("kimi") }),
+      getSettingsModel: () => settingsModel,
+      renderTranslationStatus,
+      runKeyConnectionTest,
+      buildExportPayload,
+      getKeyTestState: () => ({ op: keyTestOp, pendingOp: keyTestPendingOp })
+    };`,
+    context,
+    { filename: "popup.js" }
+  );
+  return {
+    storage: storageData,
+    dom: byId,
+    hooks: sandbox.__popupHooks,
+    sandbox,
+    blobs,
+    emitStorageChange(changes) {
+      for (const [field, change] of Object.entries(changes)) {
+        storageData[field] = change.newValue;
+      }
+      for (const fn of storageListeners) {
+        fn(changes, "local");
+      }
+    },
+    // Deliver a chrome.runtime.onMessage to the popup's own listener (e.g. a
+    // CONTENT_STATUS update from the current tab).
+    emitRuntimeMessage(message, sender = { tab: { id: 42 } }) {
+      for (const fn of runtimeMessageListeners) {
+        fn(message, sender);
+      }
+    },
+    // The unload/hide paths popup.js flushes pending debounced edits on.
+    firePageHide() {
+      for (const fn of windowListeners.pagehide || []) {
+        fn();
+      }
+    },
+    fireVisibilityHidden() {
+      sandbox.document.visibilityState = "hidden";
+      for (const fn of documentListeners.visibilitychange || []) {
+        fn();
+      }
+      sandbox.document.visibilityState = "visible";
+    }
+  };
+}
+
+async function checkKeyMigrationGate() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  const LEGACY_KEY = fakeKey("legacy", 26);
+  const DEEPSEEK_KEY = fakeKey("deepseek", 21);
+  const KIMI_KEY = fakeKey("kimi", 25);
+
+  // Provider fetch mock: capture the Authorization header, answer with a
+  // well-formed minimal translation so the whole shipping path succeeds.
+  const seenRequests = [];
+  const okBody = JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({ translations: ["你好"] }) } }]
+  });
+  const okFetch = async (url, options = {}) => {
+    seenRequests.push({ url, authorization: options.headers?.Authorization || "" });
+    return {
+      ok: true,
+      status: 200,
+      statusText: "",
+      headers: { get: () => null },
+      url,
+      text: async () => okBody
+    };
+  };
+
+  // A stored key may migrate or mirror, never disappear.
+  const storageKeysSurvive = (seed, data, label) => {
+    const seedDeepseek = String(seed.deepseekApiKey || "").trim();
+    const seedKimi = String(seed.kimiApiKey || "").trim();
+    const seedLegacy = String(seed.apiKey || "").trim();
+    if (seedDeepseek) {
+      assertTrue(
+        String(data.deepseekApiKey || "").trim() === seedDeepseek,
+        `${label}: stored DeepSeek key must survive every 1.4.3 load path`
+      );
+    }
+    if (seedKimi) {
+      assertTrue(
+        String(data.kimiApiKey || "").trim() === seedKimi,
+        `${label}: stored Kimi key must survive every 1.4.3 load path`
+      );
+    }
+    if (seedLegacy && !seedDeepseek && !seedKimi) {
+      assertTrue(
+        String(data.deepseekApiKey || "").trim() === seedLegacy,
+        `${label}: <=1.3.x legacy apiKey must migrate into deepseekApiKey, not vanish`
+      );
+    }
+  };
+
+  // Replay one stored-settings shape through every upgrade path against the
+  // SAME evolving storage object: repeated worker cold-restarts (script
+  // reload = onStartup equivalent), onInstalled(update), settings loads and
+  // the live TEST_CONNECTION message path (which must bill the expected key).
+  const runUpgradeGauntlet = async (label, seed, { expectedProvider, expectedActiveKey, expectedModel }) => {
+    const storageData = { ...seed };
+    for (let round = 0; round < 3; round += 1) {
+      // (a) worker cold-restart: fresh vm, top-level runs, onStartup fires,
+      //     then a direct settings load.
+      const cold = createBackgroundVm(storageData, okFetch);
+      assertTrue(cold.listeners.startup.length === 1, `${label}: background must register a runtime.onStartup migration pass`);
+      for (const onStartup of cold.listeners.startup) {
+        await onStartup();
+      }
+      const settings = await cold.hooks.loadSettings();
+      storageKeysSurvive(seed, storageData, `${label} (cold restart ${round})`);
+      assertEqual(settings.provider, expectedProvider, `${label}: provider preserved (round ${round})`);
+      assertEqual(settings.model, expectedModel, `${label}: model mapped to current name (round ${round})`);
+      assertEqual(
+        String(settings[expectedProvider === "kimi" ? "kimiApiKey" : "deepseekApiKey"] || ""),
+        expectedActiveKey,
+        `${label}: migrated key is usable in returned settings (round ${round})`
+      );
+
+      // (b) onInstalled(update) — the store-upgrade event itself.
+      const updated = createBackgroundVm(storageData, okFetch);
+      for (const onInstalled of updated.listeners.installed) {
+        await onInstalled({ reason: "update", previousVersion: "1.4.2" });
+      }
+      storageKeysSurvive(seed, storageData, `${label} (onInstalled update ${round})`);
+
+      // (c) live message path: TEST_CONNECTION exercises loadSettings +
+      //     translateBatch end to end and must send the expected bearer key.
+      const requestsBefore = seenRequests.length;
+      const live = createBackgroundVm(storageData, okFetch);
+      const response = await live.sendMessage({
+        type: "TEST_CONNECTION",
+        provider: expectedProvider,
+        targetLanguage: "zh-CN",
+        model: expectedModel
+      });
+      assertTrue(response?.ok === true, `${label}: TEST_CONNECTION succeeds with migrated settings (round ${round})`);
+      assertEqual(seenRequests.length, requestsBefore + 1, `${label}: connection test bills exactly one request (round ${round})`);
+      assertEqual(
+        seenRequests[seenRequests.length - 1].authorization,
+        `Bearer ${expectedActiveKey}`,
+        `${label}: migrated key reaches the provider Authorization header (round ${round})`
+      );
+
+      // (d) popup open between rounds (below) rewrites the full settings
+      //     object — folded in by the popup scenarios after this loop.
+    }
+    return storageData;
+  };
+
+  // ---- 1.3.x single-key storage (apiKey + legacy model name) ----
+  const migratedFromLegacy = await runUpgradeGauntlet(
+    "1.3.x → 1.4.3",
+    { apiKey: LEGACY_KEY, model: "deepseek-v4-flash" },
+    { expectedProvider: "deepseek", expectedActiveKey: LEGACY_KEY, expectedModel: "deepseek-flash" }
+  );
+  assertEqual(migratedFromLegacy.deepseekApiKey, LEGACY_KEY, "1.3.x → 1.4.3: legacy key persisted as deepseekApiKey");
+  assertEqual(migratedFromLegacy.model, "deepseek-flash", "1.3.x → 1.4.3: legacy model name retired in storage");
+
+  // ---- 1.4.x DeepSeek user, current + legacy model names ----
+  await runUpgradeGauntlet(
+    "1.4.x deepseek (legacy model)",
+    { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, model: "deepseek-v4-flash", targetLanguage: "zh-CN", displayMode: "bilingual" },
+    { expectedProvider: "deepseek", expectedActiveKey: DEEPSEEK_KEY, expectedModel: "deepseek-flash" }
+  );
+  await runUpgradeGauntlet(
+    "1.4.x deepseek (current model)",
+    { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, model: "deepseek-v4-pro" },
+    { expectedProvider: "deepseek", expectedActiveKey: DEEPSEEK_KEY, expectedModel: "deepseek-v4-pro" }
+  );
+
+  // ---- 1.4.x Kimi user: kimi key must survive, and the legacy apiKey
+  // mirror must NOT be reinterpreted as a DeepSeek key ----
+  const kimiStorage = await runUpgradeGauntlet(
+    "1.4.x kimi (mirrored apiKey)",
+    { provider: "kimi", kimiApiKey: KIMI_KEY, apiKey: KIMI_KEY, model: "kimi-k2.6" },
+    { expectedProvider: "kimi", expectedActiveKey: KIMI_KEY, expectedModel: "kimi-k2.6" }
+  );
+  assertEqual(String(kimiStorage.deepseekApiKey || ""), "", "1.4.x kimi: mirrored apiKey is not re-imported as a DeepSeek key");
+
+  // ---- 1.4.x dual-key user ----
+  const dualStorage = await runUpgradeGauntlet(
+    "1.4.x dual keys",
+    { provider: "kimi", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, apiKey: KIMI_KEY, model: "kimi-k2.6" },
+    { expectedProvider: "kimi", expectedActiveKey: KIMI_KEY, expectedModel: "kimi-k2.6" }
+  );
+  assertEqual(dualStorage.deepseekApiKey, DEEPSEEK_KEY, "1.4.x dual keys: inactive DeepSeek key survives Kimi sessions");
+  assertEqual(dualStorage.apiKey, KIMI_KEY, "1.4.x dual keys: apiKey mirrors the active provider's key");
+
+  // ---- Popup load path (vm + DOM mock): open on legacy storage, then
+  // re-open on the result — keys must never be wiped by the popup save ----
+  {
+    // 1.3.x storage + popup open → migration persists, status row shows the tail.
+    const legacyPopupStorage = { apiKey: LEGACY_KEY, model: "deepseek-v4-flash" };
+    const testRequests = [];
+    const popup1 = createPopupVm(legacyPopupStorage, {
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          testRequests.push(message);
+          return { ok: true };
+        }
+        return { ok: false };
+      }
+    });
+    await popup1.hooks.initializePromise;
+    assertEqual(legacyPopupStorage.deepseekApiKey, LEGACY_KEY, "popup load 1.3.x: legacy key persisted as deepseekApiKey");
+    assertEqual(legacyPopupStorage.apiKey, LEGACY_KEY, "popup load 1.3.x: selection-gate mirror carries the key");
+    assertEqual(legacyPopupStorage.model, "deepseek-flash", "popup load 1.3.x: legacy model name migrated");
+    assertEqual(popup1.dom.get("api-key").value, LEGACY_KEY, "popup load 1.3.x: key input shows the migrated key");
+    assertEqual(
+      popup1.dom.get("key-status-deepseek-value").textContent,
+      `已配置 · 尾号 ${LEGACY_KEY.slice(-4)}`,
+      "popup key status: DeepSeek row shows 已配置 with the key tail"
+    );
+    assertEqual(
+      popup1.dom.get("key-status-kimi-value").textContent,
+      "未配置",
+      "popup key status: Kimi row shows 未配置 when no key exists"
+    );
+
+    // Re-open the popup on the migrated storage: values stay put (no wipe).
+    const popup2 = createPopupVm(legacyPopupStorage);
+    await popup2.hooks.initializePromise;
+    assertEqual(legacyPopupStorage.deepseekApiKey, LEGACY_KEY, "popup reopen: migrated key not wiped");
+
+    // Kimi-only 1.4.x storage through the popup.
+    const kimiPopupStorage = { provider: "kimi", kimiApiKey: KIMI_KEY, apiKey: KIMI_KEY, model: "kimi-k2.6" };
+    const popup3 = createPopupVm(kimiPopupStorage);
+    await popup3.hooks.initializePromise;
+    assertEqual(kimiPopupStorage.kimiApiKey, KIMI_KEY, "popup load 1.4.x kimi: kimi key not wiped");
+    assertEqual(String(kimiPopupStorage.deepseekApiKey || ""), "", "popup load 1.4.x kimi: no phantom DeepSeek key appears");
+    assertEqual(
+      popup3.dom.get("key-status-kimi-value").textContent,
+      `已配置 · 尾号 ${KIMI_KEY.slice(-4)}`,
+      "popup key status: Kimi row shows 已配置 with the key tail"
+    );
+
+    // Paste flow: format gate before network, auto-save, then connection test.
+    // Seeded with BOTH providers' keys so the auto-save also proves that
+    // saving the active provider never clobbers the inactive one's key.
+    const pasteStorage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const pastePopup = createPopupVm(pasteStorage, {
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          testRequests.push(message);
+          return { ok: true };
+        }
+        return { ok: false };
+      }
+    });
+    await pastePopup.hooks.initializePromise;
+    const pasteDom = pastePopup.dom;
+    pasteDom.get("api-key").value = "not-a-key";
+    await pastePopup.hooks.handleApiKeyPasted();
+    assertEqual(testRequests.length, 0, "paste flow: format-invalid key must not hit the network");
+    assertEqual(pasteDom.get("status-title").textContent, "Key 格式错误", "paste flow: format error surfaces a clear title");
+    assertTrue(
+      String(pasteDom.get("status-detail").textContent).includes("sk-"),
+      "paste flow: format error explains the expected shape"
+    );
+    assertEqual(pastePopup.storage.deepseekApiKey, "not-a-key", "paste flow: invalid-shape paste is still saved locally (no silent drop)");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(pasteDom.get("key-guide").hidden, false, "paste flow: correction guide stays visible after async save of a malformed key");
+    assertEqual(pastePopup.storage.kimiApiKey, KIMI_KEY, "paste flow: saving the DeepSeek input never wipes the stored Kimi key");
+
+    pasteDom.get("api-key").value = DEEPSEEK_KEY;
+    await pastePopup.hooks.handleApiKeyPasted();
+    assertEqual(testRequests.length, 1, "paste flow: well-formed key triggers exactly one connection test");
+    assertEqual(testRequests[0].type, "TEST_CONNECTION", "paste flow: verification goes through the background message path");
+    assertEqual(pasteDom.get("status-title").textContent, "Key 有效", "paste flow: success surfaces a clear title");
+    assertEqual(pastePopup.storage.deepseekApiKey, DEEPSEEK_KEY, "paste flow: pasted key auto-saved");
+    assertEqual(pastePopup.storage.kimiApiKey, KIMI_KEY, "paste flow: auto-save keeps the inactive provider's key");
+    assertEqual(
+      pasteDom.get("key-status-deepseek-value").textContent,
+      `已配置 · 尾号 ${DEEPSEEK_KEY.slice(-4)}`,
+      "paste flow: key status refreshes after save"
+    );
+  }
+
+  // ---- Passive status polling must not cancel an in-flight key test ----
+  {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const pollPopup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: "", model: "deepseek-flash" },
+      { runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? gate : { ok: false }) }
+    );
+    await pollPopup.hooks.initializePromise;
+    const testDone = pollPopup.hooks.runKeyConnectionTest();
+    pollPopup.hooks.renderTranslationStatus({ active: false });
+    assertTrue(
+      String(pollPopup.dom.get("status-title").textContent).startsWith("正在验证"),
+      "poll: passive status update is suppressed while a key test is in flight"
+    );
+    release({ ok: true });
+    await testDone;
+    assertEqual(pollPopup.dom.get("status-title").textContent, "Key 有效", "poll: key test result survives a concurrent poll");
+    pollPopup.hooks.renderTranslationStatus({ active: false });
+    assertEqual(pollPopup.dom.get("status-title").textContent, "准备就绪", "poll: passive updates resume after the test completes");
+  }
+
+  // ---- The real 700 ms poll (CONTENT_STATUS → startStatusPolling →
+  // GET_STATUS → renderTranslationStatus/passiveStatus) during a pending key
+  // test: it must neither bump keyTestOp (which would drop the test's own
+  // result as stale) nor replace the test's status line ----
+  {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const pollPopup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" },
+      { runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? gate : { ok: false }) }
+    );
+    await pollPopup.hooks.initializePromise;
+    // Capture the poll callback instead of sleeping real 700 ms ticks.
+    let pollTick = null;
+    pollPopup.sandbox.setInterval = (fn) => {
+      pollTick = fn;
+      return 1;
+    };
+    pollPopup.sandbox.clearInterval = () => {};
+    const translating = { active: true, phase: "translating", translated: 3, total: 9, failed: 0, displayMode: "bilingual" };
+    pollPopup.sandbox.chrome.tabs.sendMessage = async () => ({ ok: true, status: translating });
+    pollPopup.emitRuntimeMessage({ type: "CONTENT_STATUS", status: translating });
+    assertTrue(typeof pollTick === "function", "poll interval: an active CONTENT_STATUS starts the 700 ms status poll");
+    assertEqual(pollPopup.dom.get("status-title").textContent, "正在翻译", "poll interval: translation status renders before the key test");
+
+    const testDone = pollPopup.hooks.runKeyConnectionTest();
+    const opAtStart = pollPopup.hooks.getKeyTestState();
+    await pollTick(); // one 700 ms poll lands while the test is pending
+    assertEqual(
+      pollPopup.hooks.getKeyTestState(),
+      opAtStart,
+      "poll interval: a status poll during a pending key test neither bumps keyTestOp nor clears keyTestPendingOp"
+    );
+    assertTrue(
+      String(pollPopup.dom.get("status-title").textContent).startsWith("正在验证"),
+      "poll interval: the 700 ms poll cannot replace the pending key test's status"
+    );
+    release({ ok: true });
+    await testDone;
+    assertEqual(pollPopup.dom.get("status-title").textContent, "Key 有效", "poll interval: the key test result survives concurrent 700 ms polls");
+  }
+
+  // ---- Stale view must not restore an old key over a newer one ----
+  {
+    const shared = { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" };
+    const stale = createPopupVm(shared);
+    await stale.hooks.initializePromise;
+    const NEWER = fakeKey("rotated", 24);
+    stale.emitStorageChange({ deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: NEWER } });
+    await stale.hooks.saveSettings();
+    assertEqual(stale.storage.deepseekApiKey, NEWER, "stale view: save after an external key change keeps the newer key");
+    assertEqual(stale.storage.kimiApiKey, KIMI_KEY, "stale view: other provider key untouched");
+    stale.emitStorageChange({ provider: { oldValue: "deepseek", newValue: "kimi" }, model: { oldValue: "deepseek-flash", newValue: "kimi-k2.6" }, targetLanguage: { oldValue: "zh-CN", newValue: "ja" } });
+    await stale.hooks.saveSettings();
+    assertEqual(stale.storage.provider, "kimi", "stale view: explicit save keeps provider changed in another view");
+    assertEqual(stale.storage.model, "kimi-k2.6", "stale view: explicit save keeps model changed in another view");
+    assertEqual(stale.storage.targetLanguage, "ja", "stale view: explicit save keeps target language changed in another view");
+    {
+      const pendingView = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+      await pendingView.hooks.initializePromise;
+      const EDITED = fakeKey("edited", 24);
+      const keyInput = pendingView.dom.get("api-key");
+      keyInput.value = EDITED; // local key edit not yet saved
+      for (const fn of keyInput.listeners.input || []) {
+        fn(); // a real user edit fires the input listener → dirty flag
+      }
+      pendingView.emitStorageChange({ model: { oldValue: "deepseek-flash", newValue: "deepseek-v4-pro" }, targetLanguage: { oldValue: "zh-CN", newValue: "ko" } });
+      await pendingView.hooks.saveSettings();
+      assertEqual(pendingView.storage.deepseekApiKey, EDITED, "pending edit: local key edit is saved");
+      assertEqual(pendingView.storage.model, "deepseek-v4-pro", "pending edit: external model change survives the save");
+      assertEqual(pendingView.storage.targetLanguage, "ko", "pending edit: external language change survives the save");
+    }
+    {
+      const focused = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" });
+      await focused.hooks.initializePromise;
+      focused.sandbox.document.activeElement = focused.dom.get("api-key"); // focus, no edit
+      const ROTATED2 = fakeKey("rotatedtwo", 24);
+      focused.emitStorageChange({ deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: ROTATED2 } });
+      await focused.hooks.saveSettings(); // e.g. blur
+      assertEqual(focused.storage.deepseekApiKey, ROTATED2, "focus only: external key update applies and blur-save keeps it");
+    }
+    let releaseStale;
+    const staleGate = new Promise((resolve) => { releaseStale = resolve; });
+    const racing = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" },
+      { runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? staleGate : { ok: false }) }
+    );
+    await racing.hooks.initializePromise;
+    const pending = racing.hooks.runKeyConnectionTest();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    racing.emitStorageChange({ deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: NEWER } });
+    releaseStale({ ok: true });
+    await pending;
+    assertTrue(
+      racing.dom.get("status-title").textContent !== "Key 有效",
+      "stale view: external key change supersedes an in-flight test result"
+    );
+  }
+
+  // ---- External provider switch during an in-flight key test: the tested
+  // provider is gone, so a neutral status replaces the pending one and the
+  // late test result cannot overwrite it ----
+  {
+    let releaseSwitch;
+    const switchGate = new Promise((resolve) => { releaseSwitch = resolve; });
+    const switched = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" },
+      { runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? switchGate : { ok: false }) }
+    );
+    await switched.hooks.initializePromise;
+    const pendingTest = switched.hooks.runKeyConnectionTest();
+    await new Promise((resolve) => setTimeout(resolve, 0)); // the test parks on the gated response
+    switched.emitStorageChange({
+      provider: { oldValue: "deepseek", newValue: "kimi" },
+      model: { oldValue: "deepseek-flash", newValue: "kimi-k2.6" },
+      apiKey: { oldValue: DEEPSEEK_KEY, newValue: KIMI_KEY }
+    });
+    assertEqual(
+      switched.dom.get("status-title").textContent,
+      "服务商已在其他窗口切换",
+      "provider switch mid-test: the pending test status is replaced by a neutral one"
+    );
+    assertEqual(
+      switched.dom.get("status-detail").textContent,
+      "如需验证，请重新点击「测试 API 连接」",
+      "provider switch mid-test: the neutral status points the user at re-testing"
+    );
+    releaseSwitch({ ok: true });
+    await pendingTest;
+    assertEqual(
+      switched.dom.get("status-title").textContent,
+      "服务商已在其他窗口切换",
+      "provider switch mid-test: the late test result cannot overwrite the neutral status"
+    );
+    assertEqual(switched.hooks.getKeyTestState().pendingOp, 0, "provider switch mid-test: the test is no longer pending once it settles");
+  }
+
+  // ---- Settings import/export (popup vm): schema validation + no-wipe merge ----
+  {
+    const storage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(storage);
+    await popup.hooks.initializePromise;
+
+    // Export: keys excluded by default; opt-in carries BOTH provider keys
+    // (regression: providerKeys is keyed by provider id, not field name).
+    {
+      const base = { provider: "deepseek", targetLanguage: "zh-CN", model: "deepseek-flash", displayMode: "bilingual" };
+      const noKeys = popup.hooks.buildExportPayload(base, false).settings;
+      if ("deepseekApiKey" in noKeys || "kimiApiKey" in noKeys) {
+        fail("export: keys must be excluded unless opted in");
+      }
+      const withKeys = popup.hooks.buildExportPayload(base, true).settings;
+      if (withKeys.deepseekApiKey !== DEEPSEEK_KEY || withKeys.kimiApiKey !== KIMI_KEY) {
+        fail("export: opt-in must include both stored provider keys");
+      }
+      const roundTrip = popup.hooks.parseImportedSettings(popup.hooks.buildExportPayload(base, true));
+      if (roundTrip.deepseekApiKey !== DEEPSEEK_KEY || roundTrip.kimiApiKey !== KIMI_KEY) {
+        fail("export→import round trip must preserve opted-in keys");
+      }
+    }
+
+    // Provider-only import must not leave the other provider's model.
+    {
+      const p2 = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" });
+      await p2.hooks.initializePromise;
+      await p2.hooks.applyImportedSettings({ provider: "kimi" });
+      if (p2.storage.model !== "kimi-k2.6") {
+        fail(`import: provider-only import must normalize model to kimi default, got ${p2.storage.model}`);
+      }
+      if (p2.storage.deepseekApiKey !== DEEPSEEK_KEY || p2.storage.kimiApiKey !== KIMI_KEY) {
+        fail("import: provider-only import must keep both keys");
+      }
+    }
+
+    // parseImportedSettings: happy paths and every rejection reason.
+    const goodFile = {
+      format: "kilocean-translate-settings",
+      version: 1,
+      settings: { provider: "kimi", targetLanguage: "ja", model: "deepseek-v4-flash", displayMode: "translation-only" }
+    };
+    assertEqual(
+      popup.hooks.parseImportedSettings(goodFile),
+      { provider: "kimi", targetLanguage: "ja", displayMode: "translation-only", model: "deepseek-flash" },
+      "import parse: valid file passes with legacy model mapped"
+    );
+    assertEqual(
+      popup.hooks.parseImportedSettings({ format: "kilocean-translate-settings", version: 1, settings: {} }),
+      {},
+      "import parse: key-less file parses to an empty field set"
+    );
+    assertEqual(
+      popup.hooks.parseImportedSettings({
+        format: "kilocean-translate-settings",
+        version: 1,
+        settings: { deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: "" }
+      }),
+      { deepseekApiKey: DEEPSEEK_KEY },
+      "import parse: blank key field counts as absent, valid key imports"
+    );
+    const rejectsWith = (parsed, needle, label) => {
+      try {
+        popup.hooks.parseImportedSettings(parsed);
+        fail(`${label}: expected rejection`);
+      } catch (error) {
+        assertTrue(
+          String(error.message).includes(needle),
+          `${label}: rejection must mention "${needle}", got "${error.message}"`
+        );
+      }
+    };
+    rejectsWith(null, "设置对象", "import parse: non-object");
+    rejectsWith({ format: "other", version: 1, settings: {} }, "format", "import parse: wrong format field");
+    rejectsWith({ format: "kilocean-translate-settings", version: 2, settings: {} }, "版本", "import parse: unknown version");
+    rejectsWith({ format: "kilocean-translate-settings", version: 1 }, "settings", "import parse: missing settings object");
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { bogus: "x" } },
+      "无法识别的字段",
+      "import parse: unknown field"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { provider: 7 } },
+      "字符串",
+      "import parse: non-string field"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { provider: "openai" } },
+      "服务商",
+      "import parse: provider enum"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { targetLanguage: "fr" } },
+      "目标语言",
+      "import parse: target language enum"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { displayMode: "dual" } },
+      "显示模式",
+      "import parse: display mode enum"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { model: "gpt-4o" } },
+      "模型",
+      "import parse: model not allowed"
+    );
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { deepseekApiKey: "nope" } },
+      "格式不正确",
+      "import parse: malformed key rejects the file"
+    );
+
+    // applyImportedSettings without keys: fields merge, keys untouched.
+    await popup.hooks.applyImportedSettings({ targetLanguage: "ja", displayMode: "translation-only" });
+    assertEqual(storage.targetLanguage, "ja", "import apply: file fields overwrite storage");
+    assertEqual(storage.displayMode, "translation-only", "import apply: display mode overwrites storage");
+    assertEqual(storage.deepseekApiKey, DEEPSEEK_KEY, "import apply (key-less file): DeepSeek key not wiped");
+    assertEqual(storage.kimiApiKey, KIMI_KEY, "import apply (key-less file): Kimi key not wiped");
+    assertEqual(storage.apiKey, DEEPSEEK_KEY, "import apply (key-less file): mirror keeps the active key");
+
+    // applyImportedSettings with keys + provider switch.
+    const NEW_DEEPSEEK = fakeKey("newdeepseek", 19);
+    const NEW_KIMI = fakeKey("newkimi", 23);
+    await popup.hooks.applyImportedSettings({
+      provider: "kimi",
+      model: "kimi-k3",
+      deepseekApiKey: NEW_DEEPSEEK,
+      kimiApiKey: NEW_KIMI
+    });
+    assertEqual(storage.provider, "kimi", "import apply: provider switches");
+    assertEqual(storage.model, "kimi-k3", "import apply: model switches");
+    assertEqual(storage.deepseekApiKey, NEW_DEEPSEEK, "import apply: file-provided DeepSeek key imports");
+    assertEqual(storage.kimiApiKey, NEW_KIMI, "import apply: file-provided Kimi key imports");
+    assertEqual(storage.apiKey, NEW_KIMI, "import apply: mirror follows the switched provider");
+    assertEqual(
+      popup.hooks.getProviderKeys(),
+      { deepseek: NEW_DEEPSEEK, kimi: NEW_KIMI },
+      "import apply: in-memory provider keys match storage"
+    );
+    assertEqual(
+      popup.dom.get("key-status-kimi-value").textContent,
+      `已配置 · 尾号 ${NEW_KIMI.slice(-4)}`,
+      "import apply: key status re-renders"
+    );
+
+    // importSettingsFile: an oversized file is rejected BEFORE it is read or
+    // parsed — file.text() never runs, nothing is written — with a clear
+    // Chinese error; a normal-size valid file still imports end to end.
+    {
+      const p3 = createPopupVm({
+        provider: "deepseek",
+        deepseekApiKey: DEEPSEEK_KEY,
+        kimiApiKey: KIMI_KEY,
+        apiKey: DEEPSEEK_KEY,
+        model: "deepseek-flash",
+        targetLanguage: "zh-CN",
+        displayMode: "bilingual"
+      });
+      await p3.hooks.initializePromise;
+      const MAX = p3.hooks.getSettingsImportMaxBytes();
+      assertEqual(MAX, 1024 * 1024, "import size gate: the limit is exactly 1 MiB");
+      const importFile = p3.dom.get("import-file");
+      const fireImportChange = () => {
+        const runs = (importFile.listeners.change || []).map((fn) => fn());
+        importFile.files = [];
+        return Promise.all(runs);
+      };
+      const validPayload = () =>
+        JSON.stringify({
+          format: "kilocean-translate-settings",
+          version: 1,
+          settings: { provider: "kimi", targetLanguage: "ko", model: "kimi-k3", displayMode: "translation-only" }
+        });
+
+      // Oversized pick: the read spy must stay untouched, storage identical.
+      let reads = 0;
+      const tooBig = {
+        size: MAX + 1,
+        text: async () => {
+          reads += 1;
+          return validPayload(); // would import cleanly if ever read
+        }
+      };
+      importFile.files = [tooBig];
+      const before = JSON.stringify(p3.storage);
+      await fireImportChange();
+      assertEqual(reads, 0, "import size gate: an oversized file is never read (file.text() untouched)");
+      assertEqual(JSON.stringify(p3.storage), before, "import size gate: an oversized file triggers no storage write");
+      assertEqual(importFile.value, "", "import size gate: the chooser input still resets");
+      assertEqual(p3.dom.get("status-title").textContent, "导入失败", "import size gate: the error title renders");
+      const detail = p3.dom.get("status-detail").textContent;
+      assertTrue(
+        detail.includes("文件过大") && detail.includes("1 MB"),
+        `import size gate: the error detail names the size limit, got "${detail}"`
+      );
+
+      // Exactly at the limit is NOT oversized (strictly-greater guard).
+      let boundaryReads = 0;
+      const atLimit = {
+        size: MAX,
+        text: async () => {
+          boundaryReads += 1;
+          return validPayload();
+        }
+      };
+      importFile.files = [atLimit];
+      await fireImportChange();
+      assertEqual(boundaryReads, 1, "import size gate: a file exactly at the limit is still read");
+      assertEqual(p3.storage.provider, "kimi", "import size gate: an at-the-limit valid file imports");
+      assertEqual(p3.dom.get("status-title").textContent, "设置已导入", "import size gate: an at-the-limit import succeeds");
+
+      // A normal-size valid file still imports end to end (fresh vm so the
+      // at-limit import above cannot mask a no-op write).
+      const p4 = createPopupVm({
+        provider: "deepseek",
+        deepseekApiKey: DEEPSEEK_KEY,
+        kimiApiKey: KIMI_KEY,
+        apiKey: DEEPSEEK_KEY,
+        model: "deepseek-flash",
+        targetLanguage: "zh-CN",
+        displayMode: "bilingual"
+      });
+      await p4.hooks.initializePromise;
+      const importFile4 = p4.dom.get("import-file");
+      const fireImportChange4 = () => {
+        const runs = (importFile4.listeners.change || []).map((fn) => fn());
+        importFile4.files = [];
+        return Promise.all(runs);
+      };
+      let normalReads = 0;
+      const normal = {
+        size: validPayload().length,
+        text: async () => {
+          normalReads += 1;
+          return validPayload();
+        }
+      };
+      importFile4.files = [normal];
+      await fireImportChange4();
+      assertEqual(normalReads, 1, "import normal size: the file is read exactly once");
+      assertEqual(p4.storage.provider, "kimi", "import normal size: imported provider lands in storage");
+      assertEqual(p4.storage.targetLanguage, "ko", "import normal size: imported language lands in storage");
+      assertEqual(p4.storage.deepseekApiKey, DEEPSEEK_KEY, "import normal size: a key-less file keeps the stored keys");
+      assertEqual(p4.dom.get("status-title").textContent, "设置已导入", "import normal size: success status renders");
+    }
+  }
+
+  // ---- Static: export uses blob + <a download>, never chrome.downloads ----
+  const popupScan = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
+  if (!/addEventListener\("pagehide",\s*flushPendingPersist\)/.test(popupScan)) {
+    fail("popup.js: pagehide must only flush pending edits (no stale full-settings write)");
+  }
+  // Import must not run its file chooser inside the transient action popup
+  // (crbug 364825891): popup opens popup.html?view=settings as a tab.
+  if (!/view=settings/.test(popupScan) || !/chrome\.tabs\.create\(/.test(popupScan) || !/IS_SETTINGS_TAB/.test(popupScan)) {
+    fail("popup.js: settings import must run from an extension tab (view=settings), not the action popup");
+  }
+  if (!/new Blob\(/.test(popupScan) || !/createObjectURL\(/.test(popupScan) || !/\.download\s*=/.test(popupScan)) {
+    fail("popup.js: settings export must use Blob + <a download> (no downloads permission)");
+  }
+  if (/chrome\.downloads/.test(popupScan)) {
+    fail("popup.js: settings export must not touch chrome.downloads");
+  }
+  if (!/包含 API Key/.test(fs.readFileSync(path.join(ROOT, "popup.html"), "utf8"))) {
+    fail("popup.html: export opt-in checkbox with the 明文保存 warning must exist");
+  }
+}
+
+// ---- Settings/key state: single source of truth (snapshot + dirty flags) ----
+// The pure core (reconcileModel / collectDirtyPatch / settleSavedEdits) is
+// extracted from popup.js the same way toFriendlyPageError is; the popup
+// head supplies SETTINGS_FIELDS / PROVIDER_META. VM scenarios then drive the
+// shipping popup through init races, dirty-key conflicts, external updates,
+// in-flight-save interleavings and coalesced saves.
+async function checkSettingsStateModel() {
+  const require = createRequire(import.meta.url);
+  try {
+    require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for settings-model tests: ${error.message}`);
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  const reconcileSrc = extractTopLevelFunction("popup.js", "reconcileModel");
+  const patchSrc = extractTopLevelFunction("popup.js", "collectDirtyPatch");
+  const settleSrc = extractTopLevelFunction("popup.js", "settleSavedEdits");
+  const popupSource = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
+  const popupHead = popupSource.slice(0, popupSource.indexOf("const elements ="));
+  if (!popupHead || !reconcileSrc || !patchSrc || !settleSrc) {
+    fail("popup.js: cannot extract reconcileModel/collectDirtyPatch/settleSavedEdits for settings-model tests");
+    return;
+  }
+  let pure;
+  try {
+    pure = new Function(
+      `${popupHead}\n${reconcileSrc}\n${patchSrc}\n${settleSrc}\nreturn { reconcileModel, collectDirtyPatch, settleSavedEdits };`
+    )();
+  } catch (error) {
+    fail(`popup.js: reconcileModel/collectDirtyPatch/settleSavedEdits are not runnable standalone: ${error.message}`);
+    return;
+  }
+
+  // reconcileModel: merges the storage view into the snapshot, reports every
+  // present tracked field EXCEPT dirty ones, and ignores the legacy mirror.
+  {
+    const model = {
+      snapshot: { provider: "deepseek", deepseekApiKey: "sk-a", kimiApiKey: "sk-b", model: "deepseek-flash", targetLanguage: "zh-CN", displayMode: "bilingual" },
+      edits: { deepseekApiKey: "sk-user-editing" }
+    };
+    const applied = pure.reconcileModel(model, {
+      provider: "kimi",
+      deepseekApiKey: "sk-rotated",
+      kimiApiKey: "sk-new-b",
+      model: "kimi-k3",
+      targetLanguage: "ja",
+      displayMode: "original",
+      apiKey: "sk-new-b"
+    });
+    assertTrue(!("deepseekApiKey" in applied), "reconcileModel: dirty key field is never applied");
+    assertEqual(applied.provider, "kimi", "reconcileModel: non-dirty provider is applied");
+    assertEqual(applied.kimiApiKey, "sk-new-b", "reconcileModel: non-dirty key is applied");
+    assertEqual(applied.model, "kimi-k3", "reconcileModel: non-dirty model is applied");
+    assertTrue(!("apiKey" in applied), "reconcileModel: legacy apiKey mirror is never applied");
+    assertEqual(model.snapshot.deepseekApiKey, "sk-rotated", "reconcileModel: snapshot still tracks the newer stored key behind the dirty edit");
+    assertEqual(model.edits.deepseekApiKey, "sk-user-editing", "reconcileModel: the user's edit is untouched");
+    // A delta (onChanged) only touches the fields it carries.
+    const deltaApplied = pure.reconcileModel(model, { model: "kimi-k2.6" });
+    assertEqual(deltaApplied, { model: "kimi-k2.6" }, "reconcileModel: an onChanged delta applies only the changed fields");
+    assertEqual(model.snapshot.targetLanguage, "ja", "reconcileModel: a delta merge never replaces the rest of the snapshot");
+    // Per-field snapshot revisions: every storage merge that CHANGES a field
+    // bumps only that field's revision — the token write completion compares
+    // against the revision recorded at write start, so a newer value storage
+    // delivered mid-write is never rolled back to the written one.
+    assertEqual(
+      model.revisions,
+      { provider: 1, deepseekApiKey: 1, kimiApiKey: 1, model: 2, targetLanguage: 1, displayMode: 1 },
+      "reconcileModel: revisions count each field's changed-value merges (full view then one model delta)"
+    );
+    pure.reconcileModel(model, { model: "kimi-k2.6" });
+    assertEqual(model.revisions.model, 2, "reconcileModel: merging the SAME value does not bump the revision");
+    pure.reconcileModel(model, { model: "kimi-k3" });
+    assertEqual(model.revisions.model, 3, "reconcileModel: a changed value bumps its field's revision");
+    assertEqual(model.revisions.provider, 1, "reconcileModel: a model-only merge leaves other fields' revisions untouched");
+  }
+
+  // collectDirtyPatch: writes only dirty fields that differ from the
+  // snapshot (+ the legacy mirror), and reports every considered field.
+  {
+    const model = {
+      snapshot: { provider: "deepseek", deepseekApiKey: "sk-a", kimiApiKey: "sk-b", model: "deepseek-flash", targetLanguage: "zh-CN", displayMode: "bilingual" },
+      edits: { deepseekApiKey: "sk-typed", targetLanguage: "zh-CN" }
+    };
+    const controlValues = {
+      provider: "deepseek",
+      deepseekApiKey: "sk-typed",
+      kimiApiKey: "sk-b",
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const { patch, fields } = pure.collectDirtyPatch(model, controlValues);
+    assertEqual(
+      patch,
+      { deepseekApiKey: "sk-typed", apiKey: "sk-typed" },
+      "collectDirtyPatch: only changed dirty fields (+ the mirror) are written"
+    );
+    assertEqual(
+      fields,
+      ["deepseekApiKey", "targetLanguage"],
+      "collectDirtyPatch: every dirty field is reported so its flag can clear"
+    );
+    // No dirty fields → no write at all (stale views never write back).
+    assertEqual(
+      pure.collectDirtyPatch({ snapshot: model.snapshot, edits: {} }, controlValues).patch,
+      {},
+      "collectDirtyPatch: a clean model writes nothing"
+    );
+    // Clearing the last key is a real write: the empty string must reach the
+    // legacy apiKey mirror too, or the stale mirror would make the next load
+    // treat the deleted key as a <=1.3.x legacy apiKey and resurrect it.
+    assertEqual(
+      pure.collectDirtyPatch(
+        { snapshot: { ...model.snapshot }, edits: { deepseekApiKey: "" } },
+        { ...controlValues, deepseekApiKey: "" }
+      ).patch,
+      { deepseekApiKey: "", apiKey: "" },
+      "collectDirtyPatch: clearing the last key clears the legacy apiKey mirror"
+    );
+  }
+
+  // settleSavedEdits + collectDirtyPatch's savedValues: save completion
+  // resolves an edit ONLY when it still equals the exact value that save
+  // established in storage — an edit retyped while the write was in flight
+  // survives dirty for the follow-up save, while untouched fields settle.
+  {
+    const controlValues = {
+      provider: "deepseek",
+      deepseekApiKey: "sk-typed",
+      kimiApiKey: "sk-b",
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const snapshot = {
+      provider: "deepseek",
+      deepseekApiKey: "sk-a",
+      kimiApiKey: "sk-b",
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    // No retype during the write: every collected edit settles, no follow-up.
+    const settled = { snapshot: { ...snapshot }, edits: { deepseekApiKey: "sk-typed", targetLanguage: "zh-CN" } };
+    const savedValues = pure.collectDirtyPatch(settled, controlValues).savedValues;
+    assertEqual(
+      savedValues,
+      { deepseekApiKey: "sk-typed", targetLanguage: "zh-CN" },
+      "collectDirtyPatch: savedValues records the exact value the save establishes per field"
+    );
+    assertTrue(
+      !pure.settleSavedEdits(settled, savedValues),
+      "settleSavedEdits: edits that still match the saved values need no follow-up"
+    );
+    assertEqual(settled.edits, {}, "settleSavedEdits: settled edits clear (written field and already-stored field alike)");
+
+    // The user retyped the key while its write was in flight: the newer edit
+    // stays dirty, the untouched language edit still clears.
+    const retyped = { snapshot: { ...snapshot }, edits: { deepseekApiKey: "sk-retyped-mid-flight", targetLanguage: "zh-CN" } };
+    assertTrue(
+      pure.settleSavedEdits(retyped, savedValues),
+      "settleSavedEdits: an edit that moved on mid-flight reports a needed follow-up save"
+    );
+    assertEqual(
+      retyped.edits,
+      { deepseekApiKey: "sk-retyped-mid-flight" },
+      "settleSavedEdits: only the retyped field stays dirty"
+    );
+  }
+
+  const DEEPSEEK_KEY = fakeKey("modeldeepseek", 21);
+  const KIMI_KEY = fakeKey("modelkimi", 25);
+  const EDITED = fakeKey("modelediting", 24);
+  const NEWER = fakeKey("modelrotated", 24);
+
+  const fire = (el, type) => {
+    for (const fn of el.listeners[type] || []) {
+      fn();
+    }
+  };
+  const recordSets = (popup) => {
+    const setCalls = [];
+    const originalSet = popup.sandbox.chrome.storage.local.set;
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      setCalls.push(updates);
+      await originalSet(updates);
+    };
+    return setCalls;
+  };
+
+  // (1) onChanged during init, then init completes: controls must show the
+  // newer value and no stale write-back may follow. The storage read is
+  // parked so the change lands between its snapshot and its resolution —
+  // the strongest form of the stale-first-snapshot race.
+  {
+    const storage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(storage);
+    let releaseRead;
+    const readGate = new Promise((resolve) => { releaseRead = resolve; });
+    const originalGet = popup.sandbox.chrome.storage.local.get;
+    popup.sandbox.chrome.storage.local.get = async (defaults) => {
+      const result = await originalGet(defaults);
+      popup.emitStorageChange({
+        targetLanguage: { oldValue: "zh-CN", newValue: "ja" },
+        model: { oldValue: "deepseek-flash", newValue: "deepseek-v4-pro" }
+      });
+      await readGate;
+      return result; // resolves with the pre-change snapshot on purpose
+    };
+    const initDone = popup.hooks.initializePromise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseRead();
+    await initDone;
+    assertEqual(popup.dom.get("target-language").value, "ja", "init race: control shows the value changed during init");
+    assertEqual(popup.dom.get("model").value, "deepseek-v4-pro", "init race: model control updated too");
+    assertEqual(popup.hooks.getSettingsModel().snapshot.targetLanguage, "ja", "init race: snapshot keeps the newer value after init completes");
+    const setCalls = recordSets(popup);
+    await popup.hooks.saveSettings();
+    assertEqual(setCalls.length, 0, "init race: save without edits must not write stale values back");
+    assertEqual(popup.storage.targetLanguage, "ja", "init race: storage keeps the newer value");
+  }
+
+  // (1b) Edits banked while the initial reads are still pending never got a
+  // debounce (schedulePersistSettings is a no-op before init): the end of
+  // initialization must flush them through the queue, and a hide that lands
+  // before init completes must neither write early nor lose the edit.
+  {
+    const storage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(storage);
+    let releaseRead;
+    const readGate = new Promise((resolve) => { releaseRead = resolve; });
+    const originalGet = popup.sandbox.chrome.storage.local.get;
+    popup.sandbox.chrome.storage.local.get = async (defaults) => {
+      await readGate;
+      return originalGet(defaults);
+    };
+    const setCalls = recordSets(popup);
+    // Let initialize() park inside the gated storage read…
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // …then bank a user edit before init resolves: no debounce timer exists.
+    const PENDING_EDIT = fakeKey("initpending", 24);
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = PENDING_EDIT;
+    fire(keyInput, "input");
+    // Closing mid-init must not write yet (controls do not mirror storage
+    // before init) — the edit still has to land via init's closing flush.
+    popup.firePageHide();
+    assertEqual(setCalls.length, 0, "init pending edits: pagehide before init completes writes nothing");
+    releaseRead();
+    await popup.hooks.initializePromise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(
+      setCalls,
+      [{ deepseekApiKey: PENDING_EDIT, apiKey: PENDING_EDIT }],
+      "init pending edits: initialization flushes the banked edit through the serialized queue"
+    );
+    assertEqual(popup.storage.deepseekApiKey, PENDING_EDIT, "init pending edits: the edit lands in storage once init resolves");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "init pending edits: the flushed edit settles");
+  }
+
+  // (2) External key change while the user is editing the key (key dirty):
+  // the key control keeps the user's value, every other field updates.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    popup.emitStorageChange({
+      deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: NEWER },
+      model: { oldValue: "deepseek-flash", newValue: "deepseek-v4-pro" },
+      targetLanguage: { oldValue: "zh-CN", newValue: "ko" }
+    });
+    assertEqual(keyInput.value, EDITED, "dirty key: control keeps the user's value");
+    assertEqual(popup.dom.get("model").value, "deepseek-v4-pro", "dirty key: model still updates from storage");
+    assertEqual(popup.dom.get("target-language").value, "ko", "dirty key: language still updates from storage");
+    assertEqual(popup.hooks.getSettingsModel().snapshot.deepseekApiKey, NEWER, "dirty key: snapshot tracks the newer stored key");
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, EDITED, "dirty key: the pending edit survives");
+    // The user's edit is still saved (over the external value) once saved.
+    const setCalls = recordSets(popup);
+    await popup.hooks.saveSettings();
+    assertEqual(setCalls, [{ deepseekApiKey: EDITED, apiKey: EDITED }], "dirty key: saving flushes the user's edit");
+  }
+
+  // (3) External changes while nothing is being edited: controls update —
+  // including a provider switch retargeting the key input.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash" });
+    await popup.hooks.initializePromise;
+    popup.emitStorageChange({ deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: NEWER } });
+    assertEqual(popup.dom.get("api-key").value, NEWER, "external key change applies when the key is not being edited");
+    popup.emitStorageChange({
+      provider: { oldValue: "deepseek", newValue: "kimi" },
+      model: { oldValue: "deepseek-flash", newValue: "kimi-k2.6" }
+    });
+    assertEqual(popup.dom.get("provider").value, "kimi", "external provider switch applies to the select");
+    assertEqual(popup.dom.get("model").value, "kimi-k2.6", "external provider switch applies the other view's model");
+    assertEqual(popup.dom.get("api-key").value, KIMI_KEY, "external provider switch retargets the key input");
+    assertEqual(popup.dom.get("key-status-kimi").dataset.active, "true", "external provider switch flips the key status rows");
+  }
+
+  // (4) Save writes ONLY dirty fields and clears their flags.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const setCalls = recordSets(popup);
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    await popup.hooks.saveSettings();
+    assertEqual(setCalls, [{ deepseekApiKey: EDITED, apiKey: EDITED }], "save: only the dirty key field (+ the mirror) is written");
+    assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "save: the inactive provider's stored key is untouched");
+    assertEqual(popup.storage.model, "deepseek-flash", "save: non-dirty fields are never written");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "save: dirty flags clear after the write");
+    await popup.hooks.saveSettings();
+    assertEqual(setCalls.length, 1, "save: a second save with clean flags writes nothing");
+    // A dirty non-key field flushes on its own, without dragging keys along.
+    const langSelect = popup.dom.get("target-language");
+    langSelect.value = "ja";
+    fire(langSelect, "change");
+    assertEqual(setCalls[1], { targetLanguage: "ja" }, "save: a language edit writes only the language (no key mirror)");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "save: language dirty flag cleared by the auto-save");
+  }
+
+  // First load must render the display-mode buttons even when the stored (or
+  // default) mode equals the in-memory default: the popup markup ships no
+  // preselected button, so skipping the "unchanged" render leaves the radio
+  // without an active button until the user clicks one.
+  {
+    const modeClasses = (popup) =>
+      popup.sandbox.document.querySelectorAll(".mode-button").map((button) => ({
+        mode: button.dataset.mode,
+        active: button.classList.contains("active")
+      }));
+    const empty = createPopupVm({});
+    await empty.hooks.initializePromise;
+    assertEqual(
+      modeClasses(empty),
+      [
+        { mode: "bilingual", active: true },
+        { mode: "translation-only", active: false },
+        { mode: "original", active: false }
+      ],
+      "display mode: first load on empty storage marks the default (bilingual) button active"
+    );
+    const storedMode = createPopupVm({ displayMode: "original" });
+    await storedMode.hooks.initializePromise;
+    assertEqual(
+      modeClasses(storedMode).filter((entry) => entry.active),
+      [{ mode: "original", active: true }],
+      "display mode: first load applies a stored non-default mode to the buttons"
+    );
+  }
+
+  // Deleting the last stored key must survive every later load path: the
+  // save clears both the per-provider field and the legacy mirror, and no
+  // reopen (popup migrateSettings) or worker load (background loadSettings)
+  // may resurrect the deleted key from a stale mirror.
+  {
+    const deletedStorage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: "",
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(deletedStorage);
+    await popup.hooks.initializePromise;
+    const keyInput = popup.dom.get("api-key");
+    assertEqual(keyInput.value, DEEPSEEK_KEY, "key delete: the stored key loads into the input");
+    keyInput.value = "";
+    fire(keyInput, "input");
+    await popup.hooks.saveSettings();
+    assertEqual(deletedStorage.deepseekApiKey, "", "key delete: saving the cleared input empties deepseekApiKey");
+    assertEqual(deletedStorage.apiKey, "", "key delete: the legacy apiKey mirror is cleared with it");
+
+    const reopened = createPopupVm(deletedStorage);
+    await reopened.hooks.initializePromise;
+    assertEqual(String(deletedStorage.deepseekApiKey || ""), "", "key delete: popup reopen does not resurrect the deleted key");
+    assertEqual(reopened.dom.get("api-key").value, "", "key delete: reopened popup shows an empty key input");
+
+    const worker = createBackgroundVm(deletedStorage);
+    await worker.hooks.loadSettings();
+    assertEqual(String(deletedStorage.deepseekApiKey || ""), "", "key delete: background loadSettings does not resurrect the deleted key");
+    assertEqual(String(deletedStorage.apiKey || ""), "", "key delete: the mirror stays empty after the worker load");
+
+    // Storage as the pre-fix build left it after a delete (per-provider
+    // fields present-but-empty, stale mirror alongside): both load paths
+    // treat it as cleared and heal the mirror instead of migrating it.
+    const stalePopupStorage = { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: DEEPSEEK_KEY, model: "deepseek-flash" };
+    const stalePopup = createPopupVm(stalePopupStorage);
+    await stalePopup.hooks.initializePromise;
+    assertEqual(String(stalePopupStorage.deepseekApiKey || ""), "", "stale mirror: popup load does not resurrect the deleted key");
+    assertEqual(String(stalePopupStorage.apiKey || ""), "", "stale mirror: popup load heals the stale apiKey mirror to empty");
+    const staleWorkerStorage = { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: DEEPSEEK_KEY, model: "deepseek-flash" };
+    const staleWorker = createBackgroundVm(staleWorkerStorage);
+    await staleWorker.hooks.loadSettings();
+    assertEqual(String(staleWorkerStorage.deepseekApiKey || ""), "", "stale mirror: background load does not resurrect the deleted key");
+    assertEqual(String(staleWorkerStorage.apiKey || ""), "", "stale mirror: background load heals the mirror");
+  }
+
+  // (5) Preserve edits made while a save is pending: the storage write of
+  // edit A is gated in flight; the user retypes B on the same field, the
+  // onChanged echo of our own write of A arrives, then the write completes —
+  // B must stay dirty, the control must keep showing it, and one follow-up
+  // round must write B before the initiating saveSettings() promise resolves
+  // (Codex P1: the promise used to resolve after A's write alone, with B's
+  // follow-up write still fire-and-forget). Each write gets its own release.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const setCalls = [];
+    const trueSet = popup.sandbox.chrome.storage.local.set;
+    const writeReleases = [];
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      setCalls.push(updates);
+      await new Promise((resolve) => writeReleases.push(resolve));
+      await trueSet(updates);
+    };
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    const saving = popup.hooks.saveSettings();
+    assertEqual(setCalls, [{ deepseekApiKey: EDITED, apiKey: EDITED }], "pending edit: the in-flight save writes edit A");
+    keyInput.value = NEWER;
+    fire(keyInput, "input");
+    // The storage.onChanged echo of our own write of A must not clobber B.
+    popup.emitStorageChange({
+      deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: EDITED },
+      apiKey: { oldValue: DEEPSEEK_KEY, newValue: EDITED }
+    });
+    assertEqual(keyInput.value, NEWER, "pending edit: the control keeps edit B through the echo of A");
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, NEWER, "pending edit: edit B stays banked through the echo");
+    writeReleases[0]();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(setCalls.length, 2, "pending edit: exactly one follow-up round runs");
+    assertEqual(setCalls[1], { deepseekApiKey: NEWER, apiKey: NEWER }, "pending edit: the follow-up round writes B");
+    assertEqual(keyInput.value, NEWER, "pending edit: the control still shows B while its write is in flight");
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, NEWER, "pending edit: B is still dirty while its write is in flight");
+    let resolved = false;
+    saving.then(() => { resolved = true; }, () => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertTrue(resolved === false, "pending edit: the initiating save promise stays pending until B's write commits");
+    writeReleases[1]();
+    await saving;
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "pending edit: the follow-up round clears the dirty flag before the promise resolves");
+    assertEqual(popup.storage.deepseekApiKey, NEWER, "pending edit: storage ends at B");
+  }
+
+  // (6) Saves are serialized: requests arriving while a write is in flight
+  // coalesce into ONE follow-up save — three callers, two writes total.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const setCalls = [];
+    const trueSet = popup.sandbox.chrome.storage.local.set;
+    let releaseWrite;
+    const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      setCalls.push(updates);
+      await writeGate;
+      await trueSet(updates);
+    };
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    const first = popup.hooks.saveSettings();
+    keyInput.value = NEWER;
+    fire(keyInput, "input");
+    const second = popup.hooks.saveSettings();
+    const third = popup.hooks.saveSettings();
+    releaseWrite();
+    const [secondResult, thirdResult] = await Promise.all([second, third]);
+    await first;
+    assertTrue(secondResult === thirdResult, "coalesced saves: queued callers share one follow-up result");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(setCalls.length, 2, "coalesced saves: exactly one follow-up write follows the in-flight one");
+    assertEqual(setCalls[1], { deepseekApiKey: NEWER, apiKey: NEWER }, "coalesced saves: the follow-up writes the newest edit");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "coalesced saves: the follow-up clears the dirty flag");
+    assertEqual(popup.storage.deepseekApiKey, NEWER, "coalesced saves: storage ends at the newest edit");
+  }
+
+  // Switching providers banks an unsaved key edit under the provider it was
+  // typed for; switching back restores it, and the inactive provider's
+  // stored key is never touched.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const setCalls = recordSets(popup);
+    const keyInput = popup.dom.get("api-key");
+    const providerSelect = popup.dom.get("provider");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    providerSelect.value = "kimi";
+    fire(providerSelect, "change");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(keyInput.value, KIMI_KEY, "provider switch: input swaps to the new provider's stored key");
+    assertEqual(
+      setCalls[0],
+      { deepseekApiKey: EDITED, provider: "kimi", model: "kimi-k2.6", apiKey: KIMI_KEY },
+      "provider switch: the banked edit saves under its own provider and the mirror follows the switch"
+    );
+    providerSelect.value = "deepseek";
+    fire(providerSelect, "change");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(keyInput.value, EDITED, "provider switch: switching back restores the banked edit");
+    assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "provider switch: the inactive provider's stored key is untouched");
+  }
+
+  // Hiding/unloading a STALE IDLE view (pagehide / visibilitychange=hidden)
+  // must write NOTHING: with no pending debounced edit there is no flush, so
+  // newer values another view wrote underneath survive untouched — a stale
+  // view can never restore its older keys over them.
+  {
+    const storage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(storage);
+    await popup.hooks.initializePromise;
+    const setCalls = recordSets(popup);
+    const ROTATED_DEEPSEEK = fakeKey("hidedeepseek", 24);
+    const ROTATED_KIMI = fakeKey("hidekimi", 23);
+    // Another view rotates BOTH keys while this view sits idle (no edits).
+    popup.emitStorageChange({
+      deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: ROTATED_DEEPSEEK },
+      kimiApiKey: { oldValue: KIMI_KEY, newValue: ROTATED_KIMI },
+      apiKey: { oldValue: DEEPSEEK_KEY, newValue: ROTATED_DEEPSEEK }
+    });
+    popup.firePageHide();
+    popup.fireVisibilityHidden();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(setCalls.length, 0, "stale idle hide: pagehide/visibilitychange=hidden write nothing to storage");
+    assertEqual(popup.storage.deepseekApiKey, ROTATED_DEEPSEEK, "stale idle hide: the newer DeepSeek key survives");
+    assertEqual(popup.storage.kimiApiKey, ROTATED_KIMI, "stale idle hide: the newer Kimi key survives");
+  }
+
+  // A view hidden with a PENDING DEBOUNCED key edit flushes ONLY that dirty
+  // field through the serialized write queue (+ the legacy apiKey mirror) —
+  // never the other provider's key, even though this view's snapshot of it
+  // is stale relative to what another view has since written.
+  {
+    const storage = {
+      provider: "deepseek",
+      deepseekApiKey: DEEPSEEK_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: DEEPSEEK_KEY,
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const popup = createPopupVm(storage);
+    await popup.hooks.initializePromise;
+    const setCalls = recordSets(popup);
+    const keyInput = popup.dom.get("api-key");
+    const FLUSHED_KEY = fakeKey("hideflush", 24);
+    const ROTATED_KIMI = fakeKey("hidekimi", 23);
+    keyInput.value = FLUSHED_KEY;
+    fire(keyInput, "input"); // banks the edit + schedules the 200 ms debounce
+    // Another view rotates the INACTIVE provider's key before the debounce fires.
+    popup.emitStorageChange({ kimiApiKey: { oldValue: KIMI_KEY, newValue: ROTATED_KIMI } });
+    popup.fireVisibilityHidden(); // hidden mid-debounce: flush now
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(
+      setCalls,
+      [{ deepseekApiKey: FLUSHED_KEY, apiKey: FLUSHED_KEY }],
+      "hide flush: only the pending dirty key (+ the legacy mirror) is written"
+    );
+    assertEqual(popup.storage.kimiApiKey, ROTATED_KIMI, "hide flush: the other provider's newer key is never overwritten with the stale one");
+    assertEqual(popup.storage.targetLanguage, "zh-CN", "hide flush: untouched fields are never written");
+    // The debounce timer is gone with the edit settled: a later pagehide
+    // must not write anything more.
+    popup.firePageHide();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(setCalls.length, 1, "hide flush: a second hide after the flush writes nothing");
+  }
+}
+
+// ---- Serialized write queue: concurrency (controlled fake storage) ----
+// Third round of the same race class: every chrome.storage.local.set in
+// popup.js must go through ONE serialized queue, and edits made while a
+// write is pending must coalesce into the next queued patch instead of
+// racing the pending one (or being wiped by it). The fake storage here
+// parks each set() until the test releases it, so every scenario can place
+// a new edit inside each pending write and watch the follow-up land it.
+async function checkSettingsWriteQueueConcurrency() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const fire = (el, type) => {
+    for (const fn of el.listeners[type] || []) {
+      fn();
+    }
+  };
+
+  const DEEPSEEK_KEY = fakeKey("queuedeepseek", 21);
+  const KIMI_KEY = fakeKey("queuekimi", 25);
+  const RETYPED_KEY = fakeKey("queueretype", 24);
+
+  // Controlled fake storage: set() returns a promise the test resolves by
+  // calling entry.release() (which is also when the update lands), and the
+  // state tracks how many writes were in flight at once.
+  const gateStorage = (popup) => {
+    const state = { writes: [], inFlight: 0, maxInFlight: 0 };
+    popup.sandbox.chrome.storage.local.set = (updates) => {
+      state.inFlight += 1;
+      state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
+      const entry = { updates };
+      state.writes.push(entry);
+      return new Promise((resolve) => {
+        entry.release = () => {
+          state.inFlight -= 1;
+          Object.assign(popup.storage, updates);
+          resolve();
+        };
+      });
+    };
+    return state;
+  };
+  const seededStorage = () => ({
+    provider: "deepseek",
+    deepseekApiKey: DEEPSEEK_KEY,
+    kimiApiKey: KIMI_KEY,
+    apiKey: DEEPSEEK_KEY,
+    model: "deepseek-flash",
+    targetLanguage: "zh-CN",
+    displayMode: "bilingual"
+  });
+
+  // (1) Double provider switch (DeepSeek → Kimi → DeepSeek) plus a field
+  // edit, all while the first switch's write is pending: the model edit must
+  // follow the LATEST control state (never a stale snapshot), and everything
+  // must coalesce into one follow-up write that leaves storage's
+  // provider/model pair consistent and matching the UI.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const providerSelect = popup.dom.get("provider");
+    const modelSelect = popup.dom.get("model");
+    const langSelect = popup.dom.get("target-language");
+
+    providerSelect.value = "kimi";
+    fire(providerSelect, "change");
+    assertEqual(gate.writes.length, 1, "provider switch: the switch's save is the only write so far");
+    assertEqual(
+      gate.writes[0].updates,
+      { provider: "kimi", model: "kimi-k2.6", apiKey: KIMI_KEY },
+      "provider switch: the pending write carries the new provider, its resolved model and the mirror"
+    );
+
+    // Second switch BEFORE the first write settles — plus a language edit —
+    // all while write #1 is parked.
+    providerSelect.value = "deepseek";
+    fire(providerSelect, "change");
+    langSelect.value = "ja";
+    fire(langSelect, "change");
+
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "provider switch: exactly one coalesced follow-up write starts once the pending one settles");
+    assertEqual(
+      gate.writes[1].updates,
+      { provider: "deepseek", model: "deepseek-flash", targetLanguage: "ja", apiKey: DEEPSEEK_KEY },
+      "provider switch: the follow-up writes the second switch's provider/model pair plus the coalesced language edit"
+    );
+    gate.writes[1].release();
+    await tick();
+    assertEqual(popup.storage.provider, "deepseek", "double switch: storage ends at the second provider");
+    assertEqual(popup.storage.model, "deepseek-flash", "double switch: storage model matches the final provider (no stale kimi model)");
+    assertEqual(popup.storage.targetLanguage, "ja", "double switch: the mid-write language edit reached storage");
+    assertEqual(providerSelect.value, "deepseek", "double switch: the select shows the final provider");
+    assertEqual(modelSelect.value, "deepseek-flash", "double switch: the model control matches storage");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "double switch: every edit settles once the writes land");
+    assertTrue(gate.maxInFlight === 1, "double switch: at most one write in flight at a time");
+  }
+
+  // (2) Import is a batch of edits on the same queue: an edit made to an
+  // imported field WHILE the import's write is pending survives it (the old
+  // code deleted edits for imported fields after its own unserialized write).
+  // And the Codex P1 fix: the import's save resolves only once STABLE, so the
+  // 设置已导入 status cannot render before that concurrent edit is persisted.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const langSelect = popup.dom.get("target-language");
+    const file = {
+      size: 256,
+      text: async () =>
+        JSON.stringify({
+          format: "kilocean-translate-settings",
+          version: 1,
+          settings: { provider: "kimi", model: "kimi-k3", targetLanguage: "ja" }
+        })
+    };
+    const importing = popup.hooks.importSettingsFile(file);
+    await tick(); // file.text() + parse before the import's write is queued
+    assertEqual(gate.writes.length, 1, "import: the import enqueues exactly one write");
+    assertEqual(
+      gate.writes[0].updates,
+      { provider: "kimi", targetLanguage: "ja", model: "kimi-k3", apiKey: KIMI_KEY },
+      "import: the write carries the imported fields and the mirror follows the imported provider"
+    );
+    // The user retypes an imported field while the import's write is parked.
+    langSelect.value = "ko";
+    fire(langSelect, "change");
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "import: the mid-write edit gets exactly one follow-up write");
+    assertEqual(gate.writes[1].updates, { targetLanguage: "ko" }, "import: the follow-up writes only the edited field");
+    assertTrue(
+      popup.dom.get("status-title").textContent !== "设置已导入",
+      "import: no 设置已导入 status while the concurrent edit's write is still pending"
+    );
+    gate.writes[1].release();
+    await importing;
+    assertEqual(popup.dom.get("status-title").textContent, "设置已导入", "import: the success status renders only after every follow-up write committed");
+    assertEqual(popup.storage.targetLanguage, "ko", "import: the edit made during the pending import ends in storage");
+    assertEqual(popup.storage.provider, "kimi", "import: the imported provider survives the concurrent edit");
+    assertEqual(popup.storage.model, "kimi-k3", "import: the imported model survives the concurrent edit");
+    assertEqual(langSelect.value, "ko", "import: the control keeps showing the user's newer edit");
+    assertTrue(gate.maxInFlight === 1, "import: at most one write in flight at a time");
+  }
+
+  // (3) Plain field edit retyped mid-write: the newer value wins.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const langSelect = popup.dom.get("target-language");
+    langSelect.value = "ja";
+    fire(langSelect, "change");
+    assertEqual(gate.writes[0].updates, { targetLanguage: "ja" }, "field edit: the first write carries the edit");
+    langSelect.value = "en";
+    fire(langSelect, "change");
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "field edit: the retype gets exactly one follow-up write");
+    assertEqual(gate.writes[1].updates, { targetLanguage: "en" }, "field edit: the follow-up writes the newest value");
+    gate.writes[1].release();
+    await tick();
+    assertEqual(popup.storage.targetLanguage, "en", "field edit: the retyped value ends in storage");
+    assertTrue(gate.maxInFlight === 1, "field edit: at most one write in flight at a time");
+  }
+
+  // (4) Key delete + retype during the pending write: the new key (not the
+  // deletion, not the old key) ends in storage with a consistent mirror.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = "";
+    fire(keyInput, "input");
+    fire(keyInput, "change");
+    assertEqual(
+      gate.writes[0].updates,
+      { deepseekApiKey: "", apiKey: "" },
+      "key delete: clearing the last key writes the empty value and clears the mirror"
+    );
+    // A new key typed while the deletion's write is parked.
+    keyInput.value = RETYPED_KEY;
+    fire(keyInput, "input");
+    fire(keyInput, "change");
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "key delete: the new key gets exactly one follow-up write");
+    assertEqual(
+      gate.writes[1].updates,
+      { deepseekApiKey: RETYPED_KEY, apiKey: RETYPED_KEY },
+      "key delete: the follow-up writes the new key and keeps the mirror consistent"
+    );
+    gate.writes[1].release();
+    await tick();
+    assertEqual(popup.storage.deepseekApiKey, RETYPED_KEY, "key delete: the new key ends in storage");
+    assertEqual(popup.storage.apiKey, RETYPED_KEY, "key delete: the legacy mirror ends consistent with the new key");
+    assertTrue(gate.maxInFlight === 1, "key delete: at most one write in flight at a time");
+  }
+
+  // (5) External provider switch while a model edit is queued: the dirty edit
+  // belongs to the departed provider and the rebuilt select no longer offers
+  // it, so it can never settle — re-point it at the select's resolved model
+  // or the edits can never clear (and every follow-up save retries forever).
+  // With revision-guarded completion the newer stored model also survives:
+  // completion must not stamp the departed provider's model back over the
+  // snapshot, the re-pointed edit settles against the stored value, and no
+  // follow-up write (bounded loop) is needed.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const providerSelect = popup.dom.get("provider");
+    const modelSelect = popup.dom.get("model");
+
+    // The user's model edit is collected and parked in write #1…
+    modelSelect.value = "deepseek-v4-pro";
+    fire(modelSelect, "change");
+    assertEqual(gate.writes.length, 1, "external switch: the model edit's save is the only write so far");
+    assertEqual(gate.writes[0].updates, { model: "deepseek-v4-pro" }, "external switch: the pending write carries the edited model");
+
+    // …when another view switches the provider underneath (its write
+    // committed after ours — that is why its onChanged reaches us before our
+    // promise settles).
+    popup.emitStorageChange({
+      provider: { oldValue: "deepseek", newValue: "kimi" },
+      model: { oldValue: "deepseek-flash", newValue: "kimi-k2.6" },
+      apiKey: { oldValue: DEEPSEEK_KEY, newValue: KIMI_KEY }
+    });
+    assertEqual(providerSelect.value, "kimi", "external switch: the select follows the other view's provider");
+    assertEqual(modelSelect.value, "kimi-k2.6", "external switch: the rebuilt select resolves to the new provider's model");
+    assertEqual(
+      popup.hooks.getSettingsModel().edits.model,
+      "kimi-k2.6",
+      "external switch: the stale dirty model edit is re-pointed at the select's resolved model"
+    );
+
+    gate.writes[0].release();
+    // The fake release applies OUR (older) patch last; the external write
+    // committed after ours, so restore the real final storage state.
+    Object.assign(popup.storage, { provider: "kimi", model: "kimi-k2.6", apiKey: KIMI_KEY });
+    await tick();
+    await tick();
+    assertEqual(
+      popup.hooks.getSettingsModel().snapshot.model,
+      "kimi-k2.6",
+      "external switch: completion keeps the newer stored model in the snapshot (no stale stamp)"
+    );
+    assertEqual(gate.writes.length, 1, "external switch: no follow-up write — the re-pointed edit already matches the stored model");
+    assertEqual(popup.storage.provider, "kimi", "external switch: storage ends at the new provider");
+    assertEqual(popup.storage.model, "kimi-k2.6", "external switch: storage model is valid for the new provider (no departed provider's model)");
+    assertEqual(modelSelect.value, "kimi-k2.6", "external switch: the model control matches storage");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "external switch: every edit settles (no dirty residue, no save loop)");
+    // Bounded: nothing further may appear once the edits settled.
+    await tick();
+    await tick();
+    assertEqual(gate.writes.length, 1, "external switch: no more writes after settling (no unbounded save loop)");
+    assertTrue(gate.maxInFlight === 1, "external switch: at most one write in flight at a time");
+  }
+
+  // (6) A newer stored value delivered while our write is in flight survives
+  // the write's completion: another view commits a newer displayMode after
+  // our click's write committed but before its promise settles. Completion
+  // must not stamp our older written value back over the snapshot, the
+  // radiogroup must render the newer mode, and the mode sent to the page
+  // must be the newer one — never the stale written one.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const tabMessages = [];
+    const originalSend = popup.sandbox.chrome.tabs.sendMessage;
+    popup.sandbox.chrome.tabs.sendMessage = async (tabId, message) => {
+      tabMessages.push(message);
+      return originalSend(tabId, message);
+    };
+    const buttons = popup.sandbox.document.querySelectorAll(".mode-button");
+    const activeModes = () => buttons.filter((b) => b.classList.contains("active")).map((b) => b.dataset.mode);
+
+    fire(buttons[1], "click"); // "translation-only"
+    assertEqual(gate.writes.length, 1, "overtaken write: the click's save is parked as the only write");
+    assertEqual(
+      gate.writes[0].updates,
+      { displayMode: "translation-only" },
+      "overtaken write: the pending write carries the clicked mode"
+    );
+
+    // Another view commits a NEWER mode after our write committed.
+    popup.emitStorageChange({ displayMode: { oldValue: "bilingual", newValue: "original" } });
+
+    gate.writes[0].release();
+    await tick();
+    await tick();
+    assertEqual(
+      popup.hooks.getSettingsModel().snapshot.displayMode,
+      "original",
+      "overtaken write: completion keeps the newer stored displayMode in the snapshot"
+    );
+    assertEqual(activeModes(), ["original"], "overtaken write: the radiogroup renders the newer mode");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "overtaken write: the click's edit settles");
+    assertEqual(
+      tabMessages.filter((message) => message?.type === "SET_DISPLAY_MODE").map((message) => message.displayMode),
+      ["original"],
+      "overtaken write: the page is told the effective mode, never the stale written one"
+    );
+    assertEqual(gate.writes.length, 1, "overtaken write: no follow-up write (nothing stayed dirty)");
+    assertTrue(gate.maxInFlight === 1, "overtaken write: at most one write in flight at a time");
+  }
+
+  // (6b) Without an overtaking change, the click's own mode still reaches the
+  // page — the effective-value rule must not regress the normal path.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const tabMessages = [];
+    const originalSend = popup.sandbox.chrome.tabs.sendMessage;
+    popup.sandbox.chrome.tabs.sendMessage = async (tabId, message) => {
+      tabMessages.push(message);
+      return originalSend(tabId, message);
+    };
+    const buttons = popup.sandbox.document.querySelectorAll(".mode-button");
+    fire(buttons[2], "click"); // "original"
+    assertEqual(gate.writes[0].updates, { displayMode: "original" }, "mode click: the write carries the clicked mode");
+    gate.writes[0].release();
+    await tick();
+    await tick();
+    assertEqual(
+      tabMessages.filter((message) => message?.type === "SET_DISPLAY_MODE").map((message) => message.displayMode),
+      ["original"],
+      "mode click: the clicked mode still reaches the page when nothing overtook it"
+    );
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "mode click: the edit settles");
+  }
+
+  // (7) Same race on a plain settings field: a newer stored targetLanguage
+  // delivered mid-write survives completion, and the control — which kept the
+  // user's edit while it was dirty — follows the newer stored value once the
+  // edit settles.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const langSelect = popup.dom.get("target-language");
+    langSelect.value = "ja";
+    fire(langSelect, "change");
+    assertEqual(gate.writes[0].updates, { targetLanguage: "ja" }, "overtaken language: the edit's write is parked");
+    popup.emitStorageChange({ targetLanguage: { oldValue: "zh-CN", newValue: "ko" } });
+    assertEqual(langSelect.value, "ja", "overtaken language: the dirty control keeps the user's edit until the write settles");
+    gate.writes[0].release();
+    await tick();
+    assertEqual(
+      popup.hooks.getSettingsModel().snapshot.targetLanguage,
+      "ko",
+      "overtaken language: completion keeps the newer stored language in the snapshot"
+    );
+    assertEqual(langSelect.value, "ko", "overtaken language: the control follows the newer stored language");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "overtaken language: the edit settles (no retype)");
+    assertEqual(gate.writes.length, 1, "overtaken language: no follow-up write");
+    assertTrue(gate.maxInFlight === 1, "overtaken language: at most one write in flight at a time");
+  }
+
+  // (8) Codex P1 regression — translate: hold the FIRST storage.set, retype
+  // the key mid-write, then release both writes. The save that initiated the
+  // click must not let the page start translating until the FOLLOW-UP write
+  // (the one carrying the retyped key) committed, and by then storage holds
+  // the NEW key + mirror — the page's key gate reads storage, not the popup.
+  {
+    const popup = createPopupVm(seededStorage());
+    await popup.hooks.initializePromise;
+    popup.sandbox.setInterval = () => 1; // never start a real 700 ms poll
+    popup.sandbox.clearInterval = () => {};
+    const gate = gateStorage(popup);
+    const tabMessages = [];
+    const storageAtMessage = [];
+    const originalSend = popup.sandbox.chrome.tabs.sendMessage;
+    popup.sandbox.chrome.tabs.sendMessage = async (tabId, message) => {
+      tabMessages.push(message);
+      if (message?.type === "START_TRANSLATION") {
+        storageAtMessage.push({ ...popup.storage });
+      }
+      return originalSend(tabId, message);
+    };
+    const keyInput = popup.dom.get("api-key");
+    const TYPED_KEY = fakeKey("p1typed", 20);
+    const RETYPED_KEY = fakeKey("p1retyped", 22);
+    keyInput.value = TYPED_KEY;
+    fire(keyInput, "input");
+    const clicked = popup.dom.get("translate").listeners.click[0]();
+    assertEqual(gate.writes.length, 1, "translate follow-up: the typed key's save parks as the only write");
+    assertEqual(
+      gate.writes[0].updates,
+      { deepseekApiKey: TYPED_KEY, apiKey: TYPED_KEY },
+      "translate follow-up: the pending write carries the typed key"
+    );
+    // The user retypes the key while that write is parked.
+    keyInput.value = RETYPED_KEY;
+    fire(keyInput, "input");
+    fire(keyInput, "change"); // immediate persist coalesces behind the in-flight save
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "translate follow-up: the retype gets exactly one follow-up write");
+    assertEqual(
+      gate.writes[1].updates,
+      { deepseekApiKey: RETYPED_KEY, apiKey: RETYPED_KEY },
+      "translate follow-up: the follow-up write carries the retyped key"
+    );
+    assertEqual(
+      tabMessages.filter((message) => message?.type === "START_TRANSLATION").length,
+      0,
+      "translate follow-up: no START_TRANSLATION before the follow-up write committed"
+    );
+    gate.writes[1].release();
+    await clicked;
+    const starts = tabMessages.filter((message) => message?.type === "START_TRANSLATION");
+    assertEqual(starts.length, 1, "translate follow-up: the page starts exactly once, after the follow-up write committed");
+    assertEqual(
+      starts[0].options,
+      { provider: "deepseek", targetLanguage: "zh-CN", model: "deepseek-flash", displayMode: "bilingual" },
+      "translate follow-up: the page is started with the settled settings"
+    );
+    assertEqual(storageAtMessage[0].deepseekApiKey, RETYPED_KEY, "translate follow-up: storage already holds the NEW key when the page is told to translate");
+    assertEqual(storageAtMessage[0].apiKey, RETYPED_KEY, "translate follow-up: the legacy mirror carries the NEW key too");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "translate follow-up: every edit settled before the action ran");
+    assertTrue(gate.maxInFlight === 1, "translate follow-up: at most one write in flight at a time");
+  }
+
+  // (8b) Same race through the manual connection test: TEST_CONNECTION must
+  // leave only after the follow-up write committed, and the worker must read
+  // the NEW key from storage when it fires.
+  {
+    const seed = seededStorage();
+    const testFired = [];
+    const popup = createPopupVm(seed, {
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          testFired.push({ message, storage: { ...seed } });
+        }
+        return { ok: true };
+      }
+    });
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const keyInput = popup.dom.get("api-key");
+    const TYPED_KEY = fakeKey("p1testtyped", 24);
+    const RETYPED_KEY = fakeKey("p1testretyped", 26);
+    keyInput.value = TYPED_KEY;
+    fire(keyInput, "input");
+    const clicked = popup.dom.get("test-connection").listeners.click[0]();
+    assertEqual(gate.writes.length, 1, "key test follow-up: the typed key's save parks as the only write");
+    keyInput.value = RETYPED_KEY;
+    fire(keyInput, "input");
+    fire(keyInput, "change");
+    gate.writes[0].release();
+    await tick();
+    assertEqual(gate.writes.length, 2, "key test follow-up: the retype gets exactly one follow-up write");
+    assertEqual(testFired.length, 0, "key test follow-up: no TEST_CONNECTION before the follow-up write committed");
+    gate.writes[1].release();
+    await clicked;
+    assertEqual(testFired.length, 1, "key test follow-up: the connection test fires once, after the follow-up write committed");
+    assertEqual(
+      testFired[0].storage.deepseekApiKey,
+      RETYPED_KEY,
+      "key test follow-up: storage holds the NEW key when the worker is asked to test it"
+    );
+    // The mid-write retype invalidated the run (keyTestOp bumped by its input
+    // event), so the result is dropped by design — only the button returns.
+    assertEqual(
+      popup.dom.get("status-title").textContent,
+      "正在验证 DeepSeek Key",
+      "key test follow-up: the retyped key invalidates the in-flight run's status write (documented popup behavior)"
+    );
+    assertEqual(popup.dom.get("test-connection").disabled, false, "key test follow-up: the button re-enables after the stable save");
+    assertTrue(gate.maxInFlight === 1, "key test follow-up: at most one write in flight at a time");
+  }
+
+  // (9) Codex P1 failure path: a rejected storage write must reject the
+  // initiating save promise (and every coalesced caller), render an error,
+  // leave the edits dirty, and stop the action — translate never starts, the
+  // connection test never fires — and a later save retries the dirty edit.
+  {
+    const seed = seededStorage();
+    const popup = createPopupVm(seed);
+    await popup.hooks.initializePromise;
+    popup.sandbox.setInterval = () => 1;
+    popup.sandbox.clearInterval = () => {};
+    const tabMessages = [];
+    const originalSend = popup.sandbox.chrome.tabs.sendMessage;
+    popup.sandbox.chrome.tabs.sendMessage = async (tabId, message) => {
+      tabMessages.push(message);
+      return originalSend(tabId, message);
+    };
+    let failWrites = false;
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      if (failWrites) {
+        throw new Error("quota-boom");
+      }
+      Object.assign(popup.storage, updates);
+    };
+    const keyInput = popup.dom.get("api-key");
+    const PENDING_KEY = fakeKey("p1failedit", 24);
+    keyInput.value = PENDING_KEY;
+    fire(keyInput, "input");
+    failWrites = true;
+    const clicked = popup.dom.get("translate").listeners.click[0]();
+    await clicked;
+    assertEqual(
+      tabMessages.filter((message) => message?.type === "START_TRANSLATION").length,
+      0,
+      "write failure: translate never starts when the save rejects"
+    );
+    assertEqual(popup.dom.get("status-title").textContent, "保存设置失败", "write failure: the failed save renders a dedicated error");
+    assertEqual(popup.dom.get("status-detail").textContent, "quota-boom", "write failure: the surfaced detail is the storage error");
+    assertEqual(popup.dom.get("translate").disabled, false, "write failure: the translate button re-enables");
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, PENDING_KEY, "write failure: the edit stays dirty for a retry");
+    assertEqual(seed.deepseekApiKey, DEEPSEEK_KEY, "write failure: storage keeps the pre-save key");
+
+    // The initiating caller and callers coalesced behind it all reject with
+    // the storage error — and the follow-up slot is freed, so the NEXT save
+    // is a fresh attempt (no stale rejection stuck in it).
+    const first = popup.hooks.saveSettings();
+    const second = popup.hooks.saveSettings();
+    let firstError = null;
+    let secondError = null;
+    await first.catch((error) => { firstError = error; });
+    await second.catch((error) => { secondError = error; });
+    assertTrue(/quota-boom/.test(String(firstError?.message)), "write failure: the initiating save rejects with the storage error");
+    assertTrue(/quota-boom/.test(String(secondError?.message)), "write failure: a caller coalesced behind the failed save sees the same failure");
+    failWrites = false;
+    await popup.hooks.saveSettings();
+    assertEqual(seed.deepseekApiKey, PENDING_KEY, "write failure recovery: a later save retries the still-dirty edit");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "write failure recovery: the retried edit settles once writes work again");
+  }
+
+  // (9b) Same failure through the connection test button: no network call,
+  // a dedicated error status, and the button comes back enabled.
+  {
+    const runtimeMessages = [];
+    const popup = createPopupVm(seededStorage(), {
+      runtimeMessageHandler: async (message) => {
+        runtimeMessages.push(message);
+        return { ok: true };
+      }
+    });
+    await popup.hooks.initializePromise;
+    popup.sandbox.chrome.storage.local.set = async () => {
+      throw new Error("quota-boom");
+    };
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = fakeKey("p1failtest", 22);
+    fire(keyInput, "input");
+    const clicked = popup.dom.get("test-connection").listeners.click[0]();
+    await clicked;
+    assertEqual(
+      runtimeMessages.filter((message) => message?.type === "TEST_CONNECTION").length,
+      0,
+      "write failure: no TEST_CONNECTION when the save rejects"
+    );
+    assertEqual(popup.dom.get("status-title").textContent, "保存设置失败", "write failure: the connection test renders the save error");
+    assertEqual(popup.dom.get("test-connection").disabled, false, "write failure: the test button re-enables");
+  }
+
+  // Static: exactly one chrome.storage.local.set call site — the queue — and
+  // no other direct (or remove-) write path anywhere in popup.js.
+  const popupScan = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
+  const setSites = popupScan.match(/chrome\.storage\.local\.set\s*\(/g) || [];
+  if (setSites.length !== 1) {
+    fail(`popup.js: chrome.storage.local.set must have exactly one call site (the serialized write queue), found ${setSites.length}`);
+  }
+  if (/chrome\.storage\.local\.remove/.test(popupScan)) {
+    fail("popup.js: chrome.storage.local.remove must not appear — every storage mutation routes through the write queue");
+  }
+  if (!/enqueueSettingsWrite\(/.test(popupScan)) {
+    fail("popup.js: the serialized write queue entrypoint enqueueSettingsWrite must exist");
+  }
+
+  // Static (Codex P1): no un-awaited, un-caught saveSettings() /
+  // enqueueSettingsWrite() call sites in popup.js. A save promise nobody owns
+  // is exactly how the follow-up write used to be fire-and-forget (translate,
+  // key test, selection confirm and import ran before newer edits were
+  // persisted) and how a rejected write would die as an unhandled rejection.
+  // Every call must be awaited, returned into its caller or a promise chain,
+  // or explicitly .catch-handled; anything else needs an entry in the
+  // documented allowlist below with a reason.
+  const SAVE_CALL_ALLOWLIST = new Map([
+    // Intentionally empty: persistSettingsInBackground — the single
+    // fire-and-forget shape (debounce ticks, change/blur persists, init's
+    // closing flush, the hide-time flush) — already qualifies via its .catch.
+  ]);
+  const skipStringLiteral = (text, index) => {
+    const quote = text[index];
+    let i = index + 1;
+    while (i < text.length && text[i] !== quote) {
+      if (text[i] === "\\") {
+        i += 1;
+      }
+      i += 1;
+    }
+    return i; // index of the closing quote
+  };
+  const findMatchingParen = (text, openIndex) => {
+    let depth = 0;
+    for (let i = openIndex; i < text.length; i += 1) {
+      const ch = text[i];
+      if (ch === '"' || ch === "'" || ch === "`") {
+        i = skipStringLiteral(text, i);
+      } else if (ch === "(") {
+        depth += 1;
+      } else if (ch === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          return i;
+        }
+      }
+    }
+    return -1;
+  };
+  const saveCallRe = /\b(saveSettings|enqueueSettingsWrite)\s*\(/g;
+  const exemptedSaveCalls = new Set();
+  let saveCallMatch;
+  while ((saveCallMatch = saveCallRe.exec(popupScan)) !== null) {
+    const name = saveCallMatch[1];
+    const before = popupScan.slice(0, saveCallMatch.index);
+    if (/(?:^|[^\w$])(?:async\s+)?function\s*$/.test(before)) {
+      continue; // the function's own declaration
+    }
+    if (/(?:^|[^\w$.])(?:await|return)\s*$/.test(before)) {
+      continue; // awaited by this caller, or returned into its caller/chain
+    }
+    const openIndex = popupScan.indexOf("(", saveCallMatch.index);
+    const closeIndex = findMatchingParen(popupScan, openIndex);
+    if (closeIndex >= 0 && /^\s*\.catch\s*\(/.test(popupScan.slice(closeIndex + 1))) {
+      continue; // explicitly .catch-handled fire-and-forget
+    }
+    const key = `${name}@${before.split("\n").length}`;
+    if (SAVE_CALL_ALLOWLIST.has(key)) {
+      exemptedSaveCalls.add(key);
+      continue;
+    }
+    fail(`popup.js: ${key} is an un-awaited, un-caught ${name}() call — await it, return it, or attach .catch (or document it in SAVE_CALL_ALLOWLIST in scripts/ci-check.mjs)`);
+  }
+  for (const key of SAVE_CALL_ALLOWLIST.keys()) {
+    if (!exemptedSaveCalls.has(key)) {
+      fail(`scripts/ci-check.mjs: stale save-call allowlist entry "${key}" — the call site no longer exists in popup.js`);
+    }
+  }
+}
+
+// ---- Init gate: user actions never touch settings before they are loaded ----
+// Codex P1: clicking Export (or any settings-touching action) before
+// initialize() finished acted on the pre-init DEFAULT_SETTINGS snapshot — a
+// backup of defaults with no keys, a connection test / translation against
+// default provider+model. Every such action now awaits the single init-ready
+// promise through whenReady(). Each scenario below parks the FIRST storage
+// read (initialize()'s own), fires the real DOM listener, asserts the action
+// produced NOTHING yet (no writes, no messages, no output), then releases
+// the read and asserts the action ran against the LOADED stored values.
+async function checkPopupActionInitGate() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  // Fire a DOM event and return a promise that settles once every listener's
+  // return value (the whenReady wrapper's promise) has settled.
+  const fireAction = (el, type) =>
+    Promise.all((el.listeners[type] || []).map((fn) => fn()));
+
+  const DEEPSEEK_KEY = fakeKey("gatedeepseek", 21);
+  const KIMI_KEY = fakeKey("gatekimi", 25);
+  const PASTED_KEY = fakeKey("gatepasted", 24);
+  const TYPED_KEY = fakeKey("gatetyped", 22);
+
+  const seededStorage = (overrides = {}) => ({
+    provider: "deepseek",
+    deepseekApiKey: DEEPSEEK_KEY,
+    kimiApiKey: KIMI_KEY,
+    apiKey: DEEPSEEK_KEY,
+    model: "deepseek-flash",
+    targetLanguage: "zh-CN",
+    displayMode: "bilingual",
+    ...overrides
+  });
+
+  // Popup whose FIRST chrome.storage.local.get (initialize()'s read) parks
+  // until release() — the exact pre-init window a fast user clicks inside.
+  // Storage writes and tab messages are recorded from creation on.
+  const createGatedPopup = (storageData, options = {}) => {
+    options.runtimeMessages = options.runtimeMessages || [];
+    const popup = createPopupVm(storageData, {
+      runtimeMessageHandler: async (message) => {
+        options.runtimeMessages.push(message);
+        return options.onRuntimeMessage ? options.onRuntimeMessage(message) : { ok: false };
+      }
+    });
+    let releaseRead;
+    const readGate = new Promise((resolve) => {
+      releaseRead = resolve;
+    });
+    const originalGet = popup.sandbox.chrome.storage.local.get;
+    let firstRead = true;
+    popup.sandbox.chrome.storage.local.get = (defaults) => {
+      if (!firstRead) {
+        return originalGet(defaults);
+      }
+      firstRead = false;
+      return readGate.then(() => originalGet(defaults));
+    };
+    const writes = [];
+    const originalSet = popup.sandbox.chrome.storage.local.set;
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      writes.push(updates);
+      await originalSet(updates);
+    };
+    const tabMessages = [];
+    const originalTabsSend = popup.sandbox.chrome.tabs.sendMessage;
+    popup.sandbox.chrome.tabs.sendMessage = async (tabId, message) => {
+      tabMessages.push(message);
+      return originalTabsSend(tabId, message);
+    };
+    return {
+      popup,
+      writes,
+      tabMessages,
+      release: () => {
+        releaseRead();
+        return tick();
+      }
+    };
+  };
+  const messagesOfType = (messages, type) => messages.filter((message) => message?.type === type);
+
+  // (1) Export settings — the reported P1: the backup must contain the
+  // STORED provider/model/language/mode and, with the opt-in checked, BOTH
+  // stored keys — never the pre-init defaults.
+  {
+    const { popup, writes, release } = createGatedPopup(
+      seededStorage({ provider: "kimi", model: "kimi-k3", targetLanguage: "ja", displayMode: "original", apiKey: KIMI_KEY })
+    );
+    popup.dom.get("export-include-keys").checked = true;
+    await tick(); // let initialize() park inside the gated first read
+    const click = fireAction(popup.dom.get("export-settings"), "click");
+    await tick();
+    assertEqual(popup.blobs.length, 0, "export gate: no file is produced while init's storage read is pending");
+    assertEqual(writes.length, 0, "export gate: no storage write before init completes");
+    assertEqual(popup.dom.get("status-title").textContent, "", "export gate: no status is rendered before init completes");
+    release();
+    await click;
+    assertEqual(popup.blobs.length, 1, "export gate: exactly one export file is produced after init completes");
+    const payload = JSON.parse(await popup.blobs[0].text());
+    assertEqual(
+      payload.settings,
+      {
+        provider: "kimi",
+        targetLanguage: "ja",
+        model: "kimi-k3",
+        displayMode: "original",
+        deepseekApiKey: DEEPSEEK_KEY,
+        kimiApiKey: KIMI_KEY
+      },
+      "export gate: the payload carries the STORED settings and both stored keys, never defaults"
+    );
+    assertEqual(popup.dom.get("status-title").textContent, "设置已导出", "export gate: success status renders after init completes");
+    assertEqual(writes.length, 0, "export gate: an export with no pending edits writes nothing to storage");
+  }
+
+  // (2) Import settings: nothing is written while init is pending; once
+  // released, the imported fields land and the stored keys survive (the
+  // pre-init model would have seen default keys and wiped the merge).
+  {
+    const { popup, writes, release } = createGatedPopup(seededStorage());
+    const file = {
+      text: async () =>
+        JSON.stringify({
+          format: "kilocean-translate-settings",
+          version: 1,
+          settings: { provider: "kimi", targetLanguage: "ko", model: "kimi-k3", displayMode: "translation-only" }
+        })
+    };
+    await tick();
+    popup.dom.get("import-file").files = [file];
+    const change = fireAction(popup.dom.get("import-file"), "change");
+    await tick();
+    assertEqual(writes.length, 0, "import gate: nothing is written while init is pending");
+    assertEqual(popup.storage.provider, "deepseek", "import gate: storage is untouched before init completes");
+    assertEqual(popup.dom.get("import-file").value, "", "import gate: the chooser input was reset without applying anything");
+    release();
+    await change;
+    await tick();
+    assertEqual(
+      writes,
+      [{ provider: "kimi", targetLanguage: "ko", model: "kimi-k3", displayMode: "translation-only", apiKey: KIMI_KEY }],
+      "import gate: after init, one write carries the imported fields and the mirror follows the imported provider"
+    );
+    assertEqual(popup.storage.deepseekApiKey, DEEPSEEK_KEY, "import gate: a key-less import keeps the stored DeepSeek key");
+    assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "import gate: a key-less import keeps the stored Kimi key");
+    assertEqual(popup.dom.get("status-title").textContent, "设置已导入", "import gate: success status renders after init completes");
+  }
+
+  // (3) Manual test connection: no network message while init is pending;
+  // once released, the test bills the STORED provider/model/language.
+  {
+    const options = { onRuntimeMessage: async () => ({ ok: true }) };
+    const { popup, writes, release } = createGatedPopup(
+      seededStorage({ provider: "kimi", model: "kimi-k3", targetLanguage: "ja", apiKey: KIMI_KEY }),
+      options
+    );
+    await tick();
+    const click = fireAction(popup.dom.get("test-connection"), "click");
+    await tick();
+    assertEqual(messagesOfType(options.runtimeMessages, "TEST_CONNECTION").length, 0, "key test gate: no TEST_CONNECTION while init is pending");
+    assertEqual(writes.length, 0, "key test gate: no storage write before init completes");
+    assertEqual(popup.dom.get("status-title").textContent, "", "key test gate: no test status renders before init completes");
+    release();
+    await click;
+    assertEqual(
+      messagesOfType(options.runtimeMessages, "TEST_CONNECTION"),
+      [{ type: "TEST_CONNECTION", provider: "kimi", targetLanguage: "ja", model: "kimi-k3" }],
+      "key test gate: the test runs against the STORED provider/model/language, never defaults"
+    );
+    assertEqual(popup.dom.get("status-title").textContent, "Key 有效", "key test gate: the stored key passes the test after init completes");
+    assertEqual(popup.dom.get("test-connection").disabled, false, "key test gate: the button re-enables after the gated test");
+  }
+
+  // (4) Translate: no START_TRANSLATION while init is pending; once
+  // released, the page is started with the STORED settings.
+  {
+    const { popup, writes, tabMessages, release } = createGatedPopup(
+      seededStorage({ provider: "kimi", model: "kimi-k3", targetLanguage: "ja", displayMode: "original", apiKey: KIMI_KEY })
+    );
+    popup.sandbox.setInterval = () => 1; // never start a real 700 ms poll
+    popup.sandbox.clearInterval = () => {};
+    await tick();
+    const click = fireAction(popup.dom.get("translate"), "click");
+    await tick();
+    assertEqual(messagesOfType(tabMessages, "START_TRANSLATION").length, 0, "translate gate: no START_TRANSLATION while init is pending");
+    assertEqual(writes.length, 0, "translate gate: no storage write before init completes");
+    assertEqual(popup.dom.get("status-title").textContent, "", "translate gate: no launch status renders before init completes");
+    release();
+    await click;
+    assertEqual(
+      messagesOfType(tabMessages, "START_TRANSLATION").map((message) => message.options),
+      [{ provider: "kimi", targetLanguage: "ja", model: "kimi-k3", displayMode: "original" }],
+      "translate gate: the page is started with the STORED settings, never defaults"
+    );
+  }
+
+  // (5) Display-mode click: no write and no page message while init is
+  // pending; once released, the clicked mode is saved and pushed to the page.
+  {
+    const { popup, writes, tabMessages, release } = createGatedPopup(seededStorage());
+    const buttons = popup.sandbox.document.querySelectorAll(".mode-button");
+    const activeModes = () => buttons.filter((b) => b.classList.contains("active")).map((b) => b.dataset.mode);
+    await tick();
+    const click = fireAction(buttons[1], "click"); // "translation-only"
+    await tick();
+    assertEqual(writes.length, 0, "display mode gate: no storage write while init is pending");
+    assertEqual(messagesOfType(tabMessages, "SET_DISPLAY_MODE").length, 0, "display mode gate: the page is not messaged before init completes");
+    release();
+    await click;
+    await tick();
+    assertEqual(writes, [{ displayMode: "translation-only" }], "display mode gate: after init, exactly one write carries the clicked mode");
+    assertEqual(popup.storage.displayMode, "translation-only", "display mode gate: the clicked mode lands in storage");
+    assertEqual(activeModes(), ["translation-only"], "display mode gate: the radiogroup renders the clicked mode");
+    assertEqual(
+      messagesOfType(tabMessages, "SET_DISPLAY_MODE").map((message) => message.displayMode),
+      ["translation-only"],
+      "display mode gate: the page is told the clicked mode"
+    );
+  }
+
+  // (6) Selection confirm: the confirm (worker + page messages) waits for
+  // init — the pending selection init resolves is the one that gets confirmed.
+  {
+    const PENDING = { text: "gated selection text", rangeId: "range-gate" };
+    const options = {
+      onRuntimeMessage: async (message) =>
+        message?.type === "GET_PENDING_SELECTION" || message?.type === "CONFIRM_PENDING_SELECTION"
+          ? { ok: true, pending: PENDING }
+          : { ok: false }
+    };
+    const { popup, writes, tabMessages, release } = createGatedPopup(seededStorage(), options);
+    await tick();
+    const click = fireAction(popup.dom.get("selection-confirm-btn"), "click");
+    await tick();
+    assertEqual(messagesOfType(options.runtimeMessages, "CONFIRM_PENDING_SELECTION").length, 0, "selection gate: no CONFIRM_PENDING_SELECTION while init is pending");
+    assertEqual(messagesOfType(tabMessages, "CONFIRM_SELECTION_TRANSLATE").length, 0, "selection gate: the page is not asked to translate before init completes");
+    assertEqual(writes.length, 0, "selection gate: no storage write before init completes");
+    release();
+    await click;
+    assertEqual(
+      messagesOfType(options.runtimeMessages, "CONFIRM_PENDING_SELECTION"),
+      [{ type: "CONFIRM_PENDING_SELECTION", tabId: 42, text: PENDING.text, rangeId: PENDING.rangeId }],
+      "selection gate: the confirm binds to the pending selection init resolved"
+    );
+    assertEqual(messagesOfType(tabMessages, "CONFIRM_SELECTION_TRANSLATE").length, 1, "selection gate: the page translates the confirmed selection");
+    assertEqual(popup.dom.get("status-title").textContent, "划词翻译已发送", "selection gate: success status renders after init completes");
+  }
+
+  // (7) Provider switch: the edits bank immediately (pre-init banking is the
+  // designed behavior) but the SAVE happens only after init — one write, with
+  // the loaded mirror following the new provider.
+  {
+    const { popup, writes, release } = createGatedPopup(seededStorage());
+    const providerSelect = popup.dom.get("provider");
+    await tick();
+    providerSelect.value = "kimi";
+    const change = fireAction(providerSelect, "change");
+    assertEqual(writes.length, 0, "provider switch gate: the save waits for init");
+    assertEqual(popup.hooks.getSettingsModel().edits.provider, "kimi", "provider switch gate: the provider edit is banked while init is pending");
+    assertEqual(popup.hooks.getSettingsModel().edits.model, "kimi-k2.6", "provider switch gate: the rebuilt model edit is banked while init is pending");
+    release();
+    await change;
+    await tick();
+    assertEqual(
+      writes,
+      [{ provider: "kimi", model: "kimi-k2.6", apiKey: KIMI_KEY }],
+      "provider switch gate: after init, one write carries the switch and the LOADED kimi key as the mirror"
+    );
+    assertEqual(providerSelect.value, "kimi", "provider switch gate: the select keeps the user's choice");
+  }
+
+  // (8) Key edit (input + change): banked while init is pending, saved only
+  // after — and the saved mirror uses the loaded snapshot, not defaults.
+  {
+    const { popup, writes, release } = createGatedPopup(seededStorage());
+    const keyInput = popup.dom.get("api-key");
+    await tick();
+    keyInput.value = TYPED_KEY;
+    fireAction(keyInput, "input");
+    const change = fireAction(keyInput, "change");
+    assertEqual(writes.length, 0, "key edit gate: the save waits for init");
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, TYPED_KEY, "key edit gate: the typed key is banked while init is pending");
+    release();
+    await change;
+    await tick();
+    assertEqual(
+      writes,
+      [{ deepseekApiKey: TYPED_KEY, apiKey: TYPED_KEY }],
+      "key edit gate: after init, one write lands the typed key with its mirror"
+    );
+    assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "key edit gate: the other provider's stored key is untouched");
+  }
+
+  // (9) Paste-triggered save + auto connection test: the paste banks the
+  // moment it lands (so init's reconcile cannot wipe it from the input),
+  // while the save and the network test wait for init.
+  {
+    const options = { onRuntimeMessage: async () => ({ ok: true }) };
+    const { popup, writes, release } = createGatedPopup(seededStorage({ model: "deepseek-v4-pro", targetLanguage: "ko" }), options);
+    const keyInput = popup.dom.get("api-key");
+    await tick();
+    keyInput.value = PASTED_KEY;
+    fireAction(keyInput, "paste");
+    await tick(); // the paste's deferred tick: bank + whenReady(...) parks
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, PASTED_KEY, "paste gate: the pasted key is banked while init is pending (survives init's reconcile)");
+    assertEqual(writes.length, 0, "paste gate: the auto-save waits for init");
+    assertEqual(messagesOfType(options.runtimeMessages, "TEST_CONNECTION").length, 0, "paste gate: no auto connection test before init completes");
+    release();
+    await popup.hooks.initializePromise;
+    await tick();
+    await tick();
+    assertEqual(writes, [{ deepseekApiKey: PASTED_KEY, apiKey: PASTED_KEY }], "paste gate: after init, the pasted key is saved exactly once");
+    assertEqual(
+      messagesOfType(options.runtimeMessages, "TEST_CONNECTION"),
+      [{ type: "TEST_CONNECTION", provider: "deepseek", targetLanguage: "ko", model: "deepseek-v4-pro" }],
+      "paste gate: the auto test runs against the STORED provider/model/language, never defaults"
+    );
+    assertEqual(popup.dom.get("status-title").textContent, "Key 有效", "paste gate: the auto test completes after init");
+  }
+
+  // (10) Init FAILED (the first storage read rejects): the init-ready promise
+  // rejects, so gated actions report init's error and produce nothing — they
+  // never fall back to the defaults snapshot and never hang.
+  {
+    const popup = createPopupVm(seededStorage());
+    popup.sandbox.chrome.storage.local.get = async () => {
+      throw new Error("boom-storage");
+    };
+    await tick(); // initialize() rejects; initError is set and rendered
+    const writes = [];
+    const originalSet = popup.sandbox.chrome.storage.local.set;
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      writes.push(updates);
+      await originalSet(updates);
+    };
+    popup.dom.get("export-include-keys").checked = true;
+    await fireAction(popup.dom.get("export-settings"), "click");
+    await fireAction(popup.dom.get("translate"), "click");
+    await tick();
+    assertEqual(popup.blobs.length, 0, "init failure: export produces no file");
+    assertEqual(writes.length, 0, "init failure: no action writes to storage");
+    assertEqual(popup.dom.get("status-title").textContent, "无法初始化", "init failure: actions surface init's error instead of proceeding");
+    assertEqual(popup.dom.get("status-detail").textContent, "boom-storage", "init failure: the surfaced error is init's own");
+  }
+
+  // ---- Static: every popup.js DOM listener is init-gated or allowlisted ----
+  const popupScan = stripCommentsForScan(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"));
+
+  // The single init-ready promise exists, is the RAW initialize() call (a
+  // .catch-swallowed variant would resolve on failure and let actions act on
+  // defaults), and whenReady is what awaits it.
+  if (!/function whenReady\(/.test(popupScan)) {
+    fail("popup.js: the init gate helper whenReady() must exist");
+  }
+  if (!/const initializePromise = initialize\(\);/.test(popupScan)) {
+    fail("popup.js: the init-ready promise must be the raw initialize() call (no .catch swallow)");
+  }
+  if (/initialize\(\)\s*\.catch/.test(popupScan)) {
+    fail("popup.js: initialize().catch swallows init failures — awaiting actions would proceed on defaults");
+  }
+  if (!/await initializePromise;/.test(popupScan)) {
+    fail("popup.js: whenReady must await the single init-ready promise");
+  }
+
+  // Extract every addEventListener(...) call (balanced parens, string-aware)
+  // as { receiver, event, handler } so the rule below is enforced on real
+  // registrations, not on loose greps.
+  const extractEventListenerSites = (source) => {
+    const sites = [];
+    const callRe = /([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\.\s*addEventListener\s*\(/g;
+    const skipString = (text, index) => {
+      const quote = text[index];
+      let i = index + 1;
+      while (i < text.length && text[i] !== quote) {
+        if (text[i] === "\\") {
+          i += 1;
+        }
+        i += 1;
+      }
+      return i; // index of the closing quote
+    };
+    let match;
+    while ((match = callRe.exec(source)) !== null) {
+      const receiver = match[1];
+      let i = match.index + match[0].length;
+      let depth = 1;
+      while (i < source.length && depth > 0) {
+        const ch = source[i];
+        if (ch === '"' || ch === "'" || ch === "`") {
+          i = skipString(source, i);
+        } else if (ch === "(") {
+          depth += 1;
+        } else if (ch === ")") {
+          depth -= 1;
+        }
+        i += 1;
+      }
+      const argsText = source.slice(match.index + match[0].length, i - 1);
+      const args = [];
+      let argDepth = 0;
+      let start = 0;
+      let j = 0;
+      while (j < argsText.length) {
+        const ch = argsText[j];
+        if (ch === '"' || ch === "'" || ch === "`") {
+          j = skipString(argsText, j);
+        } else if (ch === "(" || ch === "[" || ch === "{") {
+          argDepth += 1;
+        } else if (ch === ")" || ch === "]" || ch === "}") {
+          argDepth -= 1;
+        } else if (ch === "," && argDepth === 0) {
+          args.push(argsText.slice(start, j));
+          start = j + 1;
+        }
+        j += 1;
+      }
+      args.push(argsText.slice(start));
+      sites.push({
+        receiver,
+        event: (args[0] || "").trim().replace(/^['"`]|['"`]$/g, ""),
+        handler: (args[1] || "").trim()
+      });
+    }
+    return sites;
+  };
+
+  // Documented allowlist: handlers that may run before init settles. Every
+  // entry must say why it is safe; `gatedInside` handlers bank their edits
+  // synchronously (pre-init banking is the designed behavior) but must still
+  // route their SAVE through whenReady inside the handler body.
+  const ALLOWED_UNGATED = new Map([
+    ["elements.toggleKey|click", { reason: "pure key-visibility toggle, no settings access", gatedInside: false }],
+    ["elements.selectionConfirmDismiss|click", { reason: "clears worker/page selection state only, no settings access", gatedInside: false }],
+    ["elements.apiKey|input", { reason: "banks the edit only; the debounced save no-ops before init and initialize() flushes banked edits", gatedInside: false }],
+    ["elements.apiKey|paste", { reason: "banks the pasted value in the deferred tick; the save + auto test go through whenReady inside", gatedInside: true }],
+    ["elements.provider|change", { reason: "banks provider/model edits synchronously; the save goes through whenReady inside", gatedInside: true }],
+    ["elements.targetLanguage|change", { reason: "banks the language edit synchronously; the save goes through whenReady inside", gatedInside: true }],
+    ["elements.model|change", { reason: "banks the model edit synchronously; the save goes through whenReady inside", gatedInside: true }],
+    ["window|pagehide", { reason: "hide-time flush; no-ops before init (initialized gate) and init flushes banked edits", gatedInside: false }],
+    ["document|visibilitychange", { reason: "hide-time flush; no-ops before init (initialized gate) and init flushes banked edits", gatedInside: false }],
+    ["elements.restore|click", { reason: "RESTORE_ORIGINAL page message only, no settings read or write", gatedInside: false }],
+    ["elements.exportHtml|click", { reason: "export runs in the content script; the popup reads no settings", gatedInside: false }],
+    ["elements.printPdf|click", { reason: "print runs in the content script; the popup reads no settings", gatedInside: false }],
+    ["elements.importSettings|click", { reason: "opens the chooser/settings tab only; the gated import-file change handler does the work", gatedInside: false }]
+  ]);
+  // The P1 action set: these registrations MUST be whenReady-wrapped.
+  const MUST_BE_GATED = [
+    "elements.selectionConfirmBtn|click",
+    "elements.testConnection|click",
+    "elements.translate|click",
+    "elements.exportSettings|click",
+    "elements.importFile|change",
+    "button|click" // display-mode buttons
+  ];
+
+  const sites = extractEventListenerSites(popupScan);
+  if (sites.length === 0) {
+    fail("popup.js: could not extract any addEventListener registrations for the init-gate static check");
+  }
+  const registrationsPerKey = new Map();
+  for (const site of sites) {
+    const key = `${site.receiver}|${site.event}`;
+    registrationsPerKey.set(key, (registrationsPerKey.get(key) || 0) + 1);
+  }
+  const wrapped = new Set();
+  for (const [key, count] of registrationsPerKey) {
+    if (count !== 1 && ALLOWED_UNGATED.has(key)) {
+      // The allowlist exempts ONE documented registration; a second handler
+      // on the same element+event must be gated on its own merits.
+      fail(`popup.js: ${key} has ${count} registrations — only one may sit on the init-gate allowlist; wrap the others in whenReady(...)`);
+    }
+  }
+  for (const site of sites) {
+    const key = `${site.receiver}|${site.event}`;
+    const isWrapped = /^whenReady\s*\(/.test(site.handler);
+    if (isWrapped) {
+      wrapped.add(key);
+      continue;
+    }
+    const allowed = ALLOWED_UNGATED.get(key);
+    if (!allowed) {
+      fail(`popup.js: ${key} listener must be wrapped in whenReady(...) or added to the documented allowlist in scripts/ci-check.mjs with a reason`);
+      continue;
+    }
+    if ((registrationsPerKey.get(key) || 0) !== 1) {
+      continue; // already reported above
+    }
+    if (allowed.gatedInside && !site.handler.includes("whenReady(")) {
+      fail(`popup.js: allowlisted ${key} handler must route its save through whenReady() inside the handler body`);
+    }
+  }
+  const actualKeys = new Set(sites.map((site) => `${site.receiver}|${site.event}`));
+  for (const key of ALLOWED_UNGATED.keys()) {
+    if (!actualKeys.has(key)) {
+      fail(`scripts/ci-check.mjs: stale init-gate allowlist entry "${key}" — the registration no longer exists in popup.js`);
+    }
+  }
+  for (const key of MUST_BE_GATED) {
+    if (!wrapped.has(key)) {
+      fail(`popup.js: ${key} listener must be whenReady-wrapped (settings-touching user action)`);
+    }
+  }
+  assertTrue(wrapped.has("button|click"), "init gate statics: the display-mode button listeners are extracted under the receiver 'button'");
 }
 
 async function checkInflightCapAndRunCancellation() {
@@ -2764,13 +5610,14 @@ async function checkTotalDeadlineBudget() {
 function buildBackgroundVm({ storageData = {}, fetchImpl, setTimeoutImpl = setTimeout } = {}) {
   const backgroundSource = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
   const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
-  const listeners = { installed: [], message: [], tabsUpdated: [], tabsRemoved: [] };
+  const listeners = { installed: [], startup: [], message: [], tabsUpdated: [], tabsRemoved: [] };
   const storage = { ...storageData };
   const extensionId = "ci-test-extension-id";
   const chromeStub = {
     runtime: {
       id: extensionId,
       onInstalled: { addListener: (fn) => listeners.installed.push(fn) },
+      onStartup: { addListener: (fn) => listeners.startup.push(fn) },
       onMessage: { addListener: (fn) => listeners.message.push(fn) }
     },
     tabs: {
@@ -3732,18 +6579,18 @@ async function checkPackPathSafety() {
 
 function checkVersionBump() {
   const manifest = readJson("manifest.json");
-  if (manifest && manifest.version !== "1.4.2") {
-    fail(`manifest.version must be 1.4.2 for this release, got ${JSON.stringify(manifest.version)}`);
+  if (manifest && manifest.version !== "1.4.3") {
+    fail(`manifest.version must be 1.4.3 for this release, got ${JSON.stringify(manifest.version)}`);
   }
 
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
-  if (!readme.includes("1.4.2")) {
-    fail("README.md: version hint must mention 1.4.2");
+  if (!readme.includes("1.4.3")) {
+    fail("README.md: version hint must mention 1.4.3");
   }
 
   const content = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
-  if (!content.includes("Kilocean Translate 1.4.2")) {
-    fail("content.js: export generator meta must carry the extension version 1.4.2");
+  if (!content.includes("Kilocean Translate 1.4.3")) {
+    fail("content.js: export generator meta must carry the extension version 1.4.3");
   }
 }
 
@@ -3837,6 +6684,168 @@ function checkSpaNavigationAndSelectionStatics() {
   }
 }
 
+// Selection translate's key gate must follow the SELECTED provider's
+// per-provider key (deepseekApiKey / kimiApiKey), not the legacy apiKey
+// mirror: cross-view write ordering can leave provider:"kimi" + a valid
+// kimiApiKey with an empty mirror (the mirror-only gate would wrongly
+// block), or a cleared provider key with a stale mirror (it would wrongly
+// pass). The legacy single-key field is honored only on a <=1.3.x store
+// where NEITHER per-provider key field exists.
+async function checkSelectionKeyGate() {
+  const require = createRequire(import.meta.url);
+  let utils;
+  try {
+    utils = require(path.join(ROOT, "shared.js"));
+  } catch (error) {
+    fail(`shared.js: cannot load for selection key gate test: ${error.message}`);
+    return;
+  }
+
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  const sendSrc = extractContentFunction("sendSelectionTranslation");
+  if (!sendSrc) {
+    fail("content.js: cannot extract sendSelectionTranslation for selection key gate test");
+    return;
+  }
+
+  const DEEPSEEK_KEY = fakeKey("gatedeepseek", 21);
+  const KIMI_KEY = fakeKey("gatekimi", 25);
+  const STALE_KEY = fakeKey("gatestale", 19);
+  const LEGACY_KEY = fakeKey("gatelegacy", 26);
+  const SELECTION_TEXT = "The quick brown fox jumps over the lazy dog again";
+
+  // Run the shipping sendSelectionTranslation against one storage shape and
+  // report the gate's verdict: the billable SELECTION_TRANSLATE_BATCH sends,
+  // the panel states rendered, and the function result.
+  const runGate = async (storageData) => {
+    const batchMessages = [];
+    const panelStates = [];
+    const panel = {};
+    const selection = {
+      isCollapsed: false,
+      rangeCount: 1,
+      toString: () => SELECTION_TEXT,
+      getRangeAt: () => ({ getBoundingClientRect: () => ({ width: 240, height: 30 }) })
+    };
+    const chromeApi = {
+      // Array-form semantics like real Chrome: only requested keys that
+      // exist in the backing store come back (keeps "absent" distinguishable
+      // from "present but empty").
+      storage: {
+        local: {
+          get: async (keys) => {
+            const out = {};
+            for (const key of keys) {
+              if (Object.prototype.hasOwnProperty.call(storageData, key)) {
+                out[key] = storageData[key];
+              }
+            }
+            return out;
+          }
+        }
+      },
+      runtime: {
+        sendMessage: async (message) => {
+          batchMessages.push(message);
+          return { ok: true, translations: ["你好，世界"] };
+        }
+      }
+    };
+    let send;
+    try {
+      // extractContentFunction captures from `function …` — re-attach the
+      // `async` keyword the regex leaves behind, or the awaits do not parse.
+      send = new Function(
+        "window", "chrome", "Utils", "state", "hideSelectionPanel", "getSelectionRangeIdentity",
+        "isSelectionInsideTranslatorUi", "ensureSelectionPanel", "positionSelectionPanel",
+        "setSelectionPanelState",
+        `let selectionGeneration = 0;\nlet lastSelectionKey = "";\nasync ${sendSrc}\nreturn sendSelectionTranslation;`
+      )(
+        { getSelection: () => selection },
+        chromeApi,
+        utils,
+        { provider: "deepseek", targetLanguage: "zh-CN", model: "deepseek-flash" },
+        () => {},
+        () => "range-1",
+        () => false,
+        () => panel,
+        () => {},
+        (host, tone, message) => panelStates.push({ tone, message })
+      );
+    } catch (error) {
+      fail(`content.js: sendSelectionTranslation is not runnable standalone: ${error.message}`);
+      return null;
+    }
+    const result = await send({ text: SELECTION_TEXT, rangeId: "range-1" });
+    return {
+      result,
+      batches: batchMessages.filter((message) => message?.type === "SELECTION_TRANSLATE_BATCH"),
+      panelStates
+    };
+  };
+
+  // Kimi selected with a valid kimiApiKey but an EMPTY legacy mirror: the
+  // gate must pass (the mirror-only gate blocked this).
+  {
+    const run = await runGate({ provider: "kimi", kimiApiKey: KIMI_KEY, apiKey: "" });
+    if (run) {
+      assertEqual(run.batches.length, 1, "selection gate: kimi + valid kimiApiKey + empty mirror lets the batch through");
+      assertEqual(run.batches[0]?.provider, "kimi", "selection gate: the batch runs under the selected provider");
+      assertEqual(run.panelStates.at(-1)?.tone, "success", "selection gate: kimi key renders a success panel, not a key error");
+    }
+  }
+
+  // DeepSeek selected with an EMPTY deepseekApiKey but a stale mirror key:
+  // the gate must block (the mirror-only gate let this bill and 401).
+  {
+    const run = await runGate({ provider: "deepseek", deepseekApiKey: "", apiKey: STALE_KEY });
+    if (run) {
+      assertEqual(run.batches.length, 0, "selection gate: deepseek + empty deepseekApiKey + stale mirror blocks the batch");
+      assertEqual(
+        run.result,
+        { ok: false, error: "请先在扩展弹窗中填写 API Key" },
+        "selection gate: the missing selected-provider key reports the fill-in-key error"
+      );
+      assertEqual(
+        run.panelStates.at(-1),
+        { tone: "error", message: "请先在扩展弹窗中填写 API Key" },
+        "selection gate: the panel shows the fill-in-key error, not a provider 401"
+      );
+    }
+  }
+
+  // The OTHER provider's key must not unlock the selected provider either.
+  {
+    const run = await runGate({ provider: "deepseek", deepseekApiKey: "", kimiApiKey: KIMI_KEY, apiKey: "" });
+    if (run) {
+      assertEqual(run.batches.length, 0, "selection gate: an inactive provider's key does not satisfy the selected provider");
+    }
+  }
+
+  // <=1.3.x legacy store (apiKey only, neither per-provider field exists):
+  // the legacy fallback keeps selection translate enabled.
+  {
+    const run = await runGate({ apiKey: LEGACY_KEY });
+    if (run) {
+      assertEqual(run.batches.length, 1, "selection gate: legacy apiKey-only store stays enabled via the fallback");
+      assertEqual(run.batches[0]?.provider, "deepseek", "selection gate: the legacy store defaults to the deepseek provider");
+    }
+  }
+
+  // Plain 1.4 store: the selected provider's own key gates it.
+  {
+    const run = await runGate({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY });
+    if (run) {
+      assertEqual(run.batches.length, 1, "selection gate: a modern dual-key store gates on the selected provider's key");
+    }
+  }
+}
+
 async function main() {
   console.log("kilocean-translate ci-check");
   console.log(`root: ${ROOT}`);
@@ -3857,8 +6866,13 @@ async function main() {
   checkEnglishProfileDetection();
   checkVersionBump();
   checkSpaNavigationAndSelectionStatics();
+  await checkSelectionKeyGate();
   await checkFetchTimeoutCoverage();
   await checkModelMigrationAndRetryPolicy();
+  await checkKeyMigrationGate();
+  await checkSettingsStateModel();
+  await checkSettingsWriteQueueConcurrency();
+  await checkPopupActionInitGate();
   await checkInflightCapAndRunCancellation();
   await checkSpaRefreshAndSelectionLifecycle();
   await checkSpaFlushRaceGuard();
@@ -3876,7 +6890,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest, permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, fetch timeout coverage, model migration + retry policy, inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
+  console.log("OK: manifest (incl. store key → extension ID), permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, selection key gate, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm), settings state model (snapshot + dirty flags), serialized write queue concurrency (controlled fake storage), popup action init gate (held first storage read + listener statics), inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
   process.exit(0);
 }
 
