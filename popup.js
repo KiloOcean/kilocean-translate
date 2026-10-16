@@ -210,6 +210,8 @@ let providerKeys = { deepseek: "", kimi: "" };
 // Monotonic token for the paste-triggered key verification: a newer paste
 // (or manual test) invalidates the previous run's status write.
 let keyTestOp = 0;
+// op token of the key test currently in flight (0 = none).
+let keyTestPendingOp = 0;
 /** @type {{ text: string, rangeId: string } | null} */
 let pendingSelection = null;
 
@@ -636,7 +638,8 @@ function renderKeyStatus() {
       row.dataset.tone = "missing";
     }
   }
-  if (String(providerKeys[currentProvider] || "").trim()) {
+  const activeKey = String(providerKeys[currentProvider] || "").trim();
+  if (activeKey && !apiKeyFormatReason(activeKey)) {
     elements.keyGuide.hidden = true;
     elements.keyGuide.classList.remove("highlight");
     elements.apiKey.classList.remove("attention");
@@ -677,7 +680,18 @@ async function handleApiKeyPasted() {
 async function runKeyConnectionTest() {
   const label = PROVIDER_META[currentProvider]?.label || "API";
   const op = ++keyTestOp;
+  keyTestPendingOp = op;
   renderStatus(`正在验证 ${label} Key`, "发送一条最小测试请求", "loading");
+  try {
+    await runKeyConnectionTestInner(op, label);
+  } finally {
+    if (keyTestPendingOp === op) {
+      keyTestPendingOp = 0;
+    }
+  }
+}
+
+async function runKeyConnectionTestInner(op, label) {
   try {
     const settings = await saveSettings();
     const response = await chrome.runtime.sendMessage({
@@ -948,7 +962,7 @@ function renderTranslationStatus(status) {
   updateExportAvailability(status);
 
   if (!status?.active) {
-    setStatus("准备就绪", "可整页翻译，或在页面上划词查看译文", "idle");
+    passiveStatus("准备就绪", "可整页翻译，或在页面上划词查看译文", "idle");
     return;
   }
 
@@ -956,12 +970,12 @@ function renderTranslationStatus(status) {
     const progress = status.total > 0
       ? `已完成 ${status.translated} / ${status.total} 段`
       : "正在识别网页内容";
-    setStatus("正在翻译", progress, "loading");
+    passiveStatus("正在翻译", progress, "loading");
     return;
   }
 
   if (status.phase === "error") {
-    setStatus("翻译失败", status.error || "请检查 API 设置后重试", "error");
+    passiveStatus("翻译失败", status.error || "请检查 API 设置后重试", "error");
     return;
   }
 
@@ -971,7 +985,7 @@ function renderTranslationStatus(status) {
     "translation-only": "仅译文",
     original: "原文"
   }[status.displayMode] || "双语对照";
-  setStatus("翻译已开启", `已翻译 ${status.translated} 段${failureText} · ${modeLabel} · 自动跟译新内容`, "success");
+  passiveStatus("翻译已开启", `已翻译 ${status.translated} 段${failureText} · ${modeLabel} · 自动跟译新内容`, "success");
 }
 
 async function runExportAction(type, pendingTitle, successDetail) {
@@ -1006,6 +1020,16 @@ function updateExportAvailability(status) {
 // so a late validation result can't overwrite it.
 function setStatus(title, detail, tone) {
   keyTestOp += 1;
+  renderStatus(title, detail, tone);
+}
+
+// Passive (polling) updates never cancel an explicitly requested key test
+// and are skipped while one is in flight.
+function passiveStatus(title, detail, tone) {
+  // Only a still-current (not superseded) test suppresses passive updates.
+  if (keyTestPendingOp && keyTestPendingOp === keyTestOp) {
+    return;
+  }
   renderStatus(title, detail, tone);
 }
 

@@ -1239,7 +1239,7 @@ async function checkFetchTimeoutCoverage() {
   ) {
     fail("popup.js: connection-test failure must surface the error message");
   }
-  if (!/setStatus\("翻译失败",\s*status\.error/.test(popup)) {
+  if (!/(?:setStatus|passiveStatus)\("翻译失败",\s*status\.error/.test(popup)) {
     fail("popup.js: page translation failure must surface status.error");
   }
 }
@@ -2068,6 +2068,8 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
       migrateSettings,
       initializePromise,
       getProviderKeys: () => providerKeys,
+      renderTranslationStatus,
+      runKeyConnectionTest,
       buildExportPayload
     };`,
     context,
@@ -2313,6 +2315,8 @@ async function checkKeyMigrationGate() {
       "paste flow: format error explains the expected shape"
     );
     assertEqual(pastePopup.storage.deepseekApiKey, "not-a-key", "paste flow: invalid-shape paste is still saved locally (no silent drop)");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(pasteDom.get("key-guide").hidden, false, "paste flow: correction guide stays visible after async save of a malformed key");
     assertEqual(pastePopup.storage.kimiApiKey, KIMI_KEY, "paste flow: saving the DeepSeek input never wipes the stored Kimi key");
 
     pasteDom.get("api-key").value = DEEPSEEK_KEY;
@@ -2327,6 +2331,28 @@ async function checkKeyMigrationGate() {
       `已配置 · 尾号 ${DEEPSEEK_KEY.slice(-4)}`,
       "paste flow: key status refreshes after save"
     );
+  }
+
+  // ---- Passive status polling must not cancel an in-flight key test ----
+  {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const pollPopup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: "", model: "deepseek-flash" },
+      { runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? gate : { ok: false }) }
+    );
+    await pollPopup.hooks.initializePromise;
+    const testDone = pollPopup.hooks.runKeyConnectionTest();
+    pollPopup.hooks.renderTranslationStatus({ active: false });
+    assertTrue(
+      String(pollPopup.dom.get("status-title").textContent).startsWith("正在验证"),
+      "poll: passive status update is suppressed while a key test is in flight"
+    );
+    release({ ok: true });
+    await testDone;
+    assertEqual(pollPopup.dom.get("status-title").textContent, "Key 有效", "poll: key test result survives a concurrent poll");
+    pollPopup.hooks.renderTranslationStatus({ active: false });
+    assertEqual(pollPopup.dom.get("status-title").textContent, "准备就绪", "poll: passive updates resume after the test completes");
   }
 
   // ---- Settings import/export (popup vm): schema validation + no-wipe merge ----
