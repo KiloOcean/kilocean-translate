@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "千浩翻译 · Kilocean Translate",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Kilocean 千浩翻译：DeepSeek / Kimi 自备 Key，双语对照整页翻译、划词翻译，自动跟译。权限极小，Key 只存在本机。无登录、无会员墙。",
   "minimum_chrome_version": "102",
   "permissions": [

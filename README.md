@@ -12,7 +12,7 @@ Chrome / Edge 扩展：用你自己的 DeepSeek 或 Kimi（Moonshot）API Key，
 - 整页渐进式翻译，不必等全部完成
 - 自动跟译滚动 / 交互后新加载的内容
 - 目标语言：简体中文、繁体中文、英语、日语、韩语
-- 支持 DeepSeek V4 Flash / V4 Pro，以及 Kimi（K2.6 / K3 / Moonshot V1 128k）
+- 支持 DeepSeek Flash / V4 Pro，以及 Kimi（K2.6 / K3 / Moonshot V1 128k）
 - 一键清除译文并恢复页面
 - 导出翻译后 HTML；打印 / 保存 PDF
 - 自动跳过代码、输入框、链接、纯数字
@@ -34,7 +34,7 @@ Chrome / Edge 扩展：用你自己的 DeepSeek 或 Kimi（Moonshot）API Key，
 
 ## 商店包
 
-正式发布请用商店后台上传的 zip（勿把含密钥的本地配置打进包）。当前版本见 `manifest.json`（1.4.1）。
+正式发布请用商店后台上传的 zip（勿把含密钥的本地配置打进包）。当前版本见 `manifest.json`（1.4.2）。
 
 ## 隐私
 

@@ -34,10 +34,16 @@
   // Generic sites keep the full-page behavior.
   const IS_X_HOST = Utils.isXHost(location.hostname);
 
-  /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, wraps: HTMLElement[], companion: HTMLElement, layout: string}>} */
+  /** @type {Map<Element, {block: Element, originalText: string, translation: string, wrap: HTMLElement|null, wraps: HTMLElement[], companion: HTMLElement, layout: string, nested: Element[]}>} */
   const blockRecords = new Map();
   const pendingRoots = new Set();
   const pendingRefreshBlocks = new Set();
+  // Extension-created original wraps. The data-kilocean-original-wrap
+  // attribute alone is page-settable — any site can plant it on its own
+  // hidden span and step our hidden-content walk over it — so ownership is
+  // recorded here at creation time and only members of this set count as
+  // ours (hasHiddenAncestor bypass, refresh triggers, mutation ownership).
+  const ownedOriginalWraps = new WeakSet();
   /** Blocks holding a failure slot in state.failed — a retry replaces the slot. */
   const failedBlocks = new Set();
 
@@ -67,6 +73,31 @@
   let activeRunSettings = null;
   /** @type {{ provider?: string, targetLanguage?: string, model?: string } | null} */
   let deferredRunSettings = null;
+  /** Last seen URL for same-document SPA navigation detection. */
+  let lastSeenUrl = location.href;
+  /**
+   * Blocks whose source the provider already echoed back unchanged under the
+   * current run settings — re-requesting them would only re-bill. Keyed by
+   * block element, invalidated by comparing text + run settings on read.
+   * @type {WeakMap<Element, { text: string, provider: string, targetLanguage: string, model: string }>}
+   */
+  const skippedEchoBlocks = new WeakMap();
+  // Bounded LRU of source→translation under the current run settings:
+  // virtualized lists remount tweets with identical text, and re-requesting
+  // the same source would only re-bill the provider. Keyed by text + provider
+  // + target + model so any run-setting change misses; displayMode only
+  // picks how an entry is rendered, never its content, so toggling it keeps
+  // hitting the same cache. Cleared when the session ends (restoreOriginal).
+  const TRANSLATION_CACHE_LIMIT = 500;
+  /** @type {Map<string, string>} */
+  const translationCache = new Map();
+  // In-flight TRANSLATE_BATCH slot accounting, shared across ALL run
+  // generations: a generation bump abandons the old run's queue, but its
+  // provider requests (and worker-side retries) stay on the wire and stay
+  // billed, so the cap must survive SPA navigation / restore / restart and
+  // is never reset to zero by them.
+  let inflightTranslateBatches = 0;
+  const inflightTranslateWaiters = [];
 
   const state = {
     active: false,
@@ -77,13 +108,14 @@
     error: "",
     provider: "deepseek",
     targetLanguage: "zh-CN",
-    model: "deepseek-v4-flash",
+    model: "deepseek-flash",
     displayMode: Utils.DISPLAY_MODES.bilingual
   };
 
   ensureTranslatorStyles();
   applyDocumentDisplayMode(state.displayMode);
   setupSelectionTranslate();
+  setupSpaNavigationWatch();
 
   chrome.storage.local.get({
     displayMode: Utils.DISPLAY_MODES.bilingual,
@@ -99,7 +131,9 @@
       state.targetLanguage = stored.targetLanguage;
     }
     if (stored.model) {
-      state.model = stored.model;
+      // Map legacy deepseek-v4-flash → deepseek-flash on read; background's
+      // loadSettings persists the rename.
+      state.model = Utils.migrateModelName(stored.model);
     }
     applyDocumentDisplayMode(state.displayMode);
     refreshAllBlockDisplays();
@@ -129,10 +163,10 @@
       if (state.active) {
         deferredRunSettings = {
           ...(deferredRunSettings || {}),
-          model: changes.model.newValue
+          model: Utils.migrateModelName(changes.model.newValue)
         };
       } else {
-        state.model = changes.model.newValue;
+        state.model = Utils.migrateModelName(changes.model.newValue);
       }
     }
     if (changes.provider?.newValue) {
@@ -246,7 +280,7 @@
   async function startTranslation(options) {
     const provider = options.provider === "kimi" ? "kimi" : "deepseek";
     const targetLanguage = options.targetLanguage || "zh-CN";
-    const model = options.model || "deepseek-v4-flash";
+    const model = Utils.migrateModelName(options.model) || "deepseek-flash";
     let displayMode = Utils.normalizeDisplayMode(
       options.displayMode || state.displayMode || Utils.DISPLAY_MODES.bilingual
     );
@@ -271,12 +305,14 @@
       restoreOriginal({ silent: true });
     }
 
+    const abandonedRunId = generation;
     generation += 1;
     const runId = generation;
     // Detach from the cancelled run's queue tail: its in-flight network results
     // are already invalidated by the bump, so this run must not wait on them.
     // The stale chain keeps its own catch, so its late settle cannot reject here.
     workQueue = Promise.resolve();
+    cancelAbandonedRunBatches(abandonedRunId);
     deferredRunSettings = null;
     activeRunSettings = { provider, targetLanguage, model };
     Object.assign(state, {
@@ -391,14 +427,19 @@
   }
 
   function restoreOriginal(options = {}) {
+    const abandonedRunId = generation;
     generation += 1;
     // Drop the cancelled run's queue tail — a fresh startTranslation chained on
     // the old workQueue would otherwise wait on stale in-flight requests.
     workQueue = Promise.resolve();
+    cancelAbandonedRunBatches(abandonedRunId);
     stopObserving();
     activeRunSettings = null;
     deferredRunSettings = null;
     failedBlocks.clear();
+    // Session end: cached translations belong to the translated session, not
+    // to the restored page.
+    translationCache.clear();
 
     for (const record of blockRecords.values()) {
       teardownBlockRecord(record);
@@ -418,6 +459,88 @@
     if (!options.silent) {
       showToast("已恢复原文", "info");
     }
+  }
+
+  function setupSpaNavigationWatch() {
+    // X (and other SPAs) navigate via history.pushState without reloading the
+    // document, so this content script stays alive across views. Page script
+    // may patch history methods, so polling location.href is the only signal
+    // we can trust; popstate/hashchange merely accelerate detection of the
+    // navigations that do fire an event. Both are plain window events, safe
+    // to hear from the content-script isolated world; pushState itself fires
+    // nothing observable without page-script injection, which we never do.
+    window.addEventListener("popstate", () => {
+      checkSpaNavigation();
+    }, true);
+    window.addEventListener("hashchange", () => {
+      checkSpaNavigation();
+    }, true);
+    setInterval(checkSpaNavigation, 500);
+  }
+
+  // URL identity for SPA navigation ignores the fragment: an in-page anchor
+  // jump (#feed → #about) keeps the same document view and must not abort the
+  // running translation session as if it were a navigation.
+  function spaNavigationUrl(href) {
+    const value = String(href || "");
+    const hashAt = value.indexOf("#");
+    return hashAt === -1 ? value : value.slice(0, hashAt);
+  }
+
+  /** @returns {boolean} true when a navigation was detected and handled. */
+  function checkSpaNavigation() {
+    if (spaNavigationUrl(location.href) === spaNavigationUrl(lastSeenUrl)) {
+      return false;
+    }
+    lastSeenUrl = location.href;
+    handleSpaNavigation();
+    return true;
+  }
+
+  function handleSpaNavigation() {
+    if (!state.active) {
+      // Fresh documents/tabs start inactive — no auto-translate there. This
+      // handler only continues a session the user started in this tab.
+      return;
+    }
+    // Same-tab in-app navigation: abort the old view's in-flight run. Bumping
+    // the generation marks every late response stale, so aborted segments are
+    // ignored (never counted as failures, never toasted), and detaching the
+    // queue tail means the next run cannot wait on the cancelled chain. The
+    // session itself survives: still-connected blocks keep their translations
+    // and the new view gets translated below, until the user clears/restores.
+    const abandonedRunId = generation;
+    generation += 1;
+    cancelAbandonedRunBatches(abandonedRunId);
+    workQueue = Promise.resolve();
+    pendingRoots.clear();
+    // Keep refresh entries whose blocks survived the view swap (still
+    // connected): the scheduled flush re-validates each one against its
+    // recorded source text. Only blocks that left the DOM with the old view
+    // are dropped here.
+    for (const block of pendingRefreshBlocks) {
+      if (!block?.isConnected) {
+        pendingRefreshBlocks.delete(block);
+      }
+    }
+    failedBlocks.clear();
+    if (dynamicTimer) {
+      clearTimeout(dynamicTimer);
+      dynamicTimer = null;
+    }
+    // Drop records that left the DOM with the old view; route-shared chrome
+    // that is still connected keeps its translation — no re-billing.
+    pruneDetachedBlockRecords();
+    state.translated = blockRecords.size;
+    state.total = blockRecords.size;
+    state.failed = 0;
+    state.error = "";
+    state.phase = "translating";
+    notifyPopupStatus();
+    // Re-discover once the SPA swap settles; the dynamic path reuses the
+    // pinned run settings and every runId race-token check.
+    pendingRoots.add(document.body || document.documentElement);
+    scheduleDynamicTranslation();
   }
 
   function teardownBlockRecord(record) {
@@ -504,14 +627,70 @@
   // Full gate for a candidate block text: translatable shape, not page chrome
   // (@handle / URL / counter / bare date), and not already in the target
   // language (re-translating those duplicates them: "Home Home", "宝玉宝玉").
-  function shouldTranslateBlockText(text, targetLanguage) {
+  function shouldTranslateBlockText(text, targetLanguage, block) {
     if (!Utils.isTranslatableText(text, targetLanguage)) {
       return false;
     }
     if (Utils.isSkippableText(text)) {
       return false;
     }
-    return !Utils.isAlreadyTargetLanguage(text, targetLanguage);
+    if (Utils.isAlreadyTargetLanguage(text, targetLanguage)) {
+      return false;
+    }
+    return !isSkippedEchoBlock(block, text);
+  }
+
+  // True when the provider already echoed this exact source back unchanged
+  // under the same run settings: re-requesting it would only re-bill for
+  // another echo. The cached skip self-invalidates by comparison — a changed
+  // source text or a changed provider/target/model run simply stops matching.
+  function isSkippedEchoBlock(block, text) {
+    if (!block) {
+      return false;
+    }
+    const skipped = skippedEchoBlocks.get(block);
+    if (!skipped || skipped.text !== text) {
+      return false;
+    }
+    const runSettings = getRunSettings();
+    return skipped.provider === runSettings.provider &&
+      skipped.targetLanguage === runSettings.targetLanguage &&
+      skipped.model === runSettings.model;
+  }
+
+  function translationCacheKey(text, runSettings) {
+    return [
+      runSettings.provider,
+      runSettings.targetLanguage,
+      runSettings.model,
+      text
+    ].join("\u0000");
+  }
+
+  function getCachedTranslation(text, runSettings) {
+    const key = translationCacheKey(text, runSettings);
+    if (!translationCache.has(key)) {
+      return null;
+    }
+    const translation = translationCache.get(key);
+    // Refresh recency: Map iterates in insertion order, so delete+set moves
+    // the entry to the back (most recently used).
+    translationCache.delete(key);
+    translationCache.set(key, translation);
+    return translation;
+  }
+
+  function setCachedTranslation(text, translation, runSettings) {
+    if (typeof translation !== "string" || !translation.trim()) {
+      return;
+    }
+    const key = translationCacheKey(text, runSettings);
+    translationCache.delete(key);
+    translationCache.set(key, translation);
+    if (translationCache.size > TRANSLATION_CACHE_LIMIT) {
+      const oldestKey = translationCache.keys().next().value;
+      translationCache.delete(oldestKey);
+    }
   }
 
   function collectBlocks(root) {
@@ -529,7 +708,7 @@
       // blocks are not re-walked per text node (quadratic discovery).
       seen.add(block);
       const fullText = extractBlockText(block);
-      if (!shouldTranslateBlockText(fullText, targetLanguage)) {
+      if (!shouldTranslateBlockText(fullText, targetLanguage, block)) {
         continue;
       }
       blocks.push(block);
@@ -552,7 +731,7 @@
         continue;
       }
       const ownText = extractBlockText(block, nested);
-      if (shouldTranslateBlockText(ownText, targetLanguage)) {
+      if (shouldTranslateBlockText(ownText, targetLanguage, block)) {
         withOwnText.push(block);
       }
     }
@@ -644,6 +823,15 @@
 
   function hasHiddenAncestor(el) {
     for (let cur = el; cur; cur = cur.parentElement) {
+      // Our own original wraps sit at display:none in translation-only mode —
+      // that is a display preference, not invisible content. Skipping them
+      // here would blind extractBlockText during refresh comparison (empty
+      // text ≠ recorded original → false "source changed" → re-bill), so the
+      // walk steps over them. Page-owned hidden ancestors still count, and
+      // discovery stays safe because recorded blocks are excluded earlier.
+      if (isOwnedOriginalWrap(cur)) {
+        continue;
+      }
       if (isHiddenElement(cur)) {
         return true;
       }
@@ -893,7 +1081,7 @@
     for (const block of candidates) {
       const nested = descendantsOf.get(block) || [];
       const text = extractBlockText(block, nested);
-      if (!shouldTranslateBlockText(text, runSettings.targetLanguage)) {
+      if (!shouldTranslateBlockText(text, runSettings.targetLanguage, block)) {
         continue;
       }
       segments.push({
@@ -928,6 +1116,10 @@
 
     const batches = Utils.chunkSegments(segments, 5000, 24);
 
+    // Concurrency cap: at most Utils.MAX_INFLIGHT_TRANSLATE_BATCHES batches
+    // may be in flight. The sequential loop below (one await per batch) keeps
+    // a run at 1, safely under the cap — never parallelize past it or the
+    // provider starts answering with 429s.
     for (const batch of batches) {
       if (runId !== generation) {
         return;
@@ -1019,26 +1211,80 @@
     return adjustSplitAwayFromSurrogatePair(mid);
   }
 
-  async function requestSegmentTranslations(texts, runId, runSettings) {
-    const response = await chrome.runtime.sendMessage({
-      type: "TRANSLATE_BATCH",
-      texts,
-      provider: runSettings.provider || "deepseek",
-      targetLanguage: runSettings.targetLanguage,
-      model: runSettings.model
+  // Cap concurrent TRANSLATE_BATCH sends at MAX_INFLIGHT_TRANSLATE_BATCHES
+  // across ALL generations: abandoned generations keep their slots until
+  // their requests settle, so a fresh run after an SPA navigation queues
+  // behind the stale run's in-flight batches instead of stacking on top of
+  // them (which would breach the provider cap and earn 429s).
+  function acquireInflightTranslateSlot(runId) {
+    if (inflightTranslateBatches < Utils.MAX_INFLIGHT_TRANSLATE_BATCHES) {
+      inflightTranslateBatches += 1;
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      inflightTranslateWaiters.push(() => resolve(runId === generation));
     });
+  }
 
-    if (!response?.ok) {
-      const error = new Error(response?.error || "翻译请求失败");
-      error.canSplit = Boolean(response?.canSplit);
-      throw error;
+  function releaseInflightTranslateSlot() {
+    const next = inflightTranslateWaiters.shift();
+    if (next) {
+      // Hand the slot straight to the next waiter — the count stays put.
+      next();
+      return;
     }
+    inflightTranslateBatches = Math.max(0, inflightTranslateBatches - 1);
+  }
 
-    if (runId !== generation) {
-      return null;
+  // Tell the worker a run generation is abandoned (SPA navigation / restore /
+  // fresh start): its in-flight TRANSLATE_BATCHes and their worker-side
+  // backoff retries would only re-bill a generation whose results this side
+  // drops anyway. Best-effort — the worker may be waking up.
+  function cancelAbandonedRunBatches(runId) {
+    if (!Number.isInteger(runId)) {
+      return;
     }
+    try {
+      void chrome.runtime.sendMessage({
+        type: "CANCEL_TRANSLATE_BATCHES",
+        runId
+      }).catch(() => {});
+    } catch {
+      // Extension context may be gone during teardown.
+    }
+  }
 
-    return response.translations;
+  async function requestSegmentTranslations(texts, runId, runSettings) {
+    await acquireInflightTranslateSlot(runId);
+    try {
+      // Stale while queued behind full slots (navigation bumped the
+      // generation) — sending would only re-bill a dead run.
+      if (runId !== generation) {
+        return null;
+      }
+      const response = await chrome.runtime.sendMessage({
+        type: "TRANSLATE_BATCH",
+        texts,
+        runId,
+        provider: runSettings.provider || "deepseek",
+        targetLanguage: runSettings.targetLanguage,
+        model: runSettings.model
+      });
+
+      if (!response?.ok) {
+        const error = new Error(response?.error || "翻译请求失败");
+        error.canSplit = Boolean(response?.canSplit);
+        throw error;
+      }
+
+      if (runId !== generation) {
+        return null;
+      }
+
+      return response.translations;
+    } finally {
+      releaseInflightTranslateSlot();
+    }
   }
 
   function isWhitespaceDelimitedTarget(targetLanguage) {
@@ -1198,10 +1444,37 @@
       return false;
     }
 
+    // Provider echoed the source back unchanged (text already reads as the
+    // target language): inserting a block would only duplicate it on screen.
+    // Count as skipped — reclaim any failure slot and drop the total slot —
+    // never as a failure. Cache the skip for this block + source text + run
+    // settings so a rescan does not re-request (and re-bill) the same echo.
+    if (Utils.isSameTranslation(segment.text, rendered)) {
+      const runSettings = getRunSettings();
+      skippedEchoBlocks.set(segment.block, {
+        text: segment.text,
+        provider: runSettings.provider,
+        targetLanguage: runSettings.targetLanguage,
+        model: runSettings.model
+      });
+      if (failedBlocks.delete(segment.block)) {
+        if (state.failed > 0) {
+          state.failed -= 1;
+        }
+      }
+      if (state.total > 0) {
+        state.total -= 1;
+      }
+      return true;
+    }
+
     applyBlockTranslation(segment.block, segment.text, rendered, {
       companionOnly: Boolean(segment.companionOnly),
       nested: segment.nested || []
     });
+    // Store only real (validated, non-echo) translations — the cache must
+    // never resurrect an echo as an insertable "translation".
+    setCachedTranslation(segment.text, rendered, getRunSettings());
     if (failedBlocks.delete(segment.block)) {
       // Dynamic retry landed for a previously failed block — reclaim its
       // failure slot instead of counting the block as both failed and translated.
@@ -1214,6 +1487,23 @@
   }
 
   async function translateBatchWithFallback(batch, runId, runSettings = getRunSettings()) {
+    // Cache-first: virtualized-list remounts re-request identical text under
+    // identical run settings; a hit re-inserts the stored translation without
+    // a billable request. Misses (and blocks whose source changed since) fall
+    // through to the normal request path.
+    const uncached = [];
+    for (const segment of batch) {
+      const cached = runId === generation ? getCachedTranslation(segment.text, runSettings) : null;
+      if (cached != null && applyTranslatedSegment(segment, cached)) {
+        continue;
+      }
+      uncached.push(segment);
+    }
+    if (uncached.length === 0) {
+      return;
+    }
+    batch = uncached;
+
     // Oversized single block: split before the first request (413 may never recover otherwise).
     if (batch.length === 1 && batch[0].text.length > 5000 && runId === generation) {
       const segment = batch[0];
@@ -1329,8 +1619,9 @@
       if (!textNode?.isConnected || textNode.parentElement == null) {
         continue;
       }
-      if (textNode.parentElement.hasAttribute?.("data-kilocean-original-wrap")) {
-        // Already wrapped by us (e.g. prior pass) — do not adopt page-owned same-class nodes.
+      if (isOwnedOriginalWrap(textNode.parentElement)) {
+        // Already wrapped by us (e.g. prior pass). Page-owned nodes merely
+        // carrying the attribute are not ours and still get wrapped.
         continue;
       }
       if (!/\S/u.test(textNode.data || "")) {
@@ -1339,6 +1630,9 @@
       const wrap = document.createElement(wrapTag === "div" ? "span" : wrapTag);
       wrap.className = "kilocean-original-wrap";
       wrap.setAttribute("data-kilocean-original-wrap", "true");
+      // The attribute stays for the CSS display toggle; real ownership is
+      // the WeakSet — page-planted same-attribute nodes are never ours.
+      ownedOriginalWraps.add(wrap);
       // Not UI-marked: SPA edits to owned original text must still refresh.
       textNode.parentNode.insertBefore(wrap, textNode);
       wrap.appendChild(textNode);
@@ -1461,7 +1755,8 @@
         wrap,
         wraps: createdWraps,
         companion,
-        layout
+        layout,
+        nested: options.nested || []
       };
       blockRecords.set(block, record);
       applyBlockDisplay(record);
@@ -1621,11 +1916,19 @@
   }
 
   function isOwnedOriginalWrap(el) {
-    return Boolean(el?.hasAttribute?.("data-kilocean-original-wrap"));
+    // Ownership is WeakSet membership, never the attribute: the page can set
+    // data-kilocean-original-wrap on its own nodes (hidden-content bypass),
+    // but only wraps created by wrapTextNodesForToggle ever enter the set.
+    return ownedOriginalWraps.has(el);
   }
 
   function isInsideOriginalWrap(el) {
-    return Boolean(el?.closest?.("[data-kilocean-original-wrap]"));
+    for (let cur = el; cur; cur = cur.parentElement) {
+      if (isOwnedOriginalWrap(cur)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function isExtensionOwnedNode(node) {
@@ -1695,6 +1998,62 @@
       return null;
     }
     return host;
+  }
+
+  // True when a current eligible source text node of the block lives outside
+  // every owned original wrap: the SPA re-rendered equivalent text around our
+  // still-connected wraps, and that bare node would stay visible untranslated
+  // in translation-only mode unless repair rebuilds for it as well. Uses the
+  // same eligibility filter wrapTextNodesForToggle applies when collecting
+  // nodes it would wrap.
+  function hasUnwrappedOriginalTextNode(block, nestedBlocks) {
+    const nested = (nestedBlocks || []).filter(Boolean);
+    return collectRawTextNodes(block).some((node) => (
+      !nested.some((other) => other !== block && other.contains(node)) &&
+      !(block && !INTERACTIVE_TAGS.has(block.tagName) && isInsideInteractiveDescendant(node, block)) &&
+      !isOwnedOriginalWrap(node.parentElement)
+    ));
+  }
+
+  // Same source text but the SPA re-rendered the DOM around it: our own
+  // original wraps (and possibly the companion) left the tree with the old
+  // subtree, or fresh text nodes appeared outside every wrap. Rebuild the
+  // record's owned DOM from the cached translation — never via a fresh
+  // TRANSLATE_BATCH — so translation-only toggling and the visible
+  // translation survive equivalent-text re-renders without re-billing.
+  function repairBlockRecordDom(record) {
+    if (!record?.block?.isConnected) {
+      return;
+    }
+    const gen = beginApplyingDom();
+    try {
+      const wraps = record.wraps || [];
+      if (
+        wraps.length === 0 ||
+        wraps.some((wrap) => !wrap?.isConnected) ||
+        hasUnwrappedOriginalTextNode(record.block, record.nested)
+      ) {
+        const rebuilt = wrapTextNodesForToggle(record.block, record.nested || [], "span");
+        if (rebuilt.wraps.length > 0) {
+          // wrapTextNodesForToggle skips nodes already inside owned wraps, so a
+          // partial rebuild yields only the NEW wraps — keep the still-connected
+          // old ones too, or a later teardown could never unwrap them.
+          record.wraps = wraps.filter((wrap) => wrap?.isConnected).concat(rebuilt.wraps);
+          record.wrap = rebuilt.firstWrap || record.wrap;
+        }
+      }
+      if (record.companion && !record.companion.isConnected) {
+        if (record.layout === "after") {
+          // relocateAfterHostCompanion re-inserts the detached sibling after
+          // the host and manages its own applyingDom guard.
+          relocateAfterHostCompanion(record);
+        } else {
+          record.block.appendChild(record.companion);
+        }
+      }
+    } finally {
+      endApplyingDom(gen);
+    }
   }
 
   function relocateAfterHostCompanion(record) {
@@ -1954,17 +2313,45 @@
     }
     dynamicTimer = setTimeout(() => {
       dynamicTimer = null;
+      // The 450 ms debounce can land between the 500 ms SPA poll ticks:
+      // right after a pushState route swap, the new view's queued mutations
+      // would flush under the pre-navigation generation — those requests stay
+      // billed even after the poll catches up, bumps the generation and
+      // re-discovers the same content. Reconcile the URL synchronously before
+      // this flush can issue anything; when a navigation was handled,
+      // handleSpaNavigation has already bumped the generation, dropped the
+      // stale pendingRoots and re-armed discovery from document.body, so this
+      // flush must simply stop and let the re-queued one run.
+      if (checkSpaNavigation()) {
+        return;
+      }
       pruneDetachedBlockRecords();
 
       // X "Show more" expands a recorded tweetText in place: that content
-      // mutation lands in pendingRefreshBlocks, discardBlockRecord below
-      // removes the stale translation block + wraps, and the dynamic pass
-      // re-translates the full text in place. No extra observer needed.
+      // mutation lands in pendingRefreshBlocks, and only a real source-text
+      // change (current text vs. the recorded original) tears the block down
+      // — discardBlockRecord removes the stale companion translation + wraps
+      // and the dynamic pass re-translates the expanded text in place (the
+      // new translation replaces the old block; no duplicate companion).
+      // Equivalent-text churn (SPA re-render of the same words) keeps the
+      // live translation: no teardown, no re-bill — extractBlockText reads
+      // through our own translation-only display:none wraps, and if the
+      // re-render swapped out our owned DOM, repairBlockRecordDom rebuilds
+      // it from the cached translation instead of re-requesting.
+      // The comparison must extract exactly the way record.originalText was
+      // captured: excluding record.nested (separately-translated descendant
+      // blocks). Including their text would flag every ancestor-of-translated
+      // block as "source changed" and tear it down for a pointless re-bill.
       for (const block of pendingRefreshBlocks) {
-        if (blockRecords.has(block)) {
+        const record = blockRecords.get(block);
+        if (record && block.isConnected) {
+          if (extractBlockText(block, record.nested || []) === record.originalText) {
+            repairBlockRecordDom(record);
+            continue;
+          }
           discardBlockRecord(block);
         }
-        if (block?.isConnected) {
+        if (block?.isConnected && !blockRecords.has(block)) {
           pendingRoots.add(block);
         }
       }
@@ -2031,7 +2418,7 @@
     base.setAttribute("href", document.baseURI || location.href);
     const generator = document.createElement("meta");
     generator.setAttribute("name", "generator");
-    generator.setAttribute("content", "千浩翻译 · Kilocean Translate 1.3.0");
+    generator.setAttribute("content", "千浩翻译 · Kilocean Translate 1.4.2");
     const source = document.createElement("meta");
     source.setAttribute("name", "deepseek-translator-source");
     source.setAttribute("content", location.href);
@@ -2182,12 +2569,12 @@
     // also run when the host was already removed (dismissed earlier), or a
     // stale key from the previous request dead-ends the next identical drag
     // with 该选中文本已翻译.
-    // ×/Escape still go through hideSelectionPanel with the key retained.
+    // The card itself stays open on a blank-page/outside press: only ×,
+    // Escape, or a new selection replacing it may close it. Billing safety is
+    // unchanged — the popup confirm revalidates the live Selection against
+    // the previewed gesture before anything is billed.
     if (event.isTrusted !== false) {
       lastSelectionKey = "";
-    }
-    if (host) {
-      hideSelectionPanel();
     }
   }
 
@@ -2231,22 +2618,28 @@
 
     // Invalidate in-flight storage awaits when the live selection actually
     // changed (keyboard mid-await). Unchanged Shift must not bump or an
-    // in-flight TRANSLATE_BATCH response would be discarded.
+    // in-flight TRANSLATE_BATCH response would be discarded. A collapse to
+    // empty (blank click) must not bump either: a confirmed request is
+    // already billed and its card outlives the selection — bumping here is
+    // what stranded the card at loading forever.
     const snapshot = gesture ? `${gesture.text}\0${gesture.rangeId}` : "";
     if (snapshot !== lastScheduledSelectionSnapshot) {
       lastScheduledSelectionSnapshot = snapshot;
-      selectionGeneration += 1;
+      if (snapshot) {
+        // Only a NEW non-empty selection may supersede in-flight work.
+        selectionGeneration += 1;
+      }
     }
     if (selectionTimer) {
       clearTimeout(selectionTimer);
       selectionTimer = null;
     }
     if (!gesture) {
-      // Collapsed / empty / oversized at gesture time — clean up synchronously
-      // and never schedule a handler that could bill a selection a page
-      // injects after the delay.
+      // Collapsed / empty / oversized at gesture time — never schedule a
+      // handler that could bill a selection a page injects after the delay.
+      // The card stays open (only ×/Escape/a new selection closes it); just
+      // reset the dedupe key so re-selecting the same range bills again.
       lastSelectionKey = "";
-      hideSelectionPanel();
       return;
     }
     selectionTimer = setTimeout(() => {
@@ -2344,9 +2737,10 @@
 
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-      // Real selection change (collapse / clear) — allow the same words again later.
+      // Real selection change (collapse / clear) — allow the same words again
+      // later. The card stays open per the dismissal rules (×/Escape/new
+      // selection); nothing new is previewed for the collapsed selection.
       lastSelectionKey = "";
-      hideSelectionPanel();
       return;
     }
 
@@ -2358,13 +2752,12 @@
     // trusted gesture: text swapped in by page script during the debounce must
     // never reach the preview (or the later TRANSLATE_BATCH). Any rejection
     // clears the prior key so reselecting a previously translated range is not
-    // silently no-op'd by stale dedupe.
+    // silently no-op'd by stale dedupe. The card itself keeps its last state.
     if (
       selection.toString().replace(/\s+/gu, " ").trim() !== gesture.text ||
       getSelectionRangeIdentity(selection) !== gesture.rangeId
     ) {
       lastSelectionKey = "";
-      hideSelectionPanel();
       return;
     }
 
@@ -2499,7 +2892,7 @@
       // Keep selection provider/target/model local — never clobber pinned page-run state.
       const provider = stored.provider === "kimi" ? "kimi" : "deepseek";
       const targetLanguage = stored.targetLanguage || state.targetLanguage;
-      const model = stored.model || state.model;
+      const model = Utils.migrateModelName(stored.model) || state.model;
 
       if (!Utils.isTranslatableText(gesture.text, targetLanguage)) {
         // Range changed to non-translatable text — drop stale dedupe key.
@@ -2552,23 +2945,26 @@
       }
 
       // Revalidate the live Selection after the network await (same pattern as
-      // the storage await) — never publish a stale translation into a changed
-      // or collapsed selection. `gesture.text` / `gesture.rangeId` are what
-      // was sent.
+      // the storage await) — never publish a stale translation into a CHANGED
+      // selection. A merely collapsed/cleared selection (blank click after
+      // confirm) must NOT discard: the request was consented in the popup and
+      // is already billed, so its lifecycle belongs to the card, which stays
+      // open per the dismissal rules. `gesture.text` / `gesture.rangeId` are
+      // what was sent.
       const postNetworkSel = window.getSelection();
-      if (!postNetworkSel || postNetworkSel.isCollapsed || postNetworkSel.rangeCount === 0) {
-        lastSelectionKey = "";
-        hideSelectionPanel();
-        return { ok: false, error: "划词已收起，译文已丢弃" };
-      }
-      const postNetworkText = postNetworkSel.toString().replace(/\s+/gu, " ").trim();
-      const postNetworkRangeId = getSelectionRangeIdentity(postNetworkSel);
-      if (postNetworkText !== gesture.text || postNetworkRangeId !== gesture.rangeId) {
-        // Page script changed the range without a handled input event — clear
-        // the claimed key and hide the stuck loading panel (same as collapse).
-        lastSelectionKey = "";
-        hideSelectionPanel();
-        return { ok: false, error: "划词已变化，译文已丢弃" };
+      const selectionGone = !postNetworkSel || postNetworkSel.isCollapsed || postNetworkSel.rangeCount === 0;
+      if (!selectionGone) {
+        const postNetworkText = postNetworkSel.toString().replace(/\s+/gu, " ").trim();
+        const postNetworkRangeId = getSelectionRangeIdentity(postNetworkSel);
+        if (postNetworkText !== gesture.text || postNetworkRangeId !== gesture.rangeId) {
+          // Page script changed the range without a handled input event, or a
+          // genuinely new selection claimed the slot (its own bump already
+          // failed the requestId check above) — clear the claimed key and hide
+          // the panel.
+          lastSelectionKey = "";
+          hideSelectionPanel();
+          return { ok: false, error: "划词已变化，译文已丢弃" };
+        }
       }
 
       if (!response?.ok) {

@@ -8,11 +8,13 @@ const PROVIDER_META = {
     keyLabel: "DeepSeek API Key",
     keyUrl: "https://platform.deepseek.com/api_keys",
     keyField: "deepseekApiKey",
+    // Keep values in sync with Utils.DEEPSEEK_MODEL_IDS in shared.js
+    // (deepseek-v4-flash was renamed to deepseek-flash).
     models: [
-      { value: "deepseek-v4-flash", label: "V4 Flash · 快" },
-      { value: "deepseek-v4-pro", label: "V4 Pro · 准" }
+      { value: "deepseek-flash", label: "DeepSeek Flash（默认，快速）" },
+      { value: "deepseek-v4-pro", label: "DeepSeek V4 Pro" }
     ],
-    defaultModel: "deepseek-v4-flash"
+    defaultModel: "deepseek-flash"
   },
   kimi: {
     label: "Kimi",
@@ -33,7 +35,7 @@ const DEFAULT_SETTINGS = {
   deepseekApiKey: "",
   kimiApiKey: "",
   apiKey: "",
-  model: "deepseek-v4-flash",
+  model: "deepseek-flash",
   targetLanguage: "zh-CN",
   displayMode: Utils.DISPLAY_MODES.bilingual
 };
@@ -389,6 +391,13 @@ function migrateSettings(raw) {
   // exist yet; a Kimi-only user's mirrored apiKey is not legacy storage.
   if (!deepseekApiKey && !kimiApiKey && legacy) {
     deepseekApiKey = legacy;
+    didMigrate = true;
+  }
+  // deepseek-v4-flash → deepseek-flash rename: map on read; the follow-up
+  // save (background's loadSettings also persists it) retires the old value.
+  const model = Utils.migrateModelName(settings.model);
+  if (model !== settings.model) {
+    settings.model = model;
     didMigrate = true;
   }
   return {

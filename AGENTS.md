@@ -37,3 +37,7 @@ Human merge is **optional** only when every auto-merge gate passes. Copilot ofte
 
 
 Cloud setup: Node 20 only; prefer node scripts/ci-check.mjs.
+
+## 交接规矩（2026-10-15 起）
+
+把事情交给下一个 bot 时，必须单聊点名并叫醒对方，光在群里说「可以合了」不算交接。门禁转绿时，专业研发单聊通知产品 bot 和专业测试；专业测试打上 `qa-passed` 后，单聊通知产品 bot；产品 bot 合入或发布后，单聊通知专业研发。
