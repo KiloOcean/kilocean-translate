@@ -199,18 +199,22 @@ function reconcileModel(model, storageSnapshot) {
 
 // Pure core of save(): collect the pending user edits (dirty fields) from
 // the current control values. Only values that differ from the last-known
-// snapshot are written; `fields` lists every dirty field considered so the
-// caller can clear its flag once the save lands (an edit that already
-// equals the stored value was never unsaved). The legacy apiKey mirror
-// follows the active provider's key whenever a provider/key field changes.
+// snapshot are written; `savedValues` records, per dirty field, the exact
+// value this save establishes in storage (the written value, or the stored
+// value an edit already matched) so completion can tell a settled edit from
+// one the user retyped while the write was in flight. The legacy apiKey
+// mirror follows the active provider's key whenever a provider/key field
+// changes.
 function collectDirtyPatch(model, controlValues) {
   const patch = {};
   const fields = [];
+  const savedValues = {};
   for (const field of Object.keys(model.edits)) {
     if (controlValues[field] === undefined) {
       continue;
     }
     fields.push(field);
+    savedValues[field] = controlValues[field];
     if (controlValues[field] !== model.snapshot[field]) {
       patch[field] = controlValues[field];
     }
@@ -219,7 +223,28 @@ function collectDirtyPatch(model, controlValues) {
   if (patch.provider || patch.deepseekApiKey || patch.kimiApiKey) {
     patch.apiKey = controlValues[PROVIDER_META[provider].keyField] ?? model.snapshot[PROVIDER_META[provider].keyField];
   }
-  return { patch, fields };
+  return { patch, fields, savedValues };
+}
+
+// Pure core of save completion: a collected dirty edit resolves ONLY when
+// it still equals the value its save established in storage — the user may
+// have retyped the field while the write was in flight, and that newer edit
+// must stay dirty for a follow-up save (the storage.onChanged echo of our
+// own write already skips dirty fields, so it cannot clobber it either).
+// Returns true when any collected edit survived and another save is due.
+function settleSavedEdits(model, savedValues) {
+  let followUpNeeded = false;
+  for (const [field, value] of Object.entries(savedValues)) {
+    if (!(field in model.edits)) {
+      continue;
+    }
+    if (model.edits[field] === value) {
+      delete model.edits[field];
+    } else {
+      followUpNeeded = true;
+    }
+  }
+  return followUpNeeded;
 }
 
 // Pure: the fields a one-time storage upgrade (legacy apiKey →
@@ -823,23 +848,61 @@ function applyProviderUi(providerId, { resetModel }) {
   }
 }
 
+// ---- Serialized settings saves ----
+// At most one chrome.storage.local.set from this view runs at a time: two
+// concurrent writes could land out of order and let an older save's value
+// overwrite a newer edit. saveSettings() calls that arrive while a write is
+// in flight coalesce into ONE follow-up save started once that write
+// settles — every queued caller awaits that same follow-up.
+let settingsSaveInFlight = null;
+let settingsSaveFollowUp = null;
+
+function saveSettings() {
+  if (!settingsSaveInFlight) {
+    return runSettingsSave();
+  }
+  if (!settingsSaveFollowUp) {
+    settingsSaveFollowUp = settingsSaveInFlight.then(() => {
+      settingsSaveFollowUp = null;
+      return saveSettings();
+    });
+  }
+  return settingsSaveFollowUp;
+}
+
+async function runSettingsSave() {
+  let settle;
+  settingsSaveInFlight = new Promise((resolve) => {
+    settle = resolve;
+  });
+  try {
+    return await performSettingsSave();
+  } finally {
+    settle();
+    settingsSaveInFlight = null;
+  }
+}
+
 // Save = flush the pending user edits ONLY. Fields the user never touched
 // (including newer values other views wrote underneath) are never written
 // from here, so a stale idle view cannot restore old values over new ones.
-async function saveSettings() {
+async function performSettingsSave() {
   const controlValues = readControlValues();
-  const { patch, fields } = collectDirtyPatch(settingsModel, controlValues);
+  const { patch, savedValues } = collectDirtyPatch(settingsModel, controlValues);
   if (Object.keys(patch).length) {
     await chrome.storage.local.set(patch);
     for (const [field, value] of Object.entries(patch)) {
       settingsModel.snapshot[field] = value;
     }
   }
-  // The collected edits resolve either way: written fields now match
-  // storage, and an edit that already equalled the stored value was never
-  // unsaved to begin with.
-  for (const field of fields) {
-    delete settingsModel.edits[field];
+  // The collected edits resolve only when they still equal what this save
+  // established in storage: an edit retyped while the write was in flight
+  // stays dirty (the control keeps it) and gets one follow-up save.
+  if (settleSavedEdits(settingsModel, savedValues)) {
+    // Through the serializer, so this coalesces with any save already
+    // queued behind the in-flight one; a rejected write is owned by that
+    // follow-up's callers, and the edit stays dirty either way.
+    void saveSettings();
   }
   renderKeyStatus();
   return {

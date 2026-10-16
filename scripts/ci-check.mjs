@@ -2600,10 +2600,11 @@ async function checkKeyMigrationGate() {
 }
 
 // ---- Settings/key state: single source of truth (snapshot + dirty flags) ----
-// The pure core (reconcileModel / collectDirtyPatch) is extracted from
-// popup.js the same way toFriendlyPageError is; the popup head supplies
-// SETTINGS_FIELDS / PROVIDER_META. VM scenarios then drive the shipping
-// popup through init races, dirty-key conflicts, external updates and saves.
+// The pure core (reconcileModel / collectDirtyPatch / settleSavedEdits) is
+// extracted from popup.js the same way toFriendlyPageError is; the popup
+// head supplies SETTINGS_FIELDS / PROVIDER_META. VM scenarios then drive the
+// shipping popup through init races, dirty-key conflicts, external updates,
+// in-flight-save interleavings and coalesced saves.
 async function checkSettingsStateModel() {
   const require = createRequire(import.meta.url);
   try {
@@ -2626,19 +2627,20 @@ async function checkSettingsStateModel() {
 
   const reconcileSrc = extractTopLevelFunction("popup.js", "reconcileModel");
   const patchSrc = extractTopLevelFunction("popup.js", "collectDirtyPatch");
+  const settleSrc = extractTopLevelFunction("popup.js", "settleSavedEdits");
   const popupSource = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
   const popupHead = popupSource.slice(0, popupSource.indexOf("const elements ="));
-  if (!popupHead || !reconcileSrc || !patchSrc) {
-    fail("popup.js: cannot extract reconcileModel/collectDirtyPatch for settings-model tests");
+  if (!popupHead || !reconcileSrc || !patchSrc || !settleSrc) {
+    fail("popup.js: cannot extract reconcileModel/collectDirtyPatch/settleSavedEdits for settings-model tests");
     return;
   }
   let pure;
   try {
     pure = new Function(
-      `${popupHead}\n${reconcileSrc}\n${patchSrc}\nreturn { reconcileModel, collectDirtyPatch };`
+      `${popupHead}\n${reconcileSrc}\n${patchSrc}\n${settleSrc}\nreturn { reconcileModel, collectDirtyPatch, settleSavedEdits };`
     )();
   } catch (error) {
-    fail(`popup.js: reconcileModel/collectDirtyPatch are not runnable standalone: ${error.message}`);
+    fail(`popup.js: reconcileModel/collectDirtyPatch/settleSavedEdits are not runnable standalone: ${error.message}`);
     return;
   }
 
@@ -2702,6 +2704,55 @@ async function checkSettingsStateModel() {
       pure.collectDirtyPatch({ snapshot: model.snapshot, edits: {} }, controlValues).patch,
       {},
       "collectDirtyPatch: a clean model writes nothing"
+    );
+  }
+
+  // settleSavedEdits + collectDirtyPatch's savedValues: save completion
+  // resolves an edit ONLY when it still equals the exact value that save
+  // established in storage — an edit retyped while the write was in flight
+  // survives dirty for the follow-up save, while untouched fields settle.
+  {
+    const controlValues = {
+      provider: "deepseek",
+      deepseekApiKey: "sk-typed",
+      kimiApiKey: "sk-b",
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    const snapshot = {
+      provider: "deepseek",
+      deepseekApiKey: "sk-a",
+      kimiApiKey: "sk-b",
+      model: "deepseek-flash",
+      targetLanguage: "zh-CN",
+      displayMode: "bilingual"
+    };
+    // No retype during the write: every collected edit settles, no follow-up.
+    const settled = { snapshot: { ...snapshot }, edits: { deepseekApiKey: "sk-typed", targetLanguage: "zh-CN" } };
+    const savedValues = pure.collectDirtyPatch(settled, controlValues).savedValues;
+    assertEqual(
+      savedValues,
+      { deepseekApiKey: "sk-typed", targetLanguage: "zh-CN" },
+      "collectDirtyPatch: savedValues records the exact value the save establishes per field"
+    );
+    assertTrue(
+      !pure.settleSavedEdits(settled, savedValues),
+      "settleSavedEdits: edits that still match the saved values need no follow-up"
+    );
+    assertEqual(settled.edits, {}, "settleSavedEdits: settled edits clear (written field and already-stored field alike)");
+
+    // The user retyped the key while its write was in flight: the newer edit
+    // stays dirty, the untouched language edit still clears.
+    const retyped = { snapshot: { ...snapshot }, edits: { deepseekApiKey: "sk-retyped-mid-flight", targetLanguage: "zh-CN" } };
+    assertTrue(
+      pure.settleSavedEdits(retyped, savedValues),
+      "settleSavedEdits: an edit that moved on mid-flight reports a needed follow-up save"
+    );
+    assertEqual(
+      retyped.edits,
+      { deepseekApiKey: "sk-retyped-mid-flight" },
+      "settleSavedEdits: only the retyped field stays dirty"
     );
   }
 
@@ -2827,6 +2878,81 @@ async function checkSettingsStateModel() {
     assertEqual(setCalls[1], { targetLanguage: "ja" }, "save: a language edit writes only the language (no key mirror)");
     await new Promise((resolve) => setTimeout(resolve, 0));
     assertEqual(popup.hooks.getSettingsModel().edits, {}, "save: language dirty flag cleared by the auto-save");
+  }
+
+  // (5) Preserve edits made while a save is pending: the storage write of
+  // edit A is gated in flight; the user retypes B on the same field, the
+  // onChanged echo of our own write of A arrives, then the write completes —
+  // B must stay dirty, the control must keep showing it, and one follow-up
+  // save must write B before clearing the flag.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const setCalls = [];
+    const trueSet = popup.sandbox.chrome.storage.local.set;
+    let releaseWrite;
+    const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      setCalls.push(updates);
+      await writeGate;
+      await trueSet(updates);
+    };
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    const saving = popup.hooks.saveSettings();
+    assertEqual(setCalls, [{ deepseekApiKey: EDITED, apiKey: EDITED }], "pending edit: the in-flight save writes edit A");
+    keyInput.value = NEWER;
+    fire(keyInput, "input");
+    // The storage.onChanged echo of our own write of A must not clobber B.
+    popup.emitStorageChange({
+      deepseekApiKey: { oldValue: DEEPSEEK_KEY, newValue: EDITED },
+      apiKey: { oldValue: DEEPSEEK_KEY, newValue: EDITED }
+    });
+    assertEqual(keyInput.value, NEWER, "pending edit: the control keeps edit B through the echo of A");
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, NEWER, "pending edit: edit B stays banked through the echo");
+    releaseWrite();
+    await saving;
+    assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, NEWER, "pending edit: completion keeps B dirty (it never matched the saved A)");
+    assertEqual(keyInput.value, NEWER, "pending edit: the control still shows B after the save completes");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(setCalls.length, 2, "pending edit: exactly one follow-up save runs");
+    assertEqual(setCalls[1], { deepseekApiKey: NEWER, apiKey: NEWER }, "pending edit: the follow-up save writes B");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "pending edit: the follow-up save clears the dirty flag");
+    assertEqual(popup.storage.deepseekApiKey, NEWER, "pending edit: storage ends at B");
+  }
+
+  // (6) Saves are serialized: requests arriving while a write is in flight
+  // coalesce into ONE follow-up save — three callers, two writes total.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: DEEPSEEK_KEY, kimiApiKey: KIMI_KEY, model: "deepseek-flash", targetLanguage: "zh-CN" });
+    await popup.hooks.initializePromise;
+    const setCalls = [];
+    const trueSet = popup.sandbox.chrome.storage.local.set;
+    let releaseWrite;
+    const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      setCalls.push(updates);
+      await writeGate;
+      await trueSet(updates);
+    };
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = EDITED;
+    fire(keyInput, "input");
+    const first = popup.hooks.saveSettings();
+    keyInput.value = NEWER;
+    fire(keyInput, "input");
+    const second = popup.hooks.saveSettings();
+    const third = popup.hooks.saveSettings();
+    releaseWrite();
+    const [secondResult, thirdResult] = await Promise.all([second, third]);
+    await first;
+    assertTrue(secondResult === thirdResult, "coalesced saves: queued callers share one follow-up result");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(setCalls.length, 2, "coalesced saves: exactly one follow-up write follows the in-flight one");
+    assertEqual(setCalls[1], { deepseekApiKey: NEWER, apiKey: NEWER }, "coalesced saves: the follow-up writes the newest edit");
+    assertEqual(popup.hooks.getSettingsModel().edits, {}, "coalesced saves: the follow-up clears the dirty flag");
+    assertEqual(popup.storage.deepseekApiKey, NEWER, "coalesced saves: storage ends at the newest edit");
   }
 
   // Switching providers banks an unsaved key edit under the provider it was
