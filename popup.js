@@ -182,14 +182,22 @@ const SETTINGS_FIELDS = [
 // Pure core of reconcile(): merge a storage view (a fresh full read or an
 // onChanged delta) into the model's snapshot and report the fields to apply
 // to the controls — every tracked field present in the view EXCEPT those
-// with a pending user edit (dirty fields keep the user's value).
+// with a pending user edit (dirty fields keep the user's value). Each merge
+// that changes a field bumps that field's revision (model.revisions): write
+// completion compares revisions against the ones recorded when its write
+// began, so a NEWER value storage delivered while the write was in flight is
+// never rolled back to the (now older) written value.
 function reconcileModel(model, storageSnapshot) {
   const applied = {};
   for (const field of SETTINGS_FIELDS) {
     if (!Object.prototype.hasOwnProperty.call(storageSnapshot, field)) {
       continue;
     }
-    model.snapshot[field] = storageSnapshot[field];
+    if (model.snapshot[field] !== storageSnapshot[field]) {
+      model.snapshot[field] = storageSnapshot[field];
+      model.revisions = model.revisions || {};
+      model.revisions[field] = (model.revisions[field] || 0) + 1;
+    }
     if (!(field in model.edits)) {
       applied[field] = model.snapshot[field];
     }
@@ -319,6 +327,10 @@ let pendingSelection = null;
 // restore old values over newer ones.
 const settingsModel = {
   snapshot: { ...DEFAULT_SETTINGS },
+  // Per-field revision of snapshot values merged in from storage; see
+  // reconcileModel. Write completion consults it to preserve newer storage
+  // snapshots delivered while a pending write is still settling.
+  revisions: {},
   edits: {}
 };
 
@@ -370,6 +382,9 @@ function reconcile(storageSnapshot) {
   applyFieldsToControls(applied);
   if ("provider" in applied) {
     // The provider behind any in-flight key test changed: drop its result.
+    if (keyTestPendingOp && keyTestPendingOp === keyTestOp) {
+      renderStatus("服务商已在其他窗口切换", "如需验证，请重新点击「测试 API 连接」", "idle");
+    }
     keyTestOp += 1;
   } else if (PROVIDER_META[activeProvider()].keyField in applied) {
     // The key under test changed elsewhere: drop any in-flight result.
@@ -387,6 +402,18 @@ function applyFieldsToControls(applied) {
   if ("provider" in applied && PROVIDER_META[applied.provider] && elements.provider.value !== applied.provider) {
     elements.provider.value = applied.provider;
     applyProviderUi(applied.provider, { resetModel: false });
+    // A dirty model edit banked for the departed provider can never settle
+    // once the rebuilt select no longer offers it (settle compares the edit
+    // against the control value) — it would loop follow-up saves forever and
+    // land the old provider's model under the new one. Re-point it at the
+    // select's resolved model so the next save converges on a consistent
+    // provider/model pair.
+    if ("model" in settingsModel.edits) {
+      const providerModels = PROVIDER_META[applied.provider].models.map((entry) => entry.value);
+      if (!providerModels.includes(settingsModel.edits.model)) {
+        settingsModel.edits.model = elements.model.value;
+      }
+    }
   }
   if ("model" in applied && [...elements.model.options].some((option) => option.value === applied.model)) {
     elements.model.value = applied.model;
@@ -557,11 +584,13 @@ elements.model.addEventListener("change", () => {
   settingsModel.edits.model = elements.model.value;
   persistSettingsNow();
 });
-// Closing/hiding a view only flushes a still-pending debounced edit. Edits
-// are otherwise saved immediately, so an idle (possibly stale) view never
-// writes its snapshot back over newer settings from another view.
+// Closing/hiding a view flushes a still-pending debounced edit — and, once
+// init has completed, any other unsaved dirty edit (e.g. one banked before
+// initialization finished, which never got a debounce). Still dirty-only:
+// edits are otherwise saved immediately, so an idle (possibly stale) view
+// never writes its snapshot back over newer settings from another view.
 function flushPendingPersist() {
-  if (persistTimer) {
+  if (persistTimer || (initialized && Object.keys(settingsModel.edits).length)) {
     persistSettingsNow();
   }
 }
@@ -585,8 +614,17 @@ elements.modeButtons.forEach((button) => {
     // newer click while this write is pending stays dirty and settles via
     // the follow-up save instead of being un-banked unconditionally.
     await saveSettings();
-    if (op !== displayModeOp || mode !== currentDisplayMode) {
+    if (op !== displayModeOp) {
       return;
+    }
+    // The save may have been overtaken by a newer stored mode delivered
+    // while its write was in flight (another view changed the preference):
+    // the radiogroup and the page below follow the snapshot's effective
+    // mode, never the value this click wrote.
+    const effectiveMode = Utils.normalizeDisplayMode(settingsModel.snapshot.displayMode);
+    if (effectiveMode !== currentDisplayMode) {
+      currentDisplayMode = effectiveMode;
+      renderDisplayMode();
     }
 
     if (!currentTab?.id) {
@@ -595,14 +633,14 @@ elements.modeButtons.forEach((button) => {
 
     try {
       await ensureContentScript(currentTab.id);
-      if (op !== displayModeOp || mode !== currentDisplayMode) {
+      if (op !== displayModeOp) {
         return;
       }
       const response = await chrome.tabs.sendMessage(currentTab.id, {
         type: "SET_DISPLAY_MODE",
-        displayMode: mode
+        displayMode: currentDisplayMode
       });
-      if (op !== displayModeOp || mode !== currentDisplayMode) {
+      if (op !== displayModeOp) {
         return;
       }
       if (response?.ok) {
@@ -780,6 +818,12 @@ async function initialize() {
   }
   // Controls now mirror storage — safe to persist on hide/unload.
   initialized = true;
+  // Edits banked while the reads above were still pending never got their
+  // debounce (schedulePersistSettings is a no-op before init): flush them now
+  // through the serialized queue, or closing this view would drop them.
+  if (Object.keys(settingsModel.edits).length) {
+    void saveSettings();
+  }
 
   if (!currentTab?.id) {
     throw new Error("找不到当前标签页");
@@ -836,8 +880,9 @@ function migrateSettings(raw) {
     provider,
     deepseekApiKey,
     kimiApiKey,
-    // content.js's selection gate still reads the legacy single-key field;
-    // mirror the active provider's key into it on every write.
+    // content.js's selection gate reads the active provider's per-provider
+    // key; the legacy mirror is only its <=1.3.x fallback, so keep it in
+    // step with the active provider's key on every write.
     apiKey: provider === "kimi" ? kimiApiKey : deepseekApiKey,
     _didMigrate: didMigrate
   };
@@ -944,26 +989,55 @@ async function runSettingsSave() {
 async function performSettingsSave() {
   const controlValues = readControlValues();
   const { patch, savedValues } = collectDirtyPatch(settingsModel, controlValues);
+  // Fields whose snapshot revision advanced while our write was in flight:
+  // storage delivered a NEWER value for them after this write committed, and
+  // completion must keep it instead of stamping this (now older) write's
+  // value back over the snapshot.
+  const overtakenFields = [];
   if (Object.keys(patch).length) {
+    // Revisions as they stand at write START, before any onChanged of the
+    // committing value can reach us.
+    const revisionsAtStart = {};
+    for (const field of Object.keys(patch)) {
+      revisionsAtStart[field] = settingsModel.revisions[field] || 0;
+    }
     await enqueueSettingsWrite(patch);
     for (const [field, value] of Object.entries(patch)) {
-      settingsModel.snapshot[field] = value;
+      if ((settingsModel.revisions[field] || 0) === revisionsAtStart[field]) {
+        settingsModel.snapshot[field] = value;
+      } else {
+        overtakenFields.push(field);
+      }
     }
   }
   // The collected edits resolve only when they still equal what this save
   // established in storage: an edit retyped while the write was in flight
   // stays dirty (the control keeps it) and gets one follow-up save.
-  if (settleSavedEdits(settingsModel, savedValues)) {
+  const followUpNeeded = settleSavedEdits(settingsModel, savedValues);
+  // An overtaken field now holds another view's newer value in the snapshot;
+  // its control could not take that value when it arrived (the field was
+  // dirty with this save's edit). Now that the edit settled, follow the
+  // stored value — a retyped edit stays dirty and keeps the control.
+  for (const field of overtakenFields) {
+    if (!(field in settingsModel.edits)) {
+      applyFieldsToControls({ [field]: settingsModel.snapshot[field] });
+    }
+  }
+  if (followUpNeeded) {
     // Through the serializer, so this coalesces with any save already
     // queued behind the in-flight one; a rejected write is owned by that
     // follow-up's callers, and the edit stays dirty either way.
     void saveSettings();
   }
   renderKeyStatus();
+  // Post-save actions (translate start, key test, export) read the view as
+  // it stands AFTER the write, so a field another view updated mid-flight
+  // reports the newer effective value, never the stale one this save carried.
+  const effectiveValues = readControlValues();
   return {
-    ...controlValues,
+    ...effectiveValues,
     // Legacy mirror for content.js's selection key gate.
-    apiKey: controlValues[PROVIDER_META[controlValues.provider].keyField]
+    apiKey: effectiveValues[PROVIDER_META[effectiveValues.provider].keyField]
   };
 }
 

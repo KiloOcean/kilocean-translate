@@ -2848,12 +2848,21 @@
     let requestId = 0;
 
     try {
-      const stored = await chrome.storage.local.get({
-        provider: state.provider || "deepseek",
-        targetLanguage: state.targetLanguage,
-        model: state.model,
-        apiKey: ""
-      });
+      // Array form (only present keys come back): "per-provider key field
+      // absent" (a <=1.3.x store that never had them) must stay
+      // distinguishable from "present but empty" (the user cleared the key) —
+      // a defaults-object read would fill absent key fields with "" and
+      // re-arm the legacy apiKey fallback below for every cleared key.
+      // provider/targetLanguage/model are absent-safe through the fallbacks
+      // applied where they are read.
+      const stored = await chrome.storage.local.get([
+        "provider",
+        "targetLanguage",
+        "model",
+        "deepseekApiKey",
+        "kimiApiKey",
+        "apiKey"
+      ]);
 
       // Dismiss / newer work during the storage await.
       if (gate !== selectionGeneration) {
@@ -2924,7 +2933,16 @@
       positionSelectionPanel(panel, rect);
       setSelectionPanelState(panel, "loading", "正在翻译选中文本…");
 
-      if (!String(stored.apiKey || "").trim()) {
+      // Gate on the SELECTED provider's key, not the legacy apiKey mirror:
+      // the mirror is written best-effort by popup views and can lag a
+      // provider switch (kimi selected with a valid kimiApiKey but a stale
+      // or empty mirror would block, or a stale mirror would let a
+      // key-less provider through). The legacy single-key field is honored
+      // only on a <=1.3.x store where NEITHER per-provider key field exists.
+      const providerKeyField = provider === "kimi" ? "kimiApiKey" : "deepseekApiKey";
+      const legacyKeyStore = !("deepseekApiKey" in stored) && !("kimiApiKey" in stored);
+      const gateKey = legacyKeyStore ? stored.apiKey : stored[providerKeyField];
+      if (!String(gateKey || "").trim()) {
         lastSelectionKey = "";
         setSelectionPanelState(panel, "error", "请先在扩展弹窗中填写 API Key");
         return { ok: false, error: "请先在扩展弹窗中填写 API Key" };
