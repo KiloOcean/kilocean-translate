@@ -2217,6 +2217,9 @@ function createPopupVm(
     setInterval,
     clearInterval,
     location: { search: locationSearch },
+    // vm contexts only receive ECMAScript intrinsics — node's URL/URLSearchParams
+    // globals must be handed in for popup.js's settings-tab detection.
+    URLSearchParams,
     Blob: FakeBlob,
     URL: { createObjectURL: () => `blob:fake-${blobs.length}`, revokeObjectURL() {} },
     // Recorded (unlike a no-op) so tests can fire pagehide, and swapped per
@@ -5105,6 +5108,13 @@ async function checkPopupViews150() {
       fail(`${label}: expected false, got ${JSON.stringify(actual)}`);
     }
   };
+  // Identity comparison for vm DOM nodes (JSON.stringify would choke on the
+  // parentNode back-references appendChild records).
+  const assertSameDom = (actual, expected, label) => {
+    if (actual !== expected) {
+      fail(`${label}: expected the same vm node, got a different one`);
+    }
+  };
   const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
   const fire = (el, type) => {
     for (const fn of el.listeners[type] || []) {
@@ -5205,9 +5215,8 @@ async function checkPopupViews150() {
       String(popup.dom.get("status-title").textContent).includes("准备就绪"),
       "setup view: the retired 准备就绪 idle title must never render"
     );
-    assertEqual(
-      popup.dom.get("key-entry").parentNode,
-      popup.dom.get("setup-key-slot"),
+    assertTrue(
+      popup.dom.get("key-entry").parentNode === popup.dom.get("setup-key-slot"),
       "setup view: #key-entry is homed into the setup slot"
     );
     assertEqual(
@@ -5236,7 +5245,7 @@ async function checkPopupViews150() {
     // User-opened settings beats setup; back returns to setup (still no key).
     fire(popup.dom.get("open-settings"), "click");
     assertEqual(popup.hooks.getAppView(), "settings", "setup view: ⚙ opens settings");
-    assertEqual(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "settings view: #key-entry returns to the settings slot");
+    assertSameDom(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "settings view: #key-entry returns to the settings slot");
     fire(popup.dom.get("back-main"), "click");
     assertEqual(popup.hooks.getAppView(), "setup", "setup view: ← back lands on setup again (no key yet)");
     fire(popup.dom.get("more-settings"), "click");
@@ -5268,7 +5277,7 @@ async function checkPopupViews150() {
       "provider status: the meta line never carries the full key"
     );
     assertEqual(popup.dom.get("provider-status").dataset.tone, "ok", "provider status: tone ok with a key present");
-    assertEqual(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "main view: #key-entry stays in the settings slot");
+    assertSameDom(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "main view: #key-entry stays in the settings slot");
 
     // (2b) A successful connection test flips the line to 已连接.
     const tested = createPopupVm(seededMain(), {
@@ -5317,7 +5326,7 @@ async function checkPopupViews150() {
     assertEqual(popup.storage.deepseekApiKey, PASTED_KEY, "paste ok: the pasted key is stored");
     assertEqual(popup.dom.get("setup-feedback").textContent, "✓ 已连接", "paste ok: the setup card's own feedback confirms the connection");
     assertEqual(popup.dom.get("provider-status-label").textContent, "✓ DeepSeek 已连接", "paste ok: the provider line confirms the connection");
-    assertEqual(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "paste ok: the key entry returns to the settings slot");
+    assertSameDom(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "paste ok: the key entry returns to the settings slot");
   }
 
   // (3b) A rejected key (401) keeps setup open with the reason in
@@ -5347,8 +5356,11 @@ async function checkPopupViews150() {
     // The SAME key re-arriving (our own save echo) must not graduate…
     popup.emitStorageChange({ deepseekApiKey: { oldValue: "", newValue: PASTED_KEY } });
     assertEqual(popup.hooks.getAppView(), "setup", "paste 401: the rejected key's own storage echo keeps setup open");
+    // …nor may a malformed external value.
+    popup.emitStorageChange({ deepseekApiKey: { oldValue: PASTED_KEY, newValue: "not-a-key" } });
+    assertEqual(popup.hooks.getAppView(), "setup", "setup exit: a format-invalid external key never graduates");
     // …but a different valid key from another surface does.
-    popup.emitStorageChange({ deepseekApiKey: { oldValue: PASTED_KEY, newValue: EXTERNAL_KEY } });
+    popup.emitStorageChange({ deepseekApiKey: { oldValue: "not-a-key", newValue: EXTERNAL_KEY } });
     assertEqual(popup.hooks.getAppView(), "main", "setup exit: a different valid key arriving via onChanged graduates to main");
     assertEqual(popup.dom.get("api-key").value, EXTERNAL_KEY, "setup exit: the input shows the externally arrived key");
   }
@@ -5398,6 +5410,9 @@ async function checkPopupViews150() {
     );
     await popup.hooks.initializePromise;
     popup.dom.get("api-key").value = TYPED_KEY;
+    // Real typing fires input per keystroke (banks the edit) before change
+    // commits it — mirror that sequence.
+    fire(popup.dom.get("api-key"), "input");
     await fireAction(popup.dom.get("api-key"), "change");
     await waitFor(() => popup.hooks.getAppView() === "main", "typed key: graduation to main");
     assertEqual(testRequests.length, 1, "typed key: a valid manual edit auto-runs exactly one connection test");
@@ -5590,7 +5605,7 @@ async function checkPopupViews150() {
     await popup.hooks.initializePromise;
     assertEqual(popup.hooks.getAppView(), "settings", "settings tab: popup.html?view=settings is the settings view");
     assertEqual(popup.dom.get("app").dataset.view, "settings", "settings tab: #app carries data-view=settings");
-    assertEqual(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "settings tab: the key entry lives in the settings slot");
+    assertSameDom(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "settings tab: the key entry lives in the settings slot");
     fire(popup.dom.get("back-main"), "click");
     assertEqual(popup.hooks.getAppView(), "settings", "settings tab: ← back cannot leave the settings tab");
   }
@@ -8063,9 +8078,11 @@ async function main() {
   // 1.5.0 content-script checks ship as a sibling module; load it only when
   // present so this gate also runs green on checkouts mid-refactor.
   const contentChecksPath = path.join(ROOT, "scripts", "checks-content-150.mjs");
+  let contentChecksLabel = "";
   if (fs.existsSync(contentChecksPath)) {
     const { runContent150Checks } = await import(pathToFileURL(contentChecksPath).href);
     await runContent150Checks({ ROOT, fail });
+    contentChecksLabel = ", content checks 1.5.0 (vm)";
   }
   await checkPackaging();
   await checkPackPathSafety();
@@ -8079,7 +8096,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest (incl. store key → extension ID, commands, no content_scripts, unchanged hosts), permissions (incl. contextMenus), syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, selection key gate, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm, incl. onInstalled install/update menus + welcome), settings state model (snapshot + dirty flags), serialized write queue concurrency (controlled fake storage), popup action init gate (held first storage read + listener statics), popup views 1.5.0 (setup/main/settings + provider line + retry + shortcuts + restricted pages + static copy), content checks 1.5.0 (vm), inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, commands + context menu wiring (vm), welcome sample translate gate (vm), packaging (incl. welcome.html + getURL refs), pack path safety, pack getURL html references");
+  console.log(`OK: manifest (incl. store key → extension ID, commands, no content_scripts, unchanged hosts), permissions (incl. contextMenus), syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, selection key gate, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm, incl. onInstalled install/update menus + welcome), settings state model (snapshot + dirty flags), serialized write queue concurrency (controlled fake storage), popup action init gate (held first storage read + listener statics), popup views 1.5.0 (setup/main/settings + provider line + retry + shortcuts + restricted pages + static copy)${contentChecksLabel}, inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, commands + context menu wiring (vm), welcome sample translate gate (vm), packaging (incl. welcome.html + getURL refs), pack path safety, pack getURL html references`);
   process.exit(0);
 }
 

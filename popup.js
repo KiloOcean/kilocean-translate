@@ -1396,10 +1396,12 @@ function detectRestrictedPage() {
   if (/^file:/i.test(url)) {
     return new Promise((resolve) => {
       let settled = false;
+      // The promise reports whether the page IS restricted: without the
+      // user's file-access grant (or without the API at all) it is.
       const settle = (allowed) => {
         if (!settled) {
           settled = true;
-          resolve(allowed === true);
+          resolve(allowed !== true);
         }
       };
       try {
