@@ -325,15 +325,24 @@
         sendResponse({ ok: true });
         setTimeout(() => {
           // Live print includes fixed overlays; HTML export already strips our hosts.
+          // Failure markers must hide too — otherwise the red “这段没翻译成功”
+          // banner and its Retry control land in the printed page / PDF.
           hideSelectionPanel();
           hideToast();
           const pillHost = progressPillHost;
           if (pillHost) {
             pillHost.style.display = "none";
           }
+          const markerHosts = [...document.querySelectorAll("[data-kilocean-failed-marker]")];
+          for (const host of markerHosts) {
+            host.style.display = "none";
+          }
           window.print();
           if (pillHost) {
             pillHost.style.display = "";
+          }
+          for (const host of markerHosts) {
+            host.style.display = "";
           }
         }, 80);
       } catch (error) {
@@ -2878,10 +2887,17 @@
     if (state.failed > 0) {
       const progress = state.total > 0 ? Math.round((state.translated / state.total) * 100) : 0;
       root.classList.add("partial");
+      // A key error that lands mid-run (some segments already translated)
+      // still has state.failed > 0, so we reach this branch — not the pure
+      // error branch. Offer 「打开设置」 instead of Retry, or every click
+      // would re-bill the known-invalid credential (Codex PR #19 P2).
+      const action = isKeyRelatedError(state.error)
+        ? '<button class="cb primary" type="button" data-action="settings">打开设置</button>'
+        : `<button class="cb warnb" type="button" data-action="retry">重试 ${state.failed} 段</button>`;
       root.innerHTML = `
         <span class="ringp" style="background: conic-gradient(#B45309 ${progress}%, #FDE68A 0)" aria-hidden="true"></span>
         <span class="tx"><b>${state.translated} / ${state.total}</b><span>${state.failed} 段未完成</span></span>
-        <button class="cb warnb" type="button" data-action="retry">重试 ${state.failed} 段</button>
+        ${action}
         <button class="cb" type="button" data-action="jump">跳到未完成 ↓</button>`;
       return;
     }

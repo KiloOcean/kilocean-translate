@@ -2369,7 +2369,10 @@ function createWelcomeVm(
     commands = [],
     // welcome.html ships <script src="shared.js"> before welcome.js; setting
     // this to false models a broken/incomplete install (the fail-loud guard).
-    withSharedScript = true
+    withSharedScript = true,
+    // When true, every chrome.storage.local.get parks until releaseStorageGets()
+    // is called — used to race a provider switch against a slow saved-key read.
+    holdStorageGets = false
   } = {}
 ) {
   const makeEl = (overrides = {}) => {
@@ -2446,6 +2449,7 @@ function createWelcomeVm(
   let seq = 0;
   const writes = [];
   const messages = [];
+  const heldGets = [];
 
   const sandbox = {
     console: { log() {}, warn() {}, error() {} },
@@ -2463,8 +2467,22 @@ function createWelcomeVm(
       storage: {
         local: {
           get: async (keys) => {
+            if (holdStorageGets) {
+              await new Promise((resolve) => {
+                heldGets.push(resolve);
+              });
+            }
             if (typeof keys === "string") {
               return keys in storageData ? { [keys]: storageData[keys] } : {};
+            }
+            if (Array.isArray(keys)) {
+              const out = {};
+              for (const key of keys) {
+                if (key in storageData) {
+                  out[key] = storageData[key];
+                }
+              }
+              return out;
             }
             return { ...(keys || {}), ...storageData };
           },
@@ -2504,7 +2522,14 @@ function createWelcomeVm(
     stepItems,
     writes,
     messages,
+    heldGets,
     sandbox,
+    releaseStorageGets() {
+      const pending = heldGets.splice(0, heldGets.length);
+      for (const resolve of pending) {
+        resolve();
+      }
+    },
     fire(element, type) {
       for (const fn of element.listeners[type] || []) {
         fn();
@@ -4093,6 +4118,71 @@ async function checkKeyVerifierGate() {
       "welcome persist: the provider persist committed BEFORE the sample translation message"
     );
     assertEqual(testConnections.length, 0, "welcome persist: accepting a stored key never bills a TEST_CONNECTION");
+  }
+
+  // ---- (c2) Codex PR #19 P2: a slow saved-key read for provider A must not
+  // enable 继续 after the user has switched to provider B.
+  {
+    const DS_KEY = fakeKey("raceDs", 22);
+    const welcome = createWelcomeVm(
+      {
+        provider: "deepseek",
+        deepseekApiKey: DS_KEY,
+        kimiApiKey: "",
+        apiKey: DS_KEY,
+        model: "deepseek-flash",
+        deepseekKeyStatus: "verified",
+        deepseekKeyStatusFor: `${DS_KEY.length}:${DS_KEY.slice(-4)}`
+      },
+      { holdStorageGets: true }
+    );
+    // Init already called selectProvider("deepseek") and parked its saved-key read.
+    for (let i = 0; i < 40 && welcome.heldGets.length === 0; i += 1) {
+      await settle(5);
+    }
+    assertTrue(welcome.heldGets.length >= 1, "welcome race: DeepSeek's init saved-key read is in flight");
+    welcome.fire(welcome.providerButtons[1], "click"); // switch to Kimi (no key) while DeepSeek's get is parked
+    assertTrue(welcome.dom.get("s2-next").disabled, "welcome race: 继续 stays disabled right after the switch");
+    welcome.releaseStorageGets();
+    await settle(20);
+    assertTrue(welcome.dom.get("s2-next").disabled, "welcome race: DeepSeek's late read does not enable 继续 on Kimi");
+    assertFalse(
+      String(welcome.dom.get("s2-msg").textContent).includes("已配置"),
+      "welcome race: DeepSeek's late read does not render a stored-key offer on Kimi"
+    );
+  }
+
+  // ---- (c3) Codex PR #19 P2: a stored key whose matching status is "failed"
+  // must NOT enable 继续 or be re-marked verified without a fresh check.
+  {
+    const FAIL_KEY = fakeKey("failOnboard", 24);
+    const welcome = createWelcomeVm(
+      {
+        provider: "deepseek",
+        deepseekApiKey: FAIL_KEY,
+        kimiApiKey: "",
+        apiKey: FAIL_KEY,
+        model: "deepseek-flash",
+        deepseekKeyStatus: "failed",
+        deepseekKeyStatusFor: `${FAIL_KEY.length}:${FAIL_KEY.slice(-4)}`
+      }
+    );
+    welcome.fire(welcome.providerButtons[0], "click");
+    await settle(20);
+    assertTrue(welcome.dom.get("s2-next").disabled, "welcome failed: 继续 stays disabled for a failed stored key");
+    assertTrue(
+      String(welcome.dom.get("s2-msg").textContent).includes("验证失败"),
+      "welcome failed: the message names the previous failure"
+    );
+    // Clicking 继续 (disabled) must not persist a verified status.
+    welcome.fire(welcome.dom.get("s2-next"), "click");
+    await settle(20);
+    assertEqual(
+      welcome.writes.filter((write) => write.updates.keyVerified === true || write.updates.deepseekKeyStatus === "verified").length,
+      0,
+      "welcome failed: Continue does not re-mark a failed key as verified"
+    );
+    assertEqual(welcome.storage.deepseekKeyStatus, "failed", "welcome failed: the failed status survives");
   }
 
   // ---- (d) welcome.js without shared.js fails loudly, console-free ----

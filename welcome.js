@@ -417,17 +417,44 @@
     if (!canStore) {
       return;
     }
-    const meta = PROVIDERS[provider];
+    // Capture the provider this read is for: a slow chrome.storage.local.get
+    // that returns AFTER the user switched providers must not enable 继续
+    // with the previous provider's key (Codex PR #19 P2).
+    const chosenProvider = provider;
+    const meta = PROVIDERS[chosenProvider];
+    const statusField = `${chosenProvider}KeyStatus`;
+    const statusForField = `${chosenProvider}KeyStatusFor`;
     try {
-      const stored = await chrome.storage.local.get(meta.keyField);
+      const stored = await chrome.storage.local.get([
+        meta.keyField,
+        statusField,
+        statusForField
+      ]);
+      if (provider !== chosenProvider) {
+        return;
+      }
       const existing = stored && stored[meta.keyField];
       // A value in the input means the user is already pasting/typing their
       // own key — never let a slow storage read overwrite their in-flight
       // verification with the stored-key shortcut.
-      if (existing && typeof existing === "string" && existing.length >= 4 && !els.s2Key.value.trim()) {
-        setKeyMessage(`已配置 · 尾号 ${existing.slice(-4)}（可直接继续，或粘贴新 Key 替换）`, "ok");
-        setVerified(true, null);
+      if (!existing || typeof existing !== "string" || existing.length < 4 || els.s2Key.value.trim()) {
+        return;
       }
+      const status = stored[statusField];
+      const fingerprint = stored[statusForField];
+      const matches = fingerprint === Utils.keyFingerprint(existing);
+      // A definitive failed verdict for THIS key must not enable 继续 or be
+      // re-marked verified without a fresh TEST_CONNECTION.
+      if (status === "failed" && matches) {
+        setKeyMessage(
+          `上次验证失败 · 尾号 ${existing.slice(-4)} · 请重新粘贴或重新测试`,
+          "er"
+        );
+        setVerified(false, null);
+        return;
+      }
+      setKeyMessage(`已配置 · 尾号 ${existing.slice(-4)}（可直接继续，或粘贴新 Key 替换）`, "ok");
+      setVerified(true, null);
     } catch {
       // Ignore — the user can still paste a key.
     }

@@ -690,6 +690,47 @@ return {
     }
   }
 
+  // PR #19 follow-up: live print must hide failure markers (HTML export
+  // already strips them, but PRINT_PAGE previously only hid the pill).
+  {
+    const printSlice = handlerSlice("PRINT_PAGE") || "";
+    if (!printSlice) {
+      fail("content.js: runtime.onMessage must handle PRINT_PAGE");
+    } else if (!/window\.print\(/.test(printSlice)) {
+      fail("content.js: PRINT_PAGE must call window.print()");
+    } else if (!/querySelectorAll\("\[data-kilocean-failed-marker\]"\)/.test(printSlice)) {
+      fail("content.js: PRINT_PAGE must query [data-kilocean-failed-marker] hosts to hide them for print");
+    } else if (!/markerHosts[\s\S]{0,200}style\.display\s*=\s*"none"/.test(printSlice)) {
+      fail("content.js: PRINT_PAGE must set failure-marker hosts to display:none before window.print()");
+    } else if (!/#kilocean-progress-host|progressPillHost/.test(printSlice)) {
+      fail("content.js: PRINT_PAGE must still hide the progress pill around window.print()");
+    }
+  }
+
+  // PR #19 follow-up: a key error mid-run (translated + failed) lands in the
+  // partial pill — offer 「打开设置」, never Retry (which would re-bill).
+  if (renderPillSrc) {
+    const partialAt = renderPillSrc.indexOf("if (state.failed > 0)");
+    if (partialAt < 0) {
+      fail("content.js: renderProgressPill must have a partial (state.failed > 0) branch");
+    } else {
+      const partialSrc = renderPillSrc.slice(partialAt);
+      if (!/isKeyRelatedError\(state\.error\)/.test(partialSrc)) {
+        fail("content.js: the partial pill must consult isKeyRelatedError(state.error)");
+      }
+      if (!/data-action="settings"/.test(partialSrc) || !/打开设置/.test(partialSrc)) {
+        fail('content.js: the partial pill must offer 「打开设置」 for key-related errors');
+      }
+      // When the error IS key-related, the retry button must not be the one offered.
+      const keyBranch = /isKeyRelatedError\(state\.error\)\s*\?[\s\S]*?:/.exec(partialSrc);
+      if (!keyBranch) {
+        fail("content.js: the partial pill must ternary-choose settings vs retry by isKeyRelatedError");
+      } else if (/data-action="retry"/.test(keyBranch[0])) {
+        fail("content.js: the key-related arm of the partial pill must not include a retry action");
+      }
+    }
+  }
+
   // ------------------------------------------------------------------
   // (d) Copy + version.
   // ------------------------------------------------------------------
