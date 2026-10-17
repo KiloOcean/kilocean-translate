@@ -1192,7 +1192,8 @@
       ? segments
       : Utils.orderSegmentsByViewport(
         segments,
-        (block) => block.getBoundingClientRect(),
+        // Items are segments ({ block, text, ... }), not elements.
+        (segment) => segment.block.getBoundingClientRect(),
         window.innerHeight
       );
 

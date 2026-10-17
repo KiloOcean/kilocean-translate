@@ -51,6 +51,15 @@ export async function runContent150Checks({ ROOT, fail }) {
     return;
   }
   const contentRaw = fs.readFileSync(contentPath, "utf8");
+  // Regression (found in e2e): orderSegmentsByViewport receives SEGMENTS, so
+  // the rect getter must read segment.block — calling getBoundingClientRect on
+  // the segment object throws and silently degrades to DOM order.
+  {
+    const call = /orderSegmentsByViewport\(\s*segments,\s*(?:\/\/[^\n]*\n\s*)*\(([a-zA-Z_]+)\)\s*=>\s*([^,]+),/.exec(contentRaw);
+    if (!call || !new RegExp(`^${call[1]}\\.block\\.getBoundingClientRect\\(\\)`).test(call[2].trim())) {
+      fail("content.js: orderSegmentsByViewport rect getter must read segment.block.getBoundingClientRect() (items are segments, not elements)");
+    }
+  }
   const content = stripComments(contentRaw);
 
   const extract = (name) => extractFunctionFrom(contentRaw, name);
