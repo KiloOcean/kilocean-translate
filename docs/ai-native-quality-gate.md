@@ -12,7 +12,7 @@ CI 绿灯是**必要但不充分**条件。**禁止**仅凭 `ci / Build & Test` 
 4. **qa / QA Gate**：PR 带 `qa-passed` label（见 `QA.md`）
 5. **Conversation resolution**：阻断性 review threads 已 resolve
 6. **自测清单**勾选（见下）
-7. **权限克制**：`activeTab` / `scripting` / `storage`；host 仅翻译 API（`api.deepseek.com`，以及可选的 `api.moonshot.cn`）
+7. **权限克制**：`activeTab` / `scripting` / `storage` / `contextMenus`（1.5.0 起，右键菜单，无权限警告）；不加 `content_scripts`；host 仅翻译 API（`api.deepseek.com`，以及可选的 `api.moonshot.cn`）
 
 ### Copilot
 

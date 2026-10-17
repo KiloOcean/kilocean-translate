@@ -370,6 +370,51 @@
     return `${leading}${String(translated).trim()}${trailing}`;
   }
 
+  // Visible-area-first ordering for the initial page run: segments whose rect
+  // intersects the viewport translate first (input order among them — callers
+  // pass DOM order), then segments starting within one viewport height below
+  // the fold, then everything else in input order. Items whose rect is
+  // unavailable (getRect returns null/throws) keep input order in the last
+  // tier — never dropped. Pure: returns a NEW array and reads getRect exactly
+  // once per item, so callers can pass getBoundingClientRect without repeated
+  // layout reads. Dynamic follow-up runs keep discovery order (callers simply
+  // do not reorder).
+  function orderSegmentsByViewport(items, getRect, viewportHeight) {
+    const list = Array.isArray(items) ? [...items] : [];
+    if (list.length <= 1) {
+      return list;
+    }
+    const height = Number(viewportHeight);
+    const fold = Number.isFinite(height) && height > 0 ? height : 0;
+    const visible = [];
+    const below = [];
+    const rest = [];
+    for (const item of list) {
+      let rect = null;
+      try {
+        rect = getRect ? getRect(item) : null;
+      } catch {
+        rect = null;
+      }
+      if (
+        !rect ||
+        !Number.isFinite(rect.top) ||
+        !Number.isFinite(rect.bottom)
+      ) {
+        rest.push(item);
+        continue;
+      }
+      if (rect.bottom > 0 && rect.top < fold) {
+        visible.push(item);
+      } else if (rect.top >= fold && rect.top < fold * 2) {
+        below.push(item);
+      } else {
+        rest.push(item);
+      }
+    }
+    return [...visible, ...below, ...rest];
+  }
+
   function chunkSegments(segments, maxCharacters = 5000, maxItems = 24) {
     const chunks = [];
     let current = [];
@@ -699,6 +744,7 @@
     isSkippableText,
     isXHost,
     preserveWhitespace,
+    orderSegmentsByViewport,
     chunkSegments,
     hasMultiParagraphSource,
     countSourceParagraphUnits,

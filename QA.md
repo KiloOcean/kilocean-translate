@@ -28,6 +28,31 @@ PR: #___
 - [ ] **unpacked 与商店 ID 一致**：开发者模式「加载已解压的扩展程序」加载本仓库根目录后，`chrome://extensions` 中显示的 ID 为 `lmdbhjngjhlgbpmbjfffegjalchblpke`，与商店条目一致（`manifest.json` 的 `key` 字段 = 商店公钥，见 `docs/STORE_KEY.md`）；unpacked 下同样能看到已保存的 Key 状态。
   **Unpacked install shows the same ID as the store listing** (`lmdbhjngjhlgbpmbjfffegjalchblpke`) because `manifest.key` carries the store public key.
 
+## 1.5.0 手动验证（极简交互改版）/ 1.5.0 Manual checks (minimalist UX)
+
+**弹窗 / Popup**
+- [ ] 全新 profile 安装后自动打开新手引导页（welcome.html）；从 1.4.3 **更新**时不打开。
+- [ ] 引导页：选服务商 → 粘贴 Key 自动验证（格式错误就地提示、不发请求；有效 Key 显示「✓ 已连接 · 尾号 xxxx」）→「试翻这段」出现双语结果；每一步都可以跳过。
+- [ ] 没有 Key 时打开弹窗：首屏是「两步连上翻译服务」配置卡，**不出现「准备就绪」**，也看不到「翻译此页」按钮；粘贴有效 Key 验证通过后 1 秒内切换为已配置首屏。
+- [ ] 已配置首屏：「译为 xx」、连接状态行、大按钮「翻译此页 Alt+A」、双语 / 译文 / 原文切换、划词提示，不滚动即可看全，弹窗高度约 300px（任何状态都不超过 600px）。
+- [ ] 齿轮进入设置：服务商、Key、模型、测试连接、快捷键、导出 / 导入设置都在这里；「导入设置」仍会打开 popup.html?view=settings 标签页，Linux Chromium 上选择文件后导入正常。
+- [ ] chrome:// 页面或应用商店页打开弹窗，直接显示「这个页面不能翻译」，翻译按钮不可点。
+
+**快捷键与右键菜单 / Shortcuts and context menu**
+- [ ] `chrome://extensions/shortcuts` 中显示「翻译此页 Alt+A」「翻译选中文字 Alt+T」（如被其他扩展占用则显示未设置，弹窗中也显示「未设置」）。
+- [ ] 新打开、从没开过弹窗的网页：选中文字 → 按 Alt+T，2 秒内选区旁出现译文气泡；右键「翻译选中文字」同样可用。
+- [ ] 没有选中文字时按 Alt+T：气泡提示「先选中要翻译的文字…」，不发请求。
+- [ ] 没有 Key 时按 Alt+T：气泡提示「还没有配置 API Key」并有「打开设置」；按 Alt+A：打开设置标签页，不发请求。
+- [ ] 网页脚本伪造的 mouseup / keyup / click 不会产生任何翻译请求（页内提示里没有可计费的按钮）。
+- [ ] manifest 没有 `content_scripts`，host_permissions 仍只有两个翻译 API；新增的 `contextMenus` 在安装和更新时都没有权限警告。
+
+**整页翻译 / Page translation**
+- [ ] 长页面滚到中部后按 Alt+A：视口内的段落最先出现译文；右下角胶囊显示真实的「翻译中 N / M」，与弹窗进度一致。
+- [ ] 人为制造失败（如断网后翻译几段）：失败段落末尾出现「这段没翻译成功（原因）· 重试」；胶囊显示「重试 K 段」，点击后只重发失败的段（background 日志里条目数 = K），已完成的段不重翻。
+- [ ] 超过 5000 字的单个段落：任一半返回空时计为失败（胶囊 / 弹窗显示失败数），不再显示为全部成功。
+- [ ] Key 无效（401）时胶囊保持显示，不自动消失，带「打开设置」。
+- [ ] 完成后胶囊可切换双语 / 译文 / 原文、「还原」；导出 HTML 和打印里不包含胶囊和失败标记。
+
 ## 黄金样例 / Golden Samples
 
 > 用真实输入/输出对固定行为，防止悄悄漂移。

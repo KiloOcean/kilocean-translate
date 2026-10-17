@@ -15,12 +15,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 
-const ALLOWED_PERMISSIONS = new Set(["activeTab", "scripting", "storage"]);
+const ALLOWED_PERMISSIONS = new Set(["activeTab", "scripting", "storage", "contextMenus"]);
 const ALLOWED_HOSTS = new Set([
   "https://api.deepseek.com/*",
   "https://api.moonshot.cn/*",
 ]);
-const JS_FILES = ["background.js", "content.js", "popup.js", "shared.js"];
+// welcome.js (1.5.0 onboarding page) is scanned as soon as it exists — the
+// page lands in a parallel workstream, so its absence is not a CI error here.
+const JS_FILES = [
+  "background.js",
+  "content.js",
+  "popup.js",
+  "shared.js",
+  ...(fs.existsSync(path.join(ROOT, "welcome.js")) ? ["welcome.js"] : [])
+];
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
 // Chrome Web Store item this repository publishes to. manifest.key must carry
@@ -96,6 +104,50 @@ function checkManifest() {
     if (!ALLOWED_HOSTS.has(host)) {
       fail(`disallowed host_permission: ${host} (allowlist: ${[...ALLOWED_HOSTS].join(", ")})`);
     }
+  }
+  // 1.5.0 keeps the host set exactly as 1.4.x shipped it — no new origins.
+  for (const host of ALLOWED_HOSTS) {
+    if (!hosts.includes(host)) {
+      fail(`missing host_permission (the 1.4.x set must stay unchanged): ${host}`);
+    }
+  }
+
+  // 1.5.0 entry points: keyboard commands. The suggested keys are only a
+  // default (users may rebind/unbind — the UI reads the live binding via
+  // chrome.commands.getAll), but the commands themselves must exist.
+  const commands = manifest.commands && typeof manifest.commands === "object"
+    ? manifest.commands
+    : null;
+  if (!commands) {
+    fail("manifest.commands is required (translate-page / translate-selection)");
+  } else {
+    const expectedCommands = {
+      "translate-page": { key: "Alt+A", description: "翻译此页" },
+      "translate-selection": { key: "Alt+T", description: "翻译选中文字" }
+    };
+    for (const [name, expected] of Object.entries(expectedCommands)) {
+      const command = commands[name];
+      if (!command || typeof command !== "object") {
+        fail(`manifest.commands.${name} is required`);
+        continue;
+      }
+      if (
+        command.suggested_key?.default !== expected.key ||
+        command.suggested_key?.mac !== expected.key
+      ) {
+        fail(`manifest.commands.${name}.suggested_key must suggest ${expected.key} for default and mac`);
+      }
+      if (command.description !== expected.description) {
+        fail(`manifest.commands.${name}.description must be ${JSON.stringify(expected.description)}, got ${JSON.stringify(command.description)}`);
+      }
+    }
+  }
+
+  // Injection stays on demand (activeTab + chrome.scripting from the entry
+  // points): a declarative content_scripts entry would run on every page
+  // without the user asking for it.
+  if (manifest.content_scripts) {
+    fail(`manifest must not declare content_scripts (on-demand injection only), got ${JSON.stringify(manifest.content_scripts)}`);
   }
 
   // manifest.key = the Chrome Web Store public key (NOT an API key). It pins
@@ -1837,7 +1889,7 @@ async function checkModelMigrationAndRetryPolicy() {
 // may be migrated (legacy apiKey → deepseekApiKey) or mirrored (apiKey), but
 // never emptied. The popup load path runs in its own vm with a minimal DOM
 // mock, including the settings import/export merge rules.
-function createBackgroundVm(storageData, fetchImpl) {
+function createBackgroundVm(storageData, fetchImpl, { pingOk = false } = {}) {
   const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
   const backgroundSource = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
   const listeners = {
@@ -1845,8 +1897,14 @@ function createBackgroundVm(storageData, fetchImpl) {
     startup: [],
     message: [],
     tabsRemoved: [],
-    tabsUpdated: []
+    tabsUpdated: [],
+    command: [],
+    contextMenu: []
   };
+  // 1.5.0 entry-point recordings: tabs opened, tab messages delivered,
+  // on-demand injections and context menus created — the command/menu tests
+  // assert against the shipping wiring, not stub-side reimplementation.
+  const entryCalls = { tabCreates: [], tabMessages: [], injections: [], menuCreates: [], pings: [] };
   const sandbox = {
     console: { log() {}, warn() {}, error() {} },
     setTimeout,
@@ -1856,9 +1914,28 @@ function createBackgroundVm(storageData, fetchImpl) {
     chrome: {
       runtime: {
         id: "kilocean-ci-extension-id",
+        getURL: (rel) => `chrome-extension://kilocean-ci-extension-id/${rel}`,
         onInstalled: { addListener: (fn) => listeners.installed.push(fn) },
         onStartup: { addListener: (fn) => listeners.startup.push(fn) },
         onMessage: { addListener: (fn) => listeners.message.push(fn) }
+      },
+      commands: {
+        onCommand: { addListener: (fn) => listeners.command.push(fn) },
+        getAll: async () => []
+      },
+      contextMenus: {
+        removeAll: (callback) => {
+          if (typeof callback === "function") {
+            callback();
+          }
+        },
+        create: (options, callback) => {
+          entryCalls.menuCreates.push(options);
+          if (typeof callback === "function") {
+            callback();
+          }
+        },
+        onClicked: { addListener: (fn) => listeners.contextMenu.push(fn) }
       },
       storage: {
         local: {
@@ -1874,7 +1951,30 @@ function createBackgroundVm(storageData, fetchImpl) {
       },
       tabs: {
         onRemoved: { addListener: (fn) => listeners.tabsRemoved.push(fn) },
-        onUpdated: { addListener: (fn) => listeners.tabsUpdated.push(fn) }
+        onUpdated: { addListener: (fn) => listeners.tabsUpdated.push(fn) },
+        create: async (options) => {
+          entryCalls.tabCreates.push(options);
+          return { id: 900 + entryCalls.tabCreates.length };
+        },
+        query: async () => [{ id: 42, url: "https://example.com/active" }],
+        sendMessage: async (tabId, message, options) => {
+          if (message?.type === "PING_CONTENT") {
+            entryCalls.pings.push({ tabId });
+            if (!pingOk) {
+              // A real tab without the content script rejects exactly like this.
+              throw new Error("Could not establish connection. Receiving end does not exist.");
+            }
+            return { ok: true };
+          }
+          entryCalls.tabMessages.push({ tabId, message, options });
+          return { ok: true };
+        }
+      },
+      scripting: {
+        executeScript: async (injection) => {
+          entryCalls.injections.push(injection);
+          return [];
+        }
       },
       action: {
         setBadgeText: async () => {},
@@ -1897,6 +1997,7 @@ function createBackgroundVm(storageData, fetchImpl) {
   return {
     storage: storageData,
     listeners,
+    entryCalls,
     hooks: sandbox.__hooks,
     sendMessage: (message, sender = { id: sandbox.chrome.runtime.id, tab: { id: 11 } }) =>
       new Promise((resolve) => {
@@ -1910,7 +2011,21 @@ function createBackgroundVm(storageData, fetchImpl) {
 
 // Minimal DOM stub good enough to run the real popup.js load path (and the
 // settings import/export helpers) without a browser.
-function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok: false }) } = {}) {
+function createPopupVm(
+  storageData,
+  {
+    runtimeMessageHandler = async () => ({ ok: false }),
+    // chrome.commands.getAll payload (shortcut labels); [] keeps the markup
+    // fallbacks, mirroring a browser without the commands API.
+    commands = [],
+    // The tab chrome.tabs.query reports as active (id defaults to 42; tests
+    // can shape the url to exercise restricted-page handling).
+    activeTab = {},
+    // window.location.search for the popup document ("?view=settings" opens
+    // the popup.html?view=settings settings tab).
+    locationSearch = ""
+  } = {}
+) {
   const storageListeners = [];
   const runtimeMessageListeners = [];
   const windowListeners = {};
@@ -1931,6 +2046,8 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
     attributes: {},
     listeners: {},
     options: [],
+    // Inline style stub (e.g. #status-progress.style.width).
+    style: {},
     // Real class tracking (not a no-op): tests assert rendered classes,
     // e.g. the display-mode buttons' `active` state.
     classList: (() => {
@@ -1966,7 +2083,10 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
     focus() {
       this.focused = true;
     },
+    // Records the parent so tests can assert where a moved node lives (the
+    // popup homes #key-entry into the setup/settings key slots).
     appendChild(node) {
+      node.parentNode = this;
       this.options.push(node);
       return node;
     },
@@ -2044,7 +2164,35 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
     "selection-confirm-panel",
     "selection-confirm-text",
     "selection-confirm-btn",
-    "selection-confirm-dismiss"
+    "selection-confirm-dismiss",
+    // 1.5.0 popup chrome: views, provider status line, shortcuts, setup card.
+    "app",
+    "view-main",
+    "view-setup",
+    "view-settings",
+    "open-settings",
+    "back-main",
+    "more-settings",
+    "provider-status",
+    "provider-status-label",
+    "provider-status-meta",
+    "translate-shortcut",
+    "selection-shortcut",
+    "selection-hint",
+    "status-wrap",
+    "status-progress",
+    "retry-failed",
+    "setup-console-link",
+    "setup-key-slot",
+    "settings-key-slot",
+    "key-entry",
+    "setup-feedback",
+    "shortcut-list",
+    "open-shortcuts",
+    "app-version",
+    "open-welcome",
+    "more-menu",
+    "status-dot"
   ]) {
     element(id);
   }
@@ -2053,13 +2201,22 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
   const modeButtons = ["bilingual", "translation-only", "original"].map((mode) =>
     makeElement({ dataset: { mode } })
   );
+  // Setup-card provider radios (popup.js querySelectorAll(".provider-option")).
+  const providerOptionButtons = ["deepseek", "kimi"].map((provider) =>
+    makeElement({ dataset: { provider } })
+  );
 
+  // Recorded chrome.tabs.sendMessage / chrome.tabs.create traffic so tests can
+  // assert exactly one RETRY_FAILED and where the shortcuts link points.
+  const tabMessages = [];
+  const tabCreates = [];
   const sandbox = {
     console: { log() {}, warn() {}, error() {} },
     setTimeout,
     clearTimeout,
     setInterval,
     clearInterval,
+    location: { search: locationSearch },
     Blob: FakeBlob,
     URL: { createObjectURL: () => `blob:fake-${blobs.length}`, revokeObjectURL() {} },
     // Recorded (unlike a no-op) so tests can fire pagehide, and swapped per
@@ -2070,7 +2227,15 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
     document: {
       getElementById: (id) => byId.get(id) || null,
       querySelector: (selector) => (selector === ".status-card" ? statusCard : null),
-      querySelectorAll: (selector) => (selector === ".mode-button" ? modeButtons : []),
+      querySelectorAll: (selector) => {
+        if (selector === ".mode-button") {
+          return modeButtons;
+        }
+        if (selector === ".provider-option") {
+          return providerOptionButtons;
+        }
+        return [];
+      },
       createElement: () => makeElement(),
       body: makeElement(),
       addEventListener(type, fn) {
@@ -2080,7 +2245,7 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
     },
     chrome: {
       runtime: {
-        getManifest: () => ({ version: "1.4.3" }),
+        getManifest: () => ({ version: "1.5.0" }),
         onMessage: { addListener(fn) { runtimeMessageListeners.push(fn); } },
         sendMessage: (message) => runtimeMessageHandler(message)
       },
@@ -2092,9 +2257,17 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
         onChanged: { addListener(fn) { storageListeners.push(fn); } }
       },
       tabs: {
-        query: async () => [{ id: 42 }],
-        sendMessage: async () => ({ ok: true, status: { active: false } })
+        query: async () => [{ id: 42, ...activeTab }],
+        sendMessage: async (tabId, message) => {
+          tabMessages.push({ tabId, message });
+          return { ok: true, status: { active: false } };
+        },
+        create: async (details) => {
+          tabCreates.push(details);
+          return { id: 1 };
+        }
       },
+      commands: { getAll: async () => commands },
       scripting: { executeScript: async () => {} }
     }
   };
@@ -2117,7 +2290,8 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
       renderTranslationStatus,
       runKeyConnectionTest,
       buildExportPayload,
-      getKeyTestState: () => ({ op: keyTestOp, pendingOp: keyTestPendingOp })
+      getKeyTestState: () => ({ op: keyTestOp, pendingOp: keyTestPendingOp }),
+      getAppView: () => currentView()
     };`,
     context,
     { filename: "popup.js" }
@@ -2128,6 +2302,9 @@ function createPopupVm(storageData, { runtimeMessageHandler = async () => ({ ok:
     hooks: sandbox.__popupHooks,
     sandbox,
     blobs,
+    tabMessages,
+    tabCreates,
+    providerOptionButtons,
     emitStorageChange(changes) {
       for (const [field, change] of Object.entries(changes)) {
         storageData[field] = change.newValue;
@@ -2201,13 +2378,13 @@ async function checkKeyMigrationGate() {
     if (seedDeepseek) {
       assertTrue(
         String(data.deepseekApiKey || "").trim() === seedDeepseek,
-        `${label}: stored DeepSeek key must survive every 1.4.3 load path`
+        `${label}: stored DeepSeek key must survive every 1.5.0 load path`
       );
     }
     if (seedKimi) {
       assertTrue(
         String(data.kimiApiKey || "").trim() === seedKimi,
-        `${label}: stored Kimi key must survive every 1.4.3 load path`
+        `${label}: stored Kimi key must survive every 1.5.0 load path`
       );
     }
     if (seedLegacy && !seedDeepseek && !seedKimi) {
@@ -2275,12 +2452,12 @@ async function checkKeyMigrationGate() {
 
   // ---- 1.3.x single-key storage (apiKey + legacy model name) ----
   const migratedFromLegacy = await runUpgradeGauntlet(
-    "1.3.x → 1.4.3",
+    "1.3.x → 1.5.0",
     { apiKey: LEGACY_KEY, model: "deepseek-v4-flash" },
     { expectedProvider: "deepseek", expectedActiveKey: LEGACY_KEY, expectedModel: "deepseek-flash" }
   );
-  assertEqual(migratedFromLegacy.deepseekApiKey, LEGACY_KEY, "1.3.x → 1.4.3: legacy key persisted as deepseekApiKey");
-  assertEqual(migratedFromLegacy.model, "deepseek-flash", "1.3.x → 1.4.3: legacy model name retired in storage");
+  assertEqual(migratedFromLegacy.deepseekApiKey, LEGACY_KEY, "1.3.x → 1.5.0: legacy key persisted as deepseekApiKey");
+  assertEqual(migratedFromLegacy.model, "deepseek-flash", "1.3.x → 1.5.0: legacy model name retired in storage");
 
   // ---- 1.4.x DeepSeek user, current + legacy model names ----
   await runUpgradeGauntlet(
@@ -2311,6 +2488,39 @@ async function checkKeyMigrationGate() {
   );
   assertEqual(dualStorage.deepseekApiKey, DEEPSEEK_KEY, "1.4.x dual keys: inactive DeepSeek key survives Kimi sessions");
   assertEqual(dualStorage.apiKey, KIMI_KEY, "1.4.x dual keys: apiKey mirrors the active provider's key");
+
+  // ---- 1.5.0 onInstalled: menus recreated, welcome ONLY on install ----
+  {
+    // (b) above fires reason "update" three times per gauntlet round; nothing
+    // in those flows may ever open a tab.
+    const updated = createBackgroundVm({ deepseekApiKey: DEEPSEEK_KEY }, okFetch);
+    for (const onInstalled of updated.listeners.installed) {
+      await onInstalled({ reason: "update", previousVersion: "1.4.3" });
+    }
+    assertEqual(updated.entryCalls.tabCreates.length, 0, "onInstalled(update): must never open welcome.html");
+
+    const installed = createBackgroundVm({ deepseekApiKey: DEEPSEEK_KEY }, okFetch);
+    for (const onInstalled of installed.listeners.installed) {
+      await onInstalled({ reason: "install" });
+    }
+    assertEqual(installed.entryCalls.tabCreates.length, 1, "onInstalled(install): exactly one welcome tab");
+    assertTrue(
+      String(installed.entryCalls.tabCreates[0]?.url || "").endsWith("welcome.html"),
+      "onInstalled(install): opens chrome.runtime.getURL(\"welcome.html\")"
+    );
+    const selectionMenu = installed.entryCalls.menuCreates.find((menu) => menu.id === "kilocean-translate-selection");
+    assertEqual(
+      selectionMenu ? { title: selectionMenu.title, contexts: selectionMenu.contexts } : null,
+      { title: "翻译选中文字", contexts: ["selection"] },
+      "onInstalled: context menu kilocean-translate-selection (title + contexts)"
+    );
+    const pageMenu = installed.entryCalls.menuCreates.find((menu) => menu.id === "kilocean-translate-page");
+    assertEqual(
+      pageMenu ? { title: pageMenu.title, contexts: pageMenu.contexts } : null,
+      { title: "翻译此页", contexts: ["page"] },
+      "onInstalled: context menu kilocean-translate-page (title + contexts)"
+    );
+  }
 
   // ---- Popup load path (vm + DOM mock): open on legacy storage, then
   // re-open on the result — keys must never be wiped by the popup save ----
@@ -2428,8 +2638,12 @@ async function checkKeyMigrationGate() {
     release({ ok: true });
     await testDone;
     assertEqual(pollPopup.dom.get("status-title").textContent, "Key 有效", "poll: key test result survives a concurrent poll");
+    // 1.5.0: an inactive page collapses the status area instead of rendering
+    // an idle card — the title must keep its last explicit value while the
+    // wrap hides.
     pollPopup.hooks.renderTranslationStatus({ active: false });
-    assertEqual(pollPopup.dom.get("status-title").textContent, "准备就绪", "poll: passive updates resume after the test completes");
+    assertEqual(pollPopup.dom.get("status-title").textContent, "Key 有效", "poll: passive updates resume after the test completes (title untouched)");
+    assertEqual(pollPopup.dom.get("status-wrap").hidden, true, "poll: an inactive page hides the status area (no idle card in 1.5.0)");
   }
 
   // ---- The real 700 ms poll (CONTENT_STATUS → startStatusPolling →
@@ -2843,6 +3057,233 @@ async function checkKeyMigrationGate() {
   }
   if (!/包含 API Key/.test(fs.readFileSync(path.join(ROOT, "popup.html"), "utf8"))) {
     fail("popup.html: export opt-in checkbox with the 明文保存 warning must exist");
+  }
+}
+
+// ---- 1.5.0 entry points: keyboard commands + context menu (vm) ----
+// Fires chrome.commands.onCommand and chrome.contextMenus.onClicked against
+// the real background.js and asserts the shipping wiring: on-demand injection
+// (only when the content script is absent), COMMAND_SELECTION_TRANSLATE
+// delivery to the top frame, and the no-key → settings-tab rule for
+// translate-page.
+async function checkCommandsAndContextMenu() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  // The command listeners are fire-and-forget async; a short timer flushes
+  // their microtask chains (all stubbed chrome calls resolve immediately).
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  const KEY = fakeKey("cmd", 21);
+  const TAB = { id: 7, url: "https://example.com/article" };
+  const noFetch = async () => {
+    throw new Error("no provider fetch may happen in the entry-point tests");
+  };
+
+  // (1) Alt+T on a tab without the content script: PING fails → inject
+  //     shared.js + content.js, then deliver the command to frame 0.
+  {
+    const bg = createBackgroundVm({}, noFetch);
+    assertTrue(bg.listeners.command.length === 1, "commands: background must register one chrome.commands.onCommand listener");
+    bg.listeners.command[0]("translate-selection", TAB);
+    await settle();
+    assertEqual(bg.entryCalls.pings.length, 1, "Alt+T: content script is pinged before injecting");
+    assertEqual(bg.entryCalls.injections.length, 1, "Alt+T (no content script): exactly one injection");
+    assertEqual(bg.entryCalls.injections[0]?.files, ["shared.js", "content.js"], "Alt+T: injects shared.js + content.js");
+    assertEqual(bg.entryCalls.injections[0]?.target, { tabId: 7 }, "Alt+T: injection targets the command's tab");
+    assertEqual(bg.entryCalls.tabMessages.length, 1, "Alt+T: exactly one tab message");
+    assertEqual(
+      bg.entryCalls.tabMessages[0],
+      {
+        tabId: 7,
+        message: { type: "COMMAND_SELECTION_TRANSLATE", source: "command" },
+        options: { frameId: 0 }
+      },
+      "Alt+T: COMMAND_SELECTION_TRANSLATE (source command, top frame, no selectionText)"
+    );
+    assertEqual(bg.entryCalls.tabCreates.length, 0, "Alt+T: never opens a tab");
+  }
+
+  // (2) Context-menu click carries the browser's selectionText through.
+  {
+    const bg = createBackgroundVm({}, noFetch);
+    assertTrue(bg.listeners.contextMenu.length === 1, "context menu: background must register one contextMenus.onClicked listener");
+    bg.listeners.contextMenu[0](
+      { menuItemId: "kilocean-translate-selection", selectionText: "hello world" },
+      TAB
+    );
+    await settle();
+    assertEqual(bg.entryCalls.injections.length, 1, "context menu (no content script): exactly one injection");
+    assertEqual(
+      bg.entryCalls.tabMessages[0]?.message,
+      { type: "COMMAND_SELECTION_TRANSLATE", source: "contextMenu", selectionText: "hello world" },
+      "context menu: COMMAND_SELECTION_TRANSLATE (source contextMenu + selectionText)"
+    );
+    assertEqual(bg.entryCalls.tabMessages[0]?.options, { frameId: 0 }, "context menu: delivered to the top frame");
+  }
+
+  // (3) Content script already live: PING answers, nothing is injected.
+  {
+    const bg = createBackgroundVm({}, noFetch, { pingOk: true });
+    bg.listeners.command[0]("translate-selection", TAB);
+    await settle();
+    assertEqual(bg.entryCalls.pings.length, 1, "Alt+T (live script): still pinged first");
+    assertEqual(bg.entryCalls.injections.length, 0, "Alt+T (live script): must NOT re-inject when PING succeeds");
+    assertEqual(bg.entryCalls.tabMessages.length, 1, "Alt+T (live script): the command is still delivered");
+  }
+
+  // (4) Alt+A without a provider key: settings tab, nothing sent to the page,
+  //     nothing injected — no billable run can start.
+  {
+    const bg = createBackgroundVm({}, noFetch);
+    bg.listeners.command[0]("translate-page", TAB);
+    await settle();
+    assertEqual(bg.entryCalls.tabMessages.length, 0, "Alt+A (no key): no START_TRANSLATION is sent");
+    assertEqual(bg.entryCalls.injections.length, 0, "Alt+A (no key): no injection either");
+    assertEqual(bg.entryCalls.tabCreates.length, 1, "Alt+A (no key): exactly one tab opened");
+    assertTrue(
+      String(bg.entryCalls.tabCreates[0]?.url || "").endsWith("popup.html?view=settings"),
+      "Alt+A (no key): opens popup.html?view=settings"
+    );
+  }
+
+  // (5) Alt+A with a stored key: START_TRANSLATION carries the stored options.
+  {
+    const bg = createBackgroundVm({
+      provider: "deepseek",
+      deepseekApiKey: KEY,
+      targetLanguage: "zh-TW",
+      model: "deepseek-v4-pro",
+      displayMode: "translation-only"
+    }, noFetch);
+    // Route through the page context-menu item so the id → command mapping is
+    // covered too.
+    bg.listeners.contextMenu[0]({ menuItemId: "kilocean-translate-page" }, TAB);
+    await settle();
+    assertEqual(bg.entryCalls.tabCreates.length, 0, "Alt+A (keyed): no tab opened");
+    assertEqual(bg.entryCalls.tabMessages.length, 1, "Alt+A (keyed): exactly one START_TRANSLATION");
+    assertEqual(
+      bg.entryCalls.tabMessages[0]?.message,
+      {
+        type: "START_TRANSLATION",
+        options: {
+          provider: "deepseek",
+          targetLanguage: "zh-TW",
+          model: "deepseek-v4-pro",
+          displayMode: "translation-only"
+        }
+      },
+      "Alt+A (keyed): START_TRANSLATION carries the stored provider/language/model/displayMode"
+    );
+  }
+
+  // (6) Unknown command ids / menu items are ignored, and a command without a
+  //     tab resolves through the active-tab query fallback.
+  {
+    const bg = createBackgroundVm({}, noFetch);
+    bg.listeners.command[0]("translate-nothing", TAB);
+    bg.listeners.contextMenu[0]({ menuItemId: "someone-elses-menu" }, TAB);
+    await settle();
+    assertEqual(bg.entryCalls.tabMessages.length, 0, "unknown command/menu ids: nothing is sent");
+
+    bg.listeners.command[0]("translate-selection", undefined);
+    await settle();
+    assertEqual(bg.entryCalls.tabMessages[0]?.tabId, 42, "command without a tab: falls back to tabs.query active tab");
+  }
+}
+
+// ---- 1.5.0 welcome page messages (vm) ----
+// WELCOME_SAMPLE_TRANSLATE is billable: only the bundled welcome.html document
+// (sender.url = the extension's own chrome-extension:// URL) may use it, and
+// only within the 1..1200-char sample budget. OPEN_SETTINGS is the harmless
+// counterpart any of our senders may fire.
+async function checkWelcomeSampleTranslate() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+
+  const EXT = "kilocean-ci-extension-id";
+  const KEY = fakeKey("welcome", 24);
+  const fetchCalls = [];
+  const okFetch = async (url, options = {}) => {
+    fetchCalls.push({ url, authorization: options.headers?.Authorization || "" });
+    return {
+      ok: true,
+      status: 200,
+      statusText: "",
+      headers: { get: () => null },
+      url,
+      text: async () => JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ translations: ["你好，世界。"] }) } }]
+      })
+    };
+  };
+  const bg = () => createBackgroundVm({ provider: "deepseek", deepseekApiKey: KEY }, okFetch);
+
+  // (1) Forged / content-script sender (a page URL, not the extension's own
+  //     welcome document): rejected before any provider call.
+  {
+    const vmBg = bg();
+    const response = await vmBg.sendMessage(
+      { type: "WELCOME_SAMPLE_TRANSLATE", text: "hello" },
+      { id: EXT, tab: { id: 3 }, url: "https://evil.example/" }
+    );
+    assertTrue(response?.ok === false, "welcome sample: a page-URL sender must be rejected");
+    assertEqual(fetchCalls.length, 0, "welcome sample: a rejected sender must not trigger a provider fetch");
+  }
+
+  // (2) The welcome page itself: translated with the stored provider settings.
+  {
+    const vmBg = bg();
+    const response = await vmBg.sendMessage(
+      { type: "WELCOME_SAMPLE_TRANSLATE", text: "  Hello, world.  " },
+      { id: EXT, url: `chrome-extension://${EXT}/welcome.html` }
+    );
+    assertTrue(response?.ok === true, "welcome sample: the welcome page sender must be served");
+    assertEqual(response?.translation, "你好，世界。", "welcome sample: returns the translation");
+    assertEqual(fetchCalls.length, 1, "welcome sample: exactly one provider request");
+    assertEqual(fetchCalls[0].authorization, `Bearer ${KEY}`, "welcome sample: bills the stored provider key");
+  }
+
+  // (3) Over the 1200-char budget, even from the real welcome page: rejected
+  //     before any provider call.
+  {
+    const vmBg = bg();
+    const response = await vmBg.sendMessage(
+      { type: "WELCOME_SAMPLE_TRANSLATE", text: "x".repeat(1201) },
+      { id: EXT, url: `chrome-extension://${EXT}/welcome.html` }
+    );
+    assertTrue(response?.ok === false, "welcome sample: >1200 chars must be rejected");
+    assertEqual(fetchCalls.length, 1, "welcome sample: an oversized text must not trigger a provider fetch");
+  }
+
+  // (4) OPEN_SETTINGS from a content-script sender: opens the settings tab.
+  {
+    const vmBg = bg();
+    const response = await vmBg.sendMessage(
+      { type: "OPEN_SETTINGS" },
+      { id: EXT, tab: { id: 5 }, url: "https://any.example/page" }
+    );
+    assertTrue(response?.ok === true, "OPEN_SETTINGS: any own sender is served");
+    assertEqual(
+      vmBg.entryCalls.tabCreates.map((create) => create.url),
+      [`chrome-extension://${EXT}/popup.html?view=settings`],
+      "OPEN_SETTINGS: opens popup.html?view=settings in a tab"
+    );
   }
 }
 
@@ -4569,7 +5010,18 @@ async function checkPopupActionInitGate() {
     ["elements.restore|click", { reason: "RESTORE_ORIGINAL page message only, no settings read or write", gatedInside: false }],
     ["elements.exportHtml|click", { reason: "export runs in the content script; the popup reads no settings", gatedInside: false }],
     ["elements.printPdf|click", { reason: "print runs in the content script; the popup reads no settings", gatedInside: false }],
-    ["elements.importSettings|click", { reason: "opens the chooser/settings tab only; the gated import-file change handler does the work", gatedInside: false }]
+    ["elements.importSettings|click", { reason: "opens the chooser/settings tab only; the gated import-file change handler does the work", gatedInside: false }],
+    // 1.5.0 view chrome: pure navigation between main/setup/settings — none of
+    // these read or write settings.
+    ["elements.openSettings|click", { reason: "pure view navigation to settings, no settings access", gatedInside: false }],
+    ["elements.moreSettings|click", { reason: "pure view navigation to settings, no settings access", gatedInside: false }],
+    ["elements.backMain|click", { reason: "pure view navigation back to main, no settings access", gatedInside: false }],
+    ["elements.providerStatus|click", { reason: "pure view navigation (opens settings with the key focused), no settings access", gatedInside: false }],
+    ["elements.openShortcuts|click", { reason: "opens chrome://extensions/shortcuts in a new tab only, no settings access", gatedInside: false }],
+    // 1.5.0 partial-retry action: messages the page only (like restore/export).
+    ["elements.retryFailed|click", { reason: "RETRY_FAILED page message only, no settings read or write", gatedInside: false }],
+    // 1.5.0 setup card radios: mirror the #provider change handler's pattern.
+    ["option|click", { reason: "banks provider/model edits synchronously; the save goes through whenReady inside", gatedInside: true }]
   ]);
   // The P1 action set: these registrations MUST be whenReady-wrapped.
   const MUST_BE_GATED = [
@@ -4629,6 +5081,528 @@ async function checkPopupActionInitGate() {
     }
   }
   assertTrue(wrapped.has("button|click"), "init gate statics: the display-mode button listeners are extracted under the receiver 'button'");
+}
+
+// ---- 1.5.0 popup views (setup / main / settings) ----
+// The popup ships three views: a two-step embedded setup card (no key for the
+// active provider), the main view (key present), and the settings view
+// (user-opened or the popup.html?view=settings tab). This check drives the
+// real vm through the graduation rules, the provider status line, the
+// partial-retry action, shortcut labels and restricted pages.
+async function checkPopupViews150() {
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertTrue = (actual, label) => {
+    if (actual !== true) {
+      fail(`${label}: expected true, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertFalse = (actual, label) => {
+    if (actual !== false) {
+      fail(`${label}: expected false, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const fire = (el, type) => {
+    for (const fn of el.listeners[type] || []) {
+      fn();
+    }
+  };
+  // Fire and settle every listener's returned promise (whenReady wrappers).
+  const fireAction = (el, type) => Promise.all((el.listeners[type] || []).map((fn) => fn()));
+  const waitFor = async (probe, label) => {
+    for (let i = 0; i < 100 && !probe(); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    if (!probe()) {
+      fail(`popup views 1.5.0: timed out waiting for ${label}`);
+    }
+  };
+  const recordWrites = (popup) => {
+    const writes = [];
+    const originalSet = popup.sandbox.chrome.storage.local.set;
+    popup.sandbox.chrome.storage.local.set = async (updates) => {
+      writes.push(updates);
+      await originalSet(updates);
+    };
+    return writes;
+  };
+  // Controlled fake storage (set() parks until entry.release()), tracking
+  // concurrent writes — the same harness shape as the write-queue check.
+  const gateStorage = (popup) => {
+    const state = { writes: [], inFlight: 0, maxInFlight: 0 };
+    popup.sandbox.chrome.storage.local.set = (updates) => {
+      state.inFlight += 1;
+      state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
+      const entry = { updates };
+      state.writes.push(entry);
+      return new Promise((resolve) => {
+        entry.release = () => {
+          state.inFlight -= 1;
+          Object.assign(popup.storage, updates);
+          resolve();
+        };
+      });
+    };
+    return state;
+  };
+  // Popup whose FIRST chrome.storage.local.get (initialize()'s read) parks
+  // until release() — the pre-init window a fast user clicks inside.
+  const createHeldPopup = (storageData, options = {}) => {
+    const popup = createPopupVm(storageData, options);
+    let releaseRead;
+    const readGate = new Promise((resolve) => {
+      releaseRead = resolve;
+    });
+    const originalGet = popup.sandbox.chrome.storage.local.get;
+    let firstRead = true;
+    popup.sandbox.chrome.storage.local.get = (defaults) => {
+      if (!firstRead) {
+        return originalGet(defaults);
+      }
+      firstRead = false;
+      return readGate.then(() => originalGet(defaults));
+    };
+    const writes = recordWrites(popup);
+    return {
+      popup,
+      writes,
+      release: async () => {
+        releaseRead();
+        await tick();
+      }
+    };
+  };
+
+  const DEEPSEEK_KEY = fakeKey("viewdeepseek", 21);
+  const KIMI_KEY = fakeKey("viewkimi", 25);
+  const PASTED_KEY = fakeKey("viewpasted", 24);
+  const TYPED_KEY = fakeKey("viewtyped", 22);
+  const EXTERNAL_KEY = fakeKey("viewexternal", 23);
+  const seededMain = (overrides = {}) => ({
+    provider: "deepseek",
+    deepseekApiKey: DEEPSEEK_KEY,
+    kimiApiKey: KIMI_KEY,
+    apiKey: DEEPSEEK_KEY,
+    model: "deepseek-flash",
+    targetLanguage: "zh-CN",
+    displayMode: "bilingual",
+    ...overrides
+  });
+
+  // (1) Fresh store: the popup opens as the embedded setup card — no idle
+  // status card, the key entry lives in the setup slot, DeepSeek is chosen.
+  {
+    const popup = createPopupVm({});
+    await popup.hooks.initializePromise;
+    assertEqual(popup.hooks.getAppView(), "setup", "setup view: a store without a key opens as setup");
+    assertEqual(popup.dom.get("app").dataset.view, "setup", "setup view: #app carries data-view=setup");
+    assertTrue(popup.dom.get("status-wrap").hidden, "setup view: the status card is hidden (no idle line in 1.5.0)");
+    assertFalse(
+      String(popup.dom.get("status-title").textContent).includes("准备就绪"),
+      "setup view: the retired 准备就绪 idle title must never render"
+    );
+    assertEqual(
+      popup.dom.get("key-entry").parentNode,
+      popup.dom.get("setup-key-slot"),
+      "setup view: #key-entry is homed into the setup slot"
+    );
+    assertEqual(
+      popup.dom.get("setup-console-link").href,
+      "https://platform.deepseek.com/api_keys",
+      "setup view: the console link targets DeepSeek's key page"
+    );
+    assertEqual(
+      popup.dom.get("setup-console-link").textContent,
+      "打开 DeepSeek 控制台 ↗",
+      "setup view: the console link names the provider"
+    );
+    assertEqual(
+      popup.providerOptionButtons[0].getAttribute("aria-checked"),
+      "true",
+      "setup view: the DeepSeek radio is checked"
+    );
+    assertEqual(
+      popup.providerOptionButtons[1].getAttribute("aria-checked"),
+      "false",
+      "setup view: the Kimi radio is unchecked"
+    );
+    assertEqual(popup.dom.get("translate-shortcut").textContent, "Alt+A", "static info: shortcut labels fall back to Alt+A without bindings");
+    assertEqual(popup.dom.get("app-version").textContent, "1.5.0", "static info: the version comes from the manifest");
+
+    // User-opened settings beats setup; back returns to setup (still no key).
+    fire(popup.dom.get("open-settings"), "click");
+    assertEqual(popup.hooks.getAppView(), "settings", "setup view: ⚙ opens settings");
+    assertEqual(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "settings view: #key-entry returns to the settings slot");
+    fire(popup.dom.get("back-main"), "click");
+    assertEqual(popup.hooks.getAppView(), "setup", "setup view: ← back lands on setup again (no key yet)");
+    fire(popup.dom.get("more-settings"), "click");
+    assertEqual(popup.hooks.getAppView(), "settings", "setup view: 更多菜单 → 设置与备份 opens settings");
+    fire(popup.dom.get("back-main"), "click");
+    assertEqual(popup.hooks.getAppView(), "setup", "setup view: back from more-settings returns to setup");
+  }
+
+  // (2) Seeded DeepSeek store: main view, no idle card while the page is
+  // inactive, and the provider status line shows 已配置 (never 已连接 before
+  // a test this session) with the short model name and key tail only.
+  {
+    const popup = createPopupVm(seededMain());
+    await popup.hooks.initializePromise;
+    assertEqual(popup.hooks.getAppView(), "main", "main view: a store with the active key opens as main");
+    assertTrue(popup.dom.get("status-wrap").hidden, "main view: an inactive page collapses the status area (no idle card)");
+    assertEqual(
+      popup.dom.get("provider-status-label").textContent,
+      "✓ DeepSeek 已配置",
+      "provider status: configured-but-unverified shows 已配置"
+    );
+    assertEqual(
+      popup.dom.get("provider-status-meta").textContent,
+      `Flash · ••${DEEPSEEK_KEY.slice(-4)}`,
+      "provider status: meta shows the short model name and only the key tail"
+    );
+    assertFalse(
+      String(popup.dom.get("provider-status-meta").textContent).includes(DEEPSEEK_KEY),
+      "provider status: the meta line never carries the full key"
+    );
+    assertEqual(popup.dom.get("provider-status").dataset.tone, "ok", "provider status: tone ok with a key present");
+    assertEqual(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "main view: #key-entry stays in the settings slot");
+
+    // (2b) A successful connection test flips the line to 已连接.
+    const tested = createPopupVm(seededMain(), {
+      runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? { ok: true } : { ok: false })
+    });
+    await tested.hooks.initializePromise;
+    await tested.hooks.runKeyConnectionTest();
+    assertEqual(
+      tested.dom.get("provider-status-label").textContent,
+      "✓ DeepSeek 已连接",
+      "provider status: a successful test this session shows 已连接"
+    );
+    assertEqual(tested.dom.get("status-title").textContent, "Key 有效", "provider status: the test result still lands on the status card in main view");
+  }
+
+  // (3) Setup graduation through the REAL paste listener: bank → gated save
+  // (exactly one queue write) → TEST_CONNECTION ok → main view + saved key.
+  {
+    const testRequests = [];
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: KIMI_KEY, apiKey: "", model: "deepseek-flash" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            testRequests.push(message);
+            return { ok: true };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    const writes = recordWrites(popup);
+    await popup.hooks.initializePromise;
+    assertEqual(popup.hooks.getAppView(), "setup", "paste ok: empty active key starts in setup");
+    popup.dom.get("api-key").value = PASTED_KEY;
+    fire(popup.dom.get("api-key"), "paste");
+    await waitFor(() => popup.hooks.getAppView() === "main", "paste ok: graduation to main");
+    assertEqual(testRequests.length, 1, "paste ok: exactly one connection test");
+    assertEqual(testRequests[0].type, "TEST_CONNECTION", "paste ok: verification goes through the background message path");
+    assertEqual(writes.length, 1, "paste ok: the key lands through exactly one queued write");
+    assertEqual(
+      writes[0],
+      { deepseekApiKey: PASTED_KEY, apiKey: PASTED_KEY },
+      "paste ok: the write carries the key and its selection-gate mirror"
+    );
+    assertEqual(popup.storage.deepseekApiKey, PASTED_KEY, "paste ok: the pasted key is stored");
+    assertEqual(popup.dom.get("setup-feedback").textContent, "✓ 已连接", "paste ok: the setup card's own feedback confirms the connection");
+    assertEqual(popup.dom.get("provider-status-label").textContent, "✓ DeepSeek 已连接", "paste ok: the provider line confirms the connection");
+    assertEqual(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "paste ok: the key entry returns to the settings slot");
+  }
+
+  // (3b) A rejected key (401) keeps setup open with the reason in
+  // #setup-feedback; a DIFFERENT valid key arriving via storage.onChanged
+  // graduates afterwards.
+  {
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: KIMI_KEY, apiKey: "", model: "deepseek-flash" },
+      {
+        runtimeMessageHandler: async (message) =>
+          message?.type === "TEST_CONNECTION" ? { ok: false, code: "API_401" } : { ok: false }
+      }
+    );
+    await popup.hooks.initializePromise;
+    popup.dom.get("api-key").value = PASTED_KEY;
+    fire(popup.dom.get("api-key"), "paste");
+    await waitFor(
+      () => String(popup.dom.get("setup-feedback").textContent).includes("401"),
+      "paste 401: the setup feedback carries the rejection"
+    );
+    assertEqual(popup.hooks.getAppView(), "setup", "paste 401: a rejected key stays in setup");
+    assertTrue(popup.dom.get("status-wrap").hidden, "paste 401: the status card is never used in the setup flow");
+    assertFalse(
+      String(popup.dom.get("setup-feedback").textContent).includes(PASTED_KEY),
+      "paste 401: the feedback never echoes the full key"
+    );
+    // The SAME key re-arriving (our own save echo) must not graduate…
+    popup.emitStorageChange({ deepseekApiKey: { oldValue: "", newValue: PASTED_KEY } });
+    assertEqual(popup.hooks.getAppView(), "setup", "paste 401: the rejected key's own storage echo keeps setup open");
+    // …but a different valid key from another surface does.
+    popup.emitStorageChange({ deepseekApiKey: { oldValue: PASTED_KEY, newValue: EXTERNAL_KEY } });
+    assertEqual(popup.hooks.getAppView(), "main", "setup exit: a different valid key arriving via onChanged graduates to main");
+    assertEqual(popup.dom.get("api-key").value, EXTERNAL_KEY, "setup exit: the input shows the externally arrived key");
+  }
+
+  // (3c) Format-gate a malformed paste: no network, reason in the feedback.
+  {
+    const testRequests = [];
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: KIMI_KEY, apiKey: "", model: "deepseek-flash" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            testRequests.push(message);
+          }
+          return { ok: false };
+        }
+      }
+    );
+    await popup.hooks.initializePromise;
+    popup.dom.get("api-key").value = "abc";
+    fire(popup.dom.get("api-key"), "paste");
+    await waitFor(
+      () => String(popup.dom.get("setup-feedback").textContent).startsWith("✗"),
+      "paste malformed: the setup feedback shows a format error"
+    );
+    assertEqual(testRequests.length, 0, "paste malformed: a malformed key never hits the network");
+    assertTrue(String(popup.dom.get("setup-feedback").textContent).includes("sk-"), "paste malformed: the reason explains the expected sk- shape");
+    assertEqual(popup.hooks.getAppView(), "setup", "paste malformed: setup stays open");
+    assertTrue(popup.dom.get("status-wrap").hidden, "paste malformed: no status card in the setup flow");
+  }
+
+  // (3d) Manual typing in setup: change commits and auto-runs the test
+  // (review P2 #15) — one test, awaited saves only.
+  {
+    const testRequests = [];
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: KIMI_KEY, apiKey: "", model: "deepseek-flash" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            testRequests.push(message);
+            return { ok: true };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    await popup.hooks.initializePromise;
+    popup.dom.get("api-key").value = TYPED_KEY;
+    await fireAction(popup.dom.get("api-key"), "change");
+    await waitFor(() => popup.hooks.getAppView() === "main", "typed key: graduation to main");
+    assertEqual(testRequests.length, 1, "typed key: a valid manual edit auto-runs exactly one connection test");
+    assertEqual(popup.storage.deepseekApiKey, TYPED_KEY, "typed key: the typed key is stored");
+  }
+
+  // (4) Setup-card provider radios share the #provider handler's discipline:
+  // edits bank synchronously pre-init; the save waits for the init gate.
+  {
+    const { popup, writes, release } = createHeldPopup(seededMain());
+    await tick(); // let initialize() park inside the held first read
+    fire(popup.providerOptionButtons[1], "click"); // Kimi
+    assertEqual(writes.length, 0, "option gate: no storage write while init's storage read is pending");
+    release();
+    await waitFor(() => writes.length === 1, "option gate: the banked switch saves once init settles");
+    assertEqual(
+      writes[0],
+      { provider: "kimi", model: "kimi-k2.6", apiKey: KIMI_KEY },
+      "option gate: the write carries the switched provider, its resolved model and the mirror"
+    );
+    assertEqual(popup.dom.get("provider").value, "kimi", "option gate: the single #provider control follows the radio");
+    assertEqual(popup.providerOptionButtons[1].getAttribute("aria-checked"), "true", "option gate: the Kimi radio is checked");
+    assertEqual(popup.providerOptionButtons[0].getAttribute("aria-checked"), "false", "option gate: the DeepSeek radio is unchecked");
+    assertEqual(popup.dom.get("setup-console-link").href, "https://platform.moonshot.cn/console/api-keys", "option gate: the console link follows the provider");
+    assertEqual(popup.dom.get("setup-console-link").textContent, "打开 Kimi 控制台 ↗", "option gate: the console link label follows the provider");
+  }
+
+  // (4b) Two radio clicks while the first write is parked: the writes stay
+  // serialized (max 1 in flight) and the final write matches the LAST choice.
+  {
+    const popup = createPopupVm(seededMain());
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    fire(popup.providerOptionButtons[1], "click"); // Kimi → write 1 parks
+    assertEqual(gate.writes.length, 1, "option concurrency: the first switch's write is queued");
+    fire(popup.providerOptionButtons[0], "click"); // back to DeepSeek
+    gate.writes[0].release();
+    await waitFor(() => gate.writes.length === 2, "option concurrency: the second switch follows up");
+    gate.writes[1].release();
+    await tick();
+    assertEqual(
+      gate.writes[1].updates,
+      { provider: "deepseek", model: "deepseek-flash", apiKey: DEEPSEEK_KEY },
+      "option concurrency: the follow-up write matches the latest provider choice"
+    );
+    assertEqual(gate.maxInFlight, 1, "option concurrency: the queue never runs two storage writes at once");
+  }
+
+  // (5) Partial translation: the retry action, its visibility rule and the
+  // progress fill.
+  {
+    const popup = createPopupVm(seededMain());
+    await popup.hooks.initializePromise;
+    // Keep the 700 ms poll interval from keeping node alive.
+    popup.sandbox.setInterval = () => 1;
+    popup.sandbox.clearInterval = () => {};
+    popup.hooks.renderTranslationStatus({
+      active: true,
+      phase: "translated",
+      translated: 5,
+      total: 8,
+      failed: 3,
+      failedRetryable: 3,
+      displayMode: "bilingual"
+    });
+    assertFalse(popup.dom.get("retry-failed").hidden, "partial: the retry button is visible with retryable failures");
+    assertEqual(popup.dom.get("retry-failed").textContent, "重试失败的 3 段", "partial: the retry button names the segment count");
+    assertEqual(popup.dom.get("status-title").textContent, "部分未完成", "partial: the title reports the partial state");
+    assertTrue(
+      String(popup.dom.get("status-detail").textContent).includes("已翻译 5 段") &&
+        String(popup.dom.get("status-detail").textContent).includes("3 段失败"),
+      "partial: the detail names translated and failed counts"
+    );
+    assertFalse(popup.dom.get("status-wrap").hidden, "partial: the status card is visible");
+    assertEqual(popup.dom.get("status-progress").style.width, "63%", "partial: the progress bar fills to the translated share");
+
+    // While translating the retry button hides again and progress tracks live.
+    popup.hooks.renderTranslationStatus({
+      active: true,
+      phase: "translating",
+      translated: 2,
+      total: 8,
+      failed: 3,
+      failedRetryable: 3
+    });
+    assertTrue(popup.dom.get("retry-failed").hidden, "partial: no retry while a translation run is in flight");
+    assertEqual(popup.dom.get("status-title").textContent, "正在翻译", "partial: the translating title");
+    assertEqual(popup.dom.get("status-detail").textContent, "已完成 2 / 8 段", "partial: the translating detail carries live counts");
+    assertEqual(popup.dom.get("status-progress").style.width, "25%", "partial: the progress bar tracks the live share");
+
+    // failedRetryable absent falls back to failed.
+    popup.hooks.renderTranslationStatus({ active: true, phase: "translated", translated: 5, total: 8, failed: 2 });
+    assertFalse(popup.dom.get("retry-failed").hidden, "partial: failed>0 without failedRetryable still offers the retry");
+    assertEqual(popup.dom.get("retry-failed").textContent, "重试失败的 2 段", "partial: the fallback count comes from failed");
+
+    // Clicking retry messages ONLY RETRY_FAILED (never a fresh start/restore).
+    popup.hooks.renderTranslationStatus({ active: true, phase: "translated", translated: 5, total: 8, failed: 3, failedRetryable: 3 });
+    popup.tabMessages.length = 0;
+    fire(popup.dom.get("retry-failed"), "click");
+    await waitFor(
+      () => popup.tabMessages.some((entry) => entry.message?.type === "RETRY_FAILED") && !popup.dom.get("retry-failed").disabled,
+      "partial: the retry click settles"
+    );
+    assertEqual(
+      popup.tabMessages.filter((entry) => entry.message?.type === "RETRY_FAILED"),
+      [{ tabId: 42, message: { type: "RETRY_FAILED" } }],
+      "partial: exactly one RETRY_FAILED goes to the bound tab"
+    );
+    assertEqual(popup.tabMessages.filter((entry) => entry.message?.type === "START_TRANSLATION").length, 0, "partial: retry never re-starts the whole page");
+    assertEqual(popup.tabMessages.filter((entry) => entry.message?.type === "RESTORE_ORIGINAL").length, 0, "partial: retry never restores the original");
+  }
+
+  // (6) Shortcut labels from chrome.commands.getAll + the shortcuts link.
+  {
+    const popup = createPopupVm(seededMain(), {
+      commands: [
+        { name: "translate-page", shortcut: "Ctrl+Shift+1" },
+        { name: "translate-selection", shortcut: "" },
+        { name: "_execute_action", shortcut: "Ctrl+B" }
+      ]
+    });
+    await popup.hooks.initializePromise;
+    assertEqual(popup.dom.get("translate-shortcut").textContent, "Ctrl+Shift+1", "shortcuts: a rebound translate-page label wins");
+    assertEqual(popup.dom.get("selection-shortcut").textContent, "未设置", "shortcuts: an unbound command renders 未设置");
+    assertTrue(
+      String(popup.dom.get("shortcut-list").innerHTML).includes("Ctrl+Shift+1") &&
+        String(popup.dom.get("shortcut-list").innerHTML).includes("未设置"),
+      "shortcuts: the settings list mirrors the live bindings"
+    );
+    assertFalse(String(popup.dom.get("shortcut-list").innerHTML).includes("Alt+A"), "shortcuts: the stale default label is gone once rebound");
+    fire(popup.dom.get("open-shortcuts"), "click");
+    assertEqual(popup.tabCreates, [{ url: "chrome://extensions/shortcuts" }], "shortcuts: 修改快捷键 opens chrome://extensions/shortcuts");
+  }
+
+  // (7) Restricted pages: the cannot-translate notice up front, the actions
+  // disabled, and no later page status can replace it.
+  {
+    for (const [label, url] of [
+      ["chrome page", "chrome://version/"],
+      ["web store", "https://chromewebstore.google.com/detail/abc/def"],
+      ["file without access", "file:///home/user/doc.html"]
+    ]) {
+      const popup = createPopupVm(seededMain(), { activeTab: { url } });
+      await popup.hooks.initializePromise;
+      assertEqual(popup.dom.get("status-title").textContent, "这个页面不能翻译", `restricted (${label}): the notice title`);
+      assertTrue(
+        String(popup.dom.get("status-detail").textContent).includes("不允许扩展注入"),
+        `restricted (${label}): the notice explains the injection ban`
+      );
+      assertTrue(popup.dom.get("translate").disabled, `restricted (${label}): 翻译此页 is disabled`);
+      assertTrue(popup.dom.get("restore").disabled, `restricted (${label}): 还原原文 is disabled`);
+      assertFalse(popup.dom.get("status-wrap").hidden, `restricted (${label}): the notice card is visible`);
+      popup.hooks.renderTranslationStatus({ active: true, phase: "translated", translated: 9, total: 9, failed: 0 });
+      assertEqual(
+        popup.dom.get("status-title").textContent,
+        "这个页面不能翻译",
+        `restricted (${label}): no page status can replace the notice`
+      );
+      assertTrue(popup.dom.get("translate").disabled, `restricted (${label}): the translate button stays disabled`);
+    }
+  }
+
+  // (8) A page error that smells like a key problem turns the provider line
+  // into its actionable error state; clicking it opens settings at the key.
+  {
+    const popup = createPopupVm(seededMain());
+    await popup.hooks.initializePromise;
+    popup.emitRuntimeMessage(
+      { type: "CONTENT_STATUS", status: { active: true, phase: "error", error: "API Key 无效（401）" } },
+      { tab: { id: 42 } }
+    );
+    assertEqual(popup.dom.get("provider-status").dataset.tone, "error", "provider error: tone error after a 401 page error");
+    assertEqual(
+      popup.dom.get("provider-status-label").textContent,
+      "DeepSeek Key 无效 · 点此更新",
+      "provider error: the line becomes the update-key action"
+    );
+    assertEqual(popup.dom.get("status-title").textContent, "翻译失败", "provider error: the page error still surfaces on the card");
+    fire(popup.dom.get("provider-status"), "click");
+    assertEqual(popup.hooks.getAppView(), "settings", "provider error: clicking the line opens settings");
+    assertTrue(popup.dom.get("api-key").focused, "provider error: the key input is focused");
+  }
+
+  // (9) The popup.html?view=settings tab is ALWAYS the settings view — even
+  // without a key — and ← back cannot leave it.
+  {
+    const popup = createPopupVm({ provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash" }, {
+      locationSearch: "?view=settings"
+    });
+    await popup.hooks.initializePromise;
+    assertEqual(popup.hooks.getAppView(), "settings", "settings tab: popup.html?view=settings is the settings view");
+    assertEqual(popup.dom.get("app").dataset.view, "settings", "settings tab: #app carries data-view=settings");
+    assertEqual(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "settings tab: the key entry lives in the settings slot");
+    fire(popup.dom.get("back-main"), "click");
+    assertEqual(popup.hooks.getAppView(), "settings", "settings tab: ← back cannot leave the settings tab");
+  }
+
+  // (10) Retired copy never ships: the idle title is gone from the popup.
+  {
+    for (const rel of ["popup.js", "popup.html"]) {
+      const source = fs.readFileSync(path.join(ROOT, rel), "utf8");
+      assertFalse(source.includes("准备就绪"), `static copy (${rel}): the retired idle title 准备就绪 must not ship`);
+      assertFalse(source.includes("划词选中即可弹出译文"), `static copy (${rel}): the retired selection hint must not ship`);
+    }
+  }
 }
 
 async function checkInflightCapAndRunCancellation() {
@@ -5607,22 +6581,73 @@ async function checkTotalDeadlineBudget() {
 // Load the REAL background.js + shared.js into a node:vm context with a
 // stubbed chrome API and fetch so the tests drive the shipping wiring
 // (listener registration, slot gate, abort plumbing).
-function buildBackgroundVm({ storageData = {}, fetchImpl, setTimeoutImpl = setTimeout } = {}) {
+function buildBackgroundVm({ storageData = {}, fetchImpl, setTimeoutImpl = setTimeout, pingOk = false } = {}) {
   const backgroundSource = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
   const sharedSource = fs.readFileSync(path.join(ROOT, "shared.js"), "utf8");
-  const listeners = { installed: [], startup: [], message: [], tabsUpdated: [], tabsRemoved: [] };
+  const listeners = {
+    installed: [],
+    startup: [],
+    message: [],
+    tabsUpdated: [],
+    tabsRemoved: [],
+    command: [],
+    contextMenu: []
+  };
+  // 1.5.0 entry-point recordings (mirrors createBackgroundVm's stubs).
+  const entryCalls = { tabCreates: [], tabMessages: [], injections: [], menuCreates: [], pings: [] };
   const storage = { ...storageData };
   const extensionId = "ci-test-extension-id";
   const chromeStub = {
     runtime: {
       id: extensionId,
+      getURL: (rel) => `chrome-extension://${extensionId}/${rel}`,
       onInstalled: { addListener: (fn) => listeners.installed.push(fn) },
       onStartup: { addListener: (fn) => listeners.startup.push(fn) },
       onMessage: { addListener: (fn) => listeners.message.push(fn) }
     },
+    commands: {
+      onCommand: { addListener: (fn) => listeners.command.push(fn) },
+      getAll: async () => []
+    },
+    contextMenus: {
+      removeAll: (callback) => {
+        if (typeof callback === "function") {
+          callback();
+        }
+      },
+      create: (options, callback) => {
+        entryCalls.menuCreates.push(options);
+        if (typeof callback === "function") {
+          callback();
+        }
+      },
+      onClicked: { addListener: (fn) => listeners.contextMenu.push(fn) }
+    },
     tabs: {
       onRemoved: { addListener: (fn) => listeners.tabsRemoved.push(fn) },
-      onUpdated: { addListener: (fn) => listeners.tabsUpdated.push(fn) }
+      onUpdated: { addListener: (fn) => listeners.tabsUpdated.push(fn) },
+      create: async (options) => {
+        entryCalls.tabCreates.push(options);
+        return { id: 900 + entryCalls.tabCreates.length };
+      },
+      query: async () => [{ id: 42, url: "https://example.com/active" }],
+      sendMessage: async (tabId, message, options) => {
+        if (message?.type === "PING_CONTENT") {
+          entryCalls.pings.push({ tabId });
+          if (!pingOk) {
+            throw new Error("Could not establish connection. Receiving end does not exist.");
+          }
+          return { ok: true };
+        }
+        entryCalls.tabMessages.push({ tabId, message, options });
+        return { ok: true };
+      }
+    },
+    scripting: {
+      executeScript: async (injection) => {
+        entryCalls.injections.push(injection);
+        return [];
+      }
     },
     action: {
       setBadgeText: async () => {},
@@ -5664,6 +6689,7 @@ function buildBackgroundVm({ storageData = {}, fetchImpl, setTimeoutImpl = setTi
   return {
     listeners,
     extensionId,
+    entryCalls,
     sendMessage: (message, tabId) => new Promise((resolve) => {
       let settled = false;
       const respond = (response) => {
@@ -6207,6 +7233,17 @@ function checkTranslationReuseCache() {
 }
 
 // ---- P2-2: packaging ----
+// welcome.html sits at the extension root, so its local href/src references
+// resolve against "." — the same normalization pack's collectHtmlReferences
+// applies (query/hash and external URLs are filtered by the caller).
+function toPosixWelcomeRef(href) {
+  try {
+    return path.posix.normalize(path.posix.join(".", decodeURIComponent(href)));
+  } catch {
+    return "";
+  }
+}
+
 async function checkPackaging() {
   let mod;
   try {
@@ -6227,6 +7264,15 @@ async function checkPackaging() {
 
   const manifest = readJson("manifest.json");
   if (!manifest) {
+    return;
+  }
+
+  // 1.5.0 welcome walk-through: background.js opens it via
+  // chrome.runtime.getURL("welcome.html"), so the page must exist for the
+  // reference graph to resolve at all. Fail with a name here instead of the
+  // generic missing-file error from the collector.
+  if (!fs.existsSync(path.join(ROOT, "welcome.html"))) {
+    fail("pack: welcome.html is missing — background.js references it via chrome.runtime.getURL(\"welcome.html\") and the ship list cannot resolve without it (welcome.* is owned by a parallel workstream)");
     return;
   }
 
@@ -6259,6 +7305,33 @@ async function checkPackaging() {
   for (const rel of required) {
     if (!files.includes(rel)) {
       fail(`pack: required file missing from the ship list: ${rel}`);
+    }
+  }
+
+  // The welcome page ships together with every local css/js/img it pulls in
+  // (collectHtmlReferences walks it once it enters the list via the
+  // chrome.runtime.getURL reference in background.js).
+  if (!files.includes("welcome.html")) {
+    fail("pack: welcome.html missing from the ship list (background.js opens it via chrome.runtime.getURL)");
+  } else {
+    const welcomeHtml = fs.readFileSync(path.join(ROOT, "welcome.html"), "utf8");
+    for (const tag of welcomeHtml.matchAll(/<(?:link|script|img)\b[^>]*>/gi)) {
+      for (const attr of ["href", "src"]) {
+        const match = new RegExp(`${attr}\\s*=\\s*["']([^"']+)["']`, "i").exec(tag[0]);
+        if (
+          !match ||
+          /^[a-z][a-z\d+\-.]*:/i.test(match[1]) ||
+          match[1].startsWith("//") ||
+          match[1].startsWith("#") ||
+          match[1].startsWith("/")
+        ) {
+          continue;
+        }
+        const ref = toPosixWelcomeRef(match[1]);
+        if (ref && !files.includes(ref)) {
+          fail(`pack: welcome.html reference missing from the ship list: ${ref}`);
+        }
+      }
     }
   }
 
@@ -6577,20 +7650,125 @@ async function checkPackPathSafety() {
   }
 }
 
+// ---- 1.5.0 pack: chrome.runtime.getURL html references are followed ----
+// Fixture-based (temp dir), so the collector logic itself is verified even
+// before the real welcome.html lands in the repo.
+async function checkPackGetUrlReferences() {
+  let mod;
+  try {
+    mod = await import(pathToFileURL(path.join(ROOT, "scripts", "pack.mjs")).href);
+  } catch (error) {
+    fail(`scripts/pack.mjs: cannot be imported for getURL reference test: ${error.message}`);
+    return;
+  }
+  const { collectExtensionFiles } = mod;
+
+  const assertEqual = (actual, expected, label) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  };
+  const assertRejects = (fn, label) => {
+    try {
+      fn();
+    } catch {
+      return;
+    }
+    fail(`${label}: expected pack to reject`);
+  };
+
+  const tempDirs = [];
+  const writeGetUrlFixture = (workerSource) => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "kilocean-pack-geturl-"));
+    tempDirs.push(rootDir);
+    fs.writeFileSync(path.join(rootDir, "manifest.json"), JSON.stringify({
+      manifest_version: 3,
+      name: "geturl-fixture",
+      version: "1.5.0",
+      background: { service_worker: "worker.js" },
+      action: { default_popup: "popup.html" }
+    }));
+    fs.writeFileSync(path.join(rootDir, "worker.js"), workerSource);
+    fs.writeFileSync(path.join(rootDir, "popup.html"), "<script src=\"popup.js\"></script>\n");
+    fs.writeFileSync(path.join(rootDir, "popup.js"), "console.log('popup');\n");
+    fs.writeFileSync(path.join(rootDir, "welcome.html"), "<link rel=\"stylesheet\" href=\"welcome.css\">\n<script src=\"welcome.js\"></script>\n");
+    fs.writeFileSync(path.join(rootDir, "welcome.css"), "body{}\n");
+    fs.writeFileSync(path.join(rootDir, "welcome.js"), "console.log('welcome');\n");
+    fs.mkdirSync(path.join(rootDir, "deep"));
+    fs.writeFileSync(path.join(rootDir, "deep/link.htm"), "<p>help</p>\n");
+    fs.writeFileSync(path.join(rootDir, "icon.png"), "pngbytes\n");
+    return rootDir;
+  };
+
+  try {
+    // Happy path: every getURL html literal (query/hash stripped) enters the
+    // ship list and pulls its own css/js along; popup.html?view=settings
+    // collapses onto the manifest popup instead of duplicating it; non-html
+    // literals (icons) are not collected from script source.
+    const okRoot = writeGetUrlFixture([
+      "chrome.runtime.getURL(\"welcome.html\");",
+      "chrome.runtime.getURL('popup.html?view=settings');",
+      "chrome.runtime.getURL(\"deep/link.htm#top\");",
+      "chrome.runtime.getURL(\"icon.png\");",
+      "chrome.scripting.executeScript({ target: { tabId: 1 }, files: [\"shared.js\"] });"
+    ].join("\n"));
+    fs.writeFileSync(path.join(okRoot, "shared.js"), "console.log('shared');\n");
+    let collected;
+    try {
+      collected = collectExtensionFiles(okRoot);
+    } catch (error) {
+      fail(`pack getURL: benign fixture must collect, got ${error.message}`);
+      return;
+    }
+    for (const rel of [
+      "manifest.json",
+      "worker.js",
+      "shared.js",
+      "popup.html",
+      "popup.js",
+      "welcome.html",
+      "welcome.css",
+      "welcome.js",
+      "deep/link.htm"
+    ]) {
+      if (!collected.files.includes(rel)) {
+        fail(`pack getURL: ship list must follow the chrome.runtime.getURL reference to ${rel}`);
+      }
+    }
+    assertEqual(
+      collected.files.filter((rel) => rel.startsWith("popup.")),
+      ["popup.html", "popup.js"],
+      "pack getURL: popup.html?view=settings de-duplicates onto the manifest popup"
+    );
+    if (collected.files.includes("icon.png")) {
+      fail("pack getURL: only .html/.htm literals are followed (icons ship via the manifest)");
+    }
+
+    // Path safety parity: a getURL reference that climbs out of the root is
+    // rejected by the same normalizeEntryName chokepoint as manifest refs.
+    const traversalRoot = writeGetUrlFixture("chrome.runtime.getURL(\"../escape.html\");");
+    assertRejects(() => collectExtensionFiles(traversalRoot), "pack getURL: .. traversal must be rejected");
+  } finally {
+    for (const dir of tempDirs) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+}
+
 function checkVersionBump() {
   const manifest = readJson("manifest.json");
-  if (manifest && manifest.version !== "1.4.3") {
-    fail(`manifest.version must be 1.4.3 for this release, got ${JSON.stringify(manifest.version)}`);
+  if (manifest && manifest.version !== "1.5.0") {
+    fail(`manifest.version must be 1.5.0 for this release, got ${JSON.stringify(manifest.version)}`);
   }
 
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
-  if (!readme.includes("1.4.3")) {
-    fail("README.md: version hint must mention 1.4.3");
+  if (!readme.includes("1.5.0")) {
+    fail("README.md: version hint must mention 1.5.0");
   }
 
   const content = fs.readFileSync(path.join(ROOT, "content.js"), "utf8");
-  if (!content.includes("Kilocean Translate 1.4.3")) {
-    fail("content.js: export generator meta must carry the extension version 1.4.3");
+  if (!content.includes("Kilocean Translate 1.5.0")) {
+    fail("content.js: export generator meta must carry the extension version 1.5.0");
   }
 }
 
@@ -6873,14 +8051,25 @@ async function main() {
   await checkSettingsStateModel();
   await checkSettingsWriteQueueConcurrency();
   await checkPopupActionInitGate();
+  await checkPopupViews150();
   await checkInflightCapAndRunCancellation();
   await checkSpaRefreshAndSelectionLifecycle();
   await checkSpaFlushRaceGuard();
   await checkTotalDeadlineBudget();
   await checkTabConcurrencyAndNavigationCancel();
   checkTranslationReuseCache();
+  await checkCommandsAndContextMenu();
+  await checkWelcomeSampleTranslate();
+  // 1.5.0 content-script checks ship as a sibling module; load it only when
+  // present so this gate also runs green on checkouts mid-refactor.
+  const contentChecksPath = path.join(ROOT, "scripts", "checks-content-150.mjs");
+  if (fs.existsSync(contentChecksPath)) {
+    const { runContent150Checks } = await import(pathToFileURL(contentChecksPath).href);
+    await runContent150Checks({ ROOT, fail });
+  }
   await checkPackaging();
   await checkPackPathSafety();
+  await checkPackGetUrlReferences();
 
   if (errors.length > 0) {
     console.error("\nCI CHECK FAILED:");
@@ -6890,7 +8079,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("OK: manifest (incl. store key → extension ID), permissions, syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, selection key gate, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm), settings state model (snapshot + dirty flags), serialized write queue concurrency (controlled fake storage), popup action init gate (held first storage read + listener statics), inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, packaging, pack path safety");
+  console.log("OK: manifest (incl. store key → extension ID, commands, no content_scripts, unchanged hosts), permissions (incl. contextMenus), syntax, static bans, segment split logic, parseTranslationPayload, joinSplitTranslations, joinRawTextNodes, X layout heuristics, X mutation scope gate, English profile detection, version bump, SPA navigation + selection card statics, selection key gate, fetch timeout coverage, model migration + retry policy, key persistence migration gate (vm, incl. onInstalled install/update menus + welcome), settings state model (snapshot + dirty flags), serialized write queue concurrency (controlled fake storage), popup action init gate (held first storage read + listener statics), popup views 1.5.0 (setup/main/settings + provider line + retry + shortcuts + restricted pages + static copy), content checks 1.5.0 (vm), inflight cap + run cancellation, SPA refresh + selection lifecycle, SPA flush race guard, total deadline budget, tab concurrency + navigation cancel, translation reuse cache, commands + context menu wiring (vm), welcome sample translate gate (vm), packaging (incl. welcome.html + getURL refs), pack path safety, pack getURL html references");
   process.exit(0);
 }
 

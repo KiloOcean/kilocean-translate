@@ -40,6 +40,19 @@ const DEFAULT_SETTINGS = {
   displayMode: Utils.DISPLAY_MODES.bilingual
 };
 
+// popup.html opened as a normal extension tab (?view=settings). Settings and
+// the settings import run there because Chromium (Linux, ~128–130,
+// crbug 364825891) can destroy the transient action popup when a file chooser
+// opens; chrome.tabs.create needs no extra permission. In that mode the popup
+// always renders the settings view (see currentView).
+const IS_SETTINGS_TAB = (() => {
+  try {
+    return new URLSearchParams(globalThis.location?.search || "").get("view") === "settings";
+  } catch {
+    return false;
+  }
+})();
+
 // ---- Settings export / import (pure helpers, DOM-free) ----
 const SETTINGS_EXPORT_FORMAT = "kilocean-translate-settings";
 const SETTINGS_EXPORT_VERSION = 1;
@@ -304,7 +317,30 @@ const elements = {
   selectionConfirmPanel: document.getElementById("selection-confirm-panel"),
   selectionConfirmText: document.getElementById("selection-confirm-text"),
   selectionConfirmBtn: document.getElementById("selection-confirm-btn"),
-  selectionConfirmDismiss: document.getElementById("selection-confirm-dismiss")
+  selectionConfirmDismiss: document.getElementById("selection-confirm-dismiss"),
+  // 1.5.0 views / chrome. Every entry is null-guarded at its use sites: the
+  // ci-check popup vm only knows the ids registered in createPopupVm.
+  app: document.getElementById("app"),
+  openSettings: document.getElementById("open-settings"),
+  backMain: document.getElementById("back-main"),
+  moreSettings: document.getElementById("more-settings"),
+  providerStatus: document.getElementById("provider-status"),
+  providerStatusLabel: document.getElementById("provider-status-label"),
+  providerStatusMeta: document.getElementById("provider-status-meta"),
+  translateShortcut: document.getElementById("translate-shortcut"),
+  selectionShortcut: document.getElementById("selection-shortcut"),
+  shortcutList: document.getElementById("shortcut-list"),
+  openShortcuts: document.getElementById("open-shortcuts"),
+  statusWrap: document.getElementById("status-wrap"),
+  statusProgress: document.getElementById("status-progress"),
+  retryFailed: document.getElementById("retry-failed"),
+  setupConsoleLink: document.getElementById("setup-console-link"),
+  setupKeySlot: document.getElementById("setup-key-slot"),
+  settingsKeySlot: document.getElementById("settings-key-slot"),
+  keyEntry: document.getElementById("key-entry"),
+  setupFeedback: document.getElementById("setup-feedback"),
+  appVersion: document.getElementById("app-version"),
+  providerOptions: [...document.querySelectorAll(".provider-option")]
 };
 
 let currentTab = null;
@@ -319,6 +355,28 @@ let keyTestOp = 0;
 let keyTestPendingOp = 0;
 /** @type {{ text: string, rangeId: string } | null} */
 let pendingSelection = null;
+
+// ---- 1.5.0 view state ----
+// setupMode is decided once, after init: with no key for the ACTIVE provider
+// the popup opens as the embedded two-step setup card (no translate button to
+// click into an error). It clears when a connection test for the pasted key
+// succeeds, or when a format-valid key for the active provider arrives from
+// another surface (welcome page / settings tab / another popup) while this
+// one stays open. userOpenedSettings keeps the settings view up until
+// #back-main returns to whatever view was underneath.
+const viewState = { setupMode: false, userOpenedSettings: false };
+// Per-provider "verified this session" flag for the provider status line
+// (已配置 → 已连接 after a successful connection test).
+const keyVerified = { deepseek: false, kimi: false };
+// A page translation error that looks like a key problem (401 / Key 无效)
+// flips the provider status line into its actionable error state.
+let providerKeyInvalid = false;
+// The key whose connection test FAILED while setup owned the popup. Leaving
+// setup requires a key that is format-valid AND not this one — an external
+// arrival of a DIFFERENT key may still graduate the popup.
+let setupRejectedKey = "";
+// The active tab is a page the extension can never inject into (chrome://…).
+let pageRestricted = false;
 
 // ---- Settings/key state: single source of truth ----
 // settingsModel.snapshot is the last-known chrome.storage.local view; every
@@ -372,8 +430,14 @@ function readControlValues() {
 }
 
 // Bank the key input's current value as the active provider's pending edit.
+// A fresh edit also retires the per-session verdicts tied to the old value
+// (verified flag, the setup card's rejected key, the provider error tone).
 function markKeyEdit() {
-  settingsModel.edits[PROVIDER_META[activeProvider()].keyField] = elements.apiKey.value.trim();
+  const provider = activeProvider();
+  settingsModel.edits[PROVIDER_META[provider].keyField] = elements.apiKey.value.trim();
+  keyVerified[provider] = false;
+  providerKeyInvalid = false;
+  setupRejectedKey = "";
 }
 
 // The single storage→view sync path: merge a storage view (a fresh full
@@ -397,6 +461,16 @@ function reconcile(storageSnapshot) {
     }
     keyTestOp += 1;
   }
+  // A stored key change clears the per-session verified flag and the page's
+  // Key-invalid verdict — the new key has not been judged yet.
+  const activeKeyField = PROVIDER_META[activeProvider()].keyField;
+  if (activeKeyField in applied) {
+    keyVerified[activeProvider()] = false;
+    providerKeyInvalid = false;
+  }
+  // A key arriving from another surface (welcome page, settings tab) can
+  // graduate the popup out of the embedded setup card.
+  evaluateSetupExit();
 }
 
 // Apply reconciled storage values to the controls. Provider goes first: it
@@ -565,6 +639,37 @@ elements.toggleKey.addEventListener("click", () => {
   elements.toggleKey.setAttribute("aria-label", revealing ? "隐藏 API Key" : "显示 API Key");
 });
 
+// Not whenReady-gated (allowlisted in scripts/ci-check.mjs): pure view
+// navigation — none of these read or write settings.
+if (elements.openSettings) {
+  elements.openSettings.addEventListener("click", () => {
+    openSettingsView();
+  });
+}
+if (elements.moreSettings) {
+  elements.moreSettings.addEventListener("click", () => {
+    openSettingsView();
+  });
+}
+if (elements.backMain) {
+  elements.backMain.addEventListener("click", () => {
+    viewState.userOpenedSettings = false;
+    renderView();
+  });
+}
+if (elements.providerStatus) {
+  // The one-line provider status doubles as the error state's 更新 Key action:
+  // clicking it opens the settings view with the key input focused.
+  elements.providerStatus.addEventListener("click", () => {
+    openSettingsView({ focusKey: true });
+  });
+}
+if (elements.openShortcuts) {
+  elements.openShortcuts.addEventListener("click", () => {
+    void chrome.tabs.create({ url: "chrome://extensions/shortcuts" });
+  });
+}
+
 // Persist settings as the user edits so selection translate reads fresh storage
 // without requiring Test Connection / full-page Translate first.
 let persistTimer = null;
@@ -617,8 +722,8 @@ elements.apiKey.addEventListener("input", () => {
   schedulePersistSettings();
   renderKeyStatus();
 });
-elements.apiKey.addEventListener("change", whenReady(persistSettingsNow));
-elements.apiKey.addEventListener("blur", whenReady(persistSettingsNow));
+elements.apiKey.addEventListener("change", whenReady(handleApiKeyCommit));
+elements.apiKey.addEventListener("blur", whenReady(handleApiKeyCommit));
 // Paste → auto-save + auto connection test. The pasted value lands after the
 // default paste action, so run on the next tick.
 elements.apiKey.addEventListener("paste", () => {
@@ -632,34 +737,37 @@ elements.apiKey.addEventListener("paste", () => {
   }, 0);
 });
 elements.provider.addEventListener("change", () => {
-  const nextProvider = PROVIDER_META[elements.provider.value] ? elements.provider.value : "deepseek";
-  // Any unsaved edit of the previous provider's key is already banked in
-  // settingsModel.edits by its input events — switching neither loses nor
-  // mixes the two credentials. Drop any in-flight test for the old key.
-  keyTestOp += 1;
-  applyProviderUi(nextProvider, { resetModel: true });
-  // The switch (and the model reset above) are user edits this view owns.
-  // The model edit is banked UNCONDITIONALLY from the rebuilt select, never
-  // diffed against the snapshot: a previous switch's write may still be in
-  // flight, so the snapshot can be stale — diffing against it could leave a
-  // departed provider's model banked and land an inconsistent pair in
-  // storage (provider deepseek + kimi model).
-  settingsModel.edits.provider = nextProvider;
-  settingsModel.edits.model = elements.model.value;
-  // Swap the key input to the new provider's pending-or-stored key.
-  elements.apiKey.value = providerKeyValue(nextProvider);
-  renderKeyStatus();
-  // The edits banked above are pre-init-safe (dirty fields survive init's
-  // reconcile); only the SAVE waits for the init gate, so it diffs against
-  // the loaded snapshot — never the pre-init defaults.
+  selectProvider(elements.provider.value);
+  // The edits banked by selectProvider are pre-init-safe (dirty fields
+  // survive init's reconcile); only the SAVE waits for the init gate, so it
+  // diffs against the loaded snapshot — never the pre-init defaults.
   void whenReady(persistSettingsNow)();
 });
+
+// The setup card's provider radios select the SAME single provider control
+// (#provider lives in the settings view) through the same selectProvider
+// logic and the same init-gated save.
+for (const option of elements.providerOptions) {
+  // Not whenReady-gated (allowlisted): banks the provider/model edits
+  // synchronously (pre-init banking is the designed behavior); the save goes
+  // through whenReady inside.
+  option.addEventListener("click", () => {
+    const nextProvider = option.dataset.provider;
+    if (!PROVIDER_META[nextProvider] || nextProvider === elements.provider.value) {
+      renderSetupProviderChoice();
+      return;
+    }
+    selectProvider(nextProvider);
+    void whenReady(persistSettingsNow)();
+  });
+}
 elements.targetLanguage.addEventListener("change", () => {
   settingsModel.edits.targetLanguage = elements.targetLanguage.value;
   void whenReady(persistSettingsNow)();
 });
 elements.model.addEventListener("change", () => {
   settingsModel.edits.model = elements.model.value;
+  renderProviderStatus();
   void whenReady(persistSettingsNow)();
 });
 // Closing/hiding a view flushes a still-pending debounced edit — and, once
@@ -833,9 +941,38 @@ elements.restore.addEventListener("click", async () => {
     renderTranslationStatus(response.status);
     stopStatusPolling();
   } catch {
-    setStatus("当前页面尚未翻译", "点击“翻译当前网页”开始，或划词翻译", "idle");
+    setStatus("当前页面尚未翻译", "点击「翻译此页」开始，或选中文字按 Alt+T", "idle");
   }
 });
+
+// Not whenReady-gated (allowlisted): the retry only messages the page
+// (RETRY_FAILED — the content script retries JUST the failed blocks: no
+// restore, no re-billing of finished segments); the popup reads no settings.
+if (elements.retryFailed) {
+  elements.retryFailed.addEventListener("click", async () => {
+    if (!currentTab?.id) {
+      return;
+    }
+    elements.retryFailed.disabled = true;
+    try {
+      await ensureContentScript(currentTab.id);
+      const response = await chrome.tabs.sendMessage(currentTab.id, { type: "RETRY_FAILED" });
+      if (!response?.ok) {
+        throw new Error(response?.error || "重试失败");
+      }
+      if (response.status?.displayMode) {
+        currentDisplayMode = Utils.normalizeDisplayMode(response.status.displayMode);
+        renderDisplayMode();
+      }
+      renderTranslationStatus(response.status);
+      startStatusPolling();
+    } catch (error) {
+      setStatus("重试失败", toFriendlyPageError(error), "error");
+    } finally {
+      elements.retryFailed.disabled = false;
+    }
+  });
+}
 
 // Not whenReady-gated (allowlisted): the HTML export / print run inside the
 // content script from its own state; the popup reads no settings here.
@@ -859,15 +996,8 @@ elements.exportSettings.addEventListener("click", whenReady(() => exportSettings
 
 // Chromium (Linux, ~128–130, crbug 364825891) can destroy an action popup
 // when a file chooser opens, so the import never runs. Import therefore runs
-// from popup.html opened as a normal extension tab (?view=settings), which
-// survives the chooser. chrome.tabs.create needs no extra permission.
-const IS_SETTINGS_TAB = (() => {
-  try {
-    return new URLSearchParams(globalThis.location?.search || "").get("view") === "settings";
-  } catch {
-    return false;
-  }
-})();
+// from popup.html opened as a normal extension tab (?view=settings, detected
+// as IS_SETTINGS_TAB at the top of this file), which survives the chooser.
 
 // Not whenReady-gated (allowlisted): this only opens the file chooser (or
 // the settings tab); the import itself is the gated import-file change
@@ -939,8 +1069,24 @@ async function initialize() {
     persistSettingsInBackground();
   }
 
+  // 1.5.0 embedded setup: without a key for the ACTIVE provider the popup
+  // opens as the two-step setup card — no translate button to click into an
+  // error, and no idle status line. With a key it opens as the main view.
+  viewState.setupMode = !providerKeyValue(activeProvider());
+  setupRejectedKey = "";
+  renderView();
+  renderStaticInfo();
+
   if (!currentTab?.id) {
     throw new Error("找不到当前标签页");
+  }
+
+  // Restricted pages (chrome://, Web Store, about:, file: without access)
+  // can never take the injection: say so up front instead of failing on the
+  // first click, and disable the actions that would only error.
+  pageRestricted = await detectRestrictedPage();
+  if (pageRestricted) {
+    renderRestrictedNotice();
   }
 
   try {
@@ -1019,6 +1165,269 @@ function applyProviderUi(providerId, { resetModel }) {
   } else {
     elements.model.value = meta.defaultModel;
   }
+}
+
+// ---- 1.5.0 views: main / setup / settings ----
+
+// #app[data-view] drives which section CSS shows. The settings-tab mode
+// always renders settings (import needs the tab); otherwise an explicit user
+// navigation wins until 返回, and the setup card wins over main while the
+// active provider has no usable key.
+function currentView() {
+  if (IS_SETTINGS_TAB || viewState.userOpenedSettings) {
+    return "settings";
+  }
+  return viewState.setupMode ? "setup" : "main";
+}
+
+function renderView() {
+  const view = currentView();
+  if (elements.app) {
+    elements.app.dataset.view = view;
+  }
+  // #key-entry is authored inside #settings-key-slot; the setup view borrows
+  // the whole block (label + input + guide) into its own slot.
+  const slot = view === "setup" ? elements.setupKeySlot : elements.settingsKeySlot;
+  if (elements.keyEntry && slot && elements.keyEntry.parentNode !== slot) {
+    slot.appendChild(elements.keyEntry);
+  }
+  renderSetupProviderChoice();
+}
+
+function openSettingsView({ focusKey = false } = {}) {
+  viewState.userOpenedSettings = true;
+  renderView();
+  if (focusKey && elements.apiKey) {
+    elements.apiKey.focus();
+  }
+}
+
+// Leave the embedded setup card once the active provider's key is present,
+// format-valid and not the one a connection test just rejected. A test that
+// is still in flight defers the decision: the paste-and-verify flow must
+// resolve on the test's verdict, never on the storage echo of its own save.
+function evaluateSetupExit() {
+  if (!viewState.setupMode) {
+    return;
+  }
+  if (keyTestPendingOp && keyTestPendingOp === keyTestOp) {
+    return;
+  }
+  const key = providerKeyValue(activeProvider());
+  if (!key || apiKeyFormatReason(key) || key === setupRejectedKey) {
+    return;
+  }
+  viewState.setupMode = false;
+  renderView();
+}
+
+// Route a setup-flow status line into #setup-feedback (the status card lives
+// in the main view and is not used while setup owns the popup); returns true
+// when consumed so callers fall back to the status card everywhere else.
+function renderSetupFeedback(text) {
+  if (currentView() !== "setup" || !elements.setupFeedback) {
+    return false;
+  }
+  elements.setupFeedback.textContent = text;
+  return true;
+}
+
+// The setup card's radios mirror the single provider control.
+function renderSetupProviderChoice() {
+  const provider = activeProvider();
+  for (const option of elements.providerOptions) {
+    option.setAttribute("aria-checked", option.dataset.provider === provider ? "true" : "false");
+  }
+  if (elements.setupConsoleLink) {
+    const meta = PROVIDER_META[provider];
+    elements.setupConsoleLink.href = meta.keyUrl;
+    elements.setupConsoleLink.textContent = `打开 ${meta.label} 控制台 ↗`;
+  }
+}
+
+// Provider selection from EITHER surface — the settings-view #provider
+// select (change) or the setup card's radio buttons. Both bank their edits
+// synchronously and route the SAVE through whenReady at the call site.
+function selectProvider(rawProvider) {
+  const nextProvider = PROVIDER_META[rawProvider] ? rawProvider : "deepseek";
+  // Any unsaved edit of the previous provider's key is already banked in
+  // settingsModel.edits by its input events — switching neither loses nor
+  // mixes the two credentials. Drop any in-flight test for the old key.
+  keyTestOp += 1;
+  if (elements.provider.value !== nextProvider) {
+    elements.provider.value = nextProvider;
+  }
+  applyProviderUi(nextProvider, { resetModel: true });
+  // The switch (and the model reset above) are user edits this view owns.
+  // The model edit is banked UNCONDITIONALLY from the rebuilt select, never
+  // diffed against the snapshot: a previous switch's write may still be in
+  // flight, so the snapshot can be stale — diffing against it could leave a
+  // departed provider's model banked and land an inconsistent pair in
+  // storage (provider deepseek + kimi model).
+  settingsModel.edits.provider = nextProvider;
+  settingsModel.edits.model = elements.model.value;
+  // Swap the key input to the new provider's pending-or-stored key.
+  elements.apiKey.value = providerKeyValue(nextProvider);
+  providerKeyInvalid = false;
+  setupRejectedKey = "";
+  renderKeyStatus();
+  renderSetupProviderChoice();
+}
+
+// ---- Provider status line (main view) ----
+
+const MODEL_SHORT_NAMES = {
+  "deepseek-flash": "Flash",
+  "deepseek-v4-pro": "V4 Pro",
+  "kimi-k2.6": "K2.6",
+  "kimi-k3": "K3",
+  "moonshot-v1-128k": "128k"
+};
+
+function renderProviderStatus() {
+  if (!elements.providerStatus || !elements.providerStatusLabel) {
+    return;
+  }
+  const provider = activeProvider();
+  const meta = PROVIDER_META[provider];
+  const key = providerKeyValue(provider);
+  if (providerKeyInvalid) {
+    elements.providerStatus.dataset.tone = "error";
+    elements.providerStatusLabel.textContent = `${meta.label} Key 无效 · 点此更新`;
+  } else if (key) {
+    elements.providerStatus.dataset.tone = "ok";
+    elements.providerStatusLabel.textContent = `✓ ${meta.label} ${keyVerified[provider] ? "已连接" : "已配置"}`;
+  } else {
+    elements.providerStatus.dataset.tone = "missing";
+    elements.providerStatusLabel.textContent = `${meta.label} 未配置 · 点此填写`;
+  }
+  if (elements.providerStatusMeta) {
+    const model = MODEL_SHORT_NAMES[elements.model.value] || elements.model.value || "";
+    const tail = keyTail(key);
+    elements.providerStatusMeta.textContent = tail ? `${model} · ••${tail}` : model;
+  }
+}
+
+// A page translation error that smells like a key problem (401 / Key 无效)
+// turns the provider line into its actionable error state.
+function noteProviderKeyError(errorText) {
+  if (/API\s*Key|401|Key 无效/i.test(String(errorText || ""))) {
+    providerKeyInvalid = true;
+    renderProviderStatus();
+  }
+}
+
+// ---- Static chrome info: version + live shortcut labels ----
+
+function renderStaticInfo() {
+  if (elements.appVersion) {
+    elements.appVersion.textContent = chrome.runtime.getManifest().version;
+  }
+  void loadShortcutLabels();
+}
+
+const SHORTCUT_COMMANDS = [
+  { name: "translate-page", element: "translateShortcut", fallback: "Alt+A", label: "翻译此页" },
+  { name: "translate-selection", element: "selectionShortcut", fallback: "Alt+T", label: "翻译选中文字" }
+];
+
+// Shortcut labels are read at runtime when chrome.commands exists (the user
+// may rebind or unbind); missing bindings render as 未设置, and environments
+// without the API keep the suggested-key defaults from the markup.
+async function loadShortcutLabels() {
+  const api = globalThis.chrome?.commands;
+  if (typeof api?.getAll !== "function") {
+    return;
+  }
+  let commands;
+  try {
+    commands = await api.getAll();
+  } catch {
+    return;
+  }
+  const shortcutOf = (name, fallback) => {
+    for (const command of commands || []) {
+      if (command?.name === name) {
+        return command.shortcut || "未设置";
+      }
+    }
+    return fallback;
+  };
+  for (const { name, element, fallback } of SHORTCUT_COMMANDS) {
+    const target = elements[element];
+    if (target) {
+      target.textContent = shortcutOf(name, fallback);
+    }
+  }
+  if (elements.shortcutList) {
+    const rows = SHORTCUT_COMMANDS.map(
+      ({ name, fallback, label }) =>
+        `<li><span>${label}</span><kbd>${escapeHtml(shortcutOf(name, fallback))}</kbd></li>`
+    );
+    elements.shortcutList.innerHTML = rows.join("");
+  }
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[ch]);
+}
+
+// ---- Restricted pages ----
+
+// chrome://, edge://, about:, the Chrome Web Store and (without the user's
+// file-access grant) file:// pages can never receive the content script.
+function detectRestrictedPage() {
+  const url = String(currentTab?.url || currentTab?.pendingUrl || "");
+  if (!url) {
+    return Promise.resolve(false);
+  }
+  if (/^(chrome|edge|about|devtools|view-source|chrome-error|javascript|data):/i.test(url)) {
+    return Promise.resolve(true);
+  }
+  if (/^https?:\/\/(chromewebstore\.google\.com|chrome\.google\.com\/webstore)/i.test(url)) {
+    return Promise.resolve(true);
+  }
+  if (/^file:/i.test(url)) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (allowed) => {
+        if (!settled) {
+          settled = true;
+          resolve(allowed === true);
+        }
+      };
+      try {
+        const api = globalThis.chrome?.extension;
+        if (typeof api?.isAllowedFileSchemeAccess !== "function") {
+          settle(false);
+          return;
+        }
+        const maybePromise = api.isAllowedFileSchemeAccess(settle);
+        if (maybePromise && typeof maybePromise.then === "function") {
+          maybePromise.then(settle, () => settle(false));
+        }
+      } catch {
+        settle(false);
+      }
+    });
+  }
+  return Promise.resolve(false);
+}
+
+function renderRestrictedNotice() {
+  if (elements.translate) {
+    elements.translate.disabled = true;
+  }
+  if (elements.restore) {
+    elements.restore.disabled = true;
+  }
+  setStatus("这个页面不能翻译", "Chrome 内置页面和应用商店不允许扩展注入，请打开普通网页", "error");
 }
 
 // ---- Serialized settings saves ----
@@ -1233,6 +1642,7 @@ function renderKeyStatus() {
     elements.keyGuide.classList.remove("highlight");
     elements.apiKey.classList.remove("attention");
   }
+  renderProviderStatus();
 }
 
 // Expand + highlight the key entry step (both providers' console links) when
@@ -1245,6 +1655,27 @@ function revealKeyEntry() {
 
 // ---- Paste → auto-save + auto connection test ----
 
+// Change/blur commits the key edit (immediate persist through the queue).
+// Inside the embedded setup card a format-valid manual edit ALSO auto-runs
+// the connection test (review P2 #15: typed keys deserve the verification
+// pasted ones get); the awaited save happens inside that test.
+async function handleApiKeyCommit() {
+  persistSettingsNow();
+  if (!viewState.setupMode) {
+    return;
+  }
+  const key = elements.apiKey.value.trim();
+  if (!key) {
+    return;
+  }
+  const formatReason = apiKeyFormatReason(elements.apiKey.value);
+  if (formatReason) {
+    renderSetupFeedback(`✗ ${formatReason}`);
+    return;
+  }
+  await runKeyConnectionTest();
+}
+
 async function handleApiKeyPasted() {
   const label = PROVIDER_META[activeProvider()]?.label || "API";
   // A paste is a user edit: bank it before the auto-save below.
@@ -1253,7 +1684,9 @@ async function handleApiKeyPasted() {
   renderKeyStatus();
   const key = elements.apiKey.value.trim();
   if (!key) {
-    setStatus("Key 已清空", `下次翻译前请重新填写 ${label} API Key`, "idle");
+    if (!renderSetupFeedback("已清空，请重新粘贴 Key")) {
+      setStatus("Key 已清空", `下次翻译前请重新填写 ${label} API Key`, "idle");
+    }
     return;
   }
   // Format gate before any network call: a paste accident fails in ms with a
@@ -1261,8 +1694,10 @@ async function handleApiKeyPasted() {
   const formatReason = apiKeyFormatReason(elements.apiKey.value);
   if (formatReason) {
     keyTestOp += 1;
-    revealKeyEntry();
-    setStatus("Key 格式错误", `${formatReason}（已保存本机，未发起网络验证）`, "error");
+    if (!renderSetupFeedback(`✗ ${formatReason}`)) {
+      revealKeyEntry();
+      setStatus("Key 格式错误", `${formatReason}（已保存本机，未发起网络验证）`, "error");
+    }
     return;
   }
   await runKeyConnectionTest();
@@ -1272,13 +1707,18 @@ async function runKeyConnectionTest() {
   const label = PROVIDER_META[activeProvider()]?.label || "API";
   const op = ++keyTestOp;
   keyTestPendingOp = op;
-  renderStatus(`正在验证 ${label} Key`, "发送一条最小测试请求", "loading");
+  if (!renderSetupFeedback(`正在验证 ${label} Key…`)) {
+    renderStatus(`正在验证 ${label} Key`, "发送一条最小测试请求", "loading");
+  }
   try {
     await runKeyConnectionTestInner(op, label);
   } finally {
     if (keyTestPendingOp === op) {
       keyTestPendingOp = 0;
     }
+    // A key that arrived from another surface while this test was in flight
+    // deferred the setup decision on its verdict — re-evaluate now.
+    evaluateSetupExit();
   }
 }
 
@@ -1292,9 +1732,12 @@ async function runKeyConnectionTestInner(op, label) {
     if (op !== keyTestOp) {
       return;
     }
-    renderStatus("保存设置失败", toFriendlyPageError(error), "error");
+    if (!renderSetupFeedback(`✗ 保存设置失败：${toFriendlyPageError(error)}`)) {
+      renderStatus("保存设置失败", toFriendlyPageError(error), "error");
+    }
     return;
   }
+  const testedKey = String(settings[PROVIDER_META[settings.provider]?.keyField] || "");
   try {
     const response = await chrome.runtime.sendMessage({
       type: "TEST_CONNECTION",
@@ -1306,16 +1749,36 @@ async function runKeyConnectionTestInner(op, label) {
       return;
     }
     if (response?.ok) {
-      renderStatus("Key 有效", `${label} 连接成功，可以开始翻译`, "success");
+      keyVerified[settings.provider] = true;
+      providerKeyInvalid = false;
+      setupRejectedKey = "";
+      const wasSetup = viewState.setupMode;
+      // Say it inside the setup card while the setup view still owns the
+      // popup, then graduate — the main view the user lands on answers with
+      // its provider status line ("✓ DeepSeek 已连接").
+      if (!renderSetupFeedback("✓ 已连接")) {
+        renderStatus("Key 有效", `${label} 连接成功，可以开始翻译`, "success");
+      }
+      if (wasSetup) {
+        viewState.setupMode = false;
+        renderView();
+      }
+      renderProviderStatus();
       return;
     }
+    setupRejectedKey = testedKey;
     const [title, detail] = friendlyKeyTestFailure(response, label);
-    renderStatus(title, detail, "error");
+    if (!renderSetupFeedback(`✗ ${title}：${detail}`)) {
+      renderStatus(title, detail, "error");
+    }
   } catch (error) {
     if (op !== keyTestOp) {
       return;
     }
-    renderStatus("网络错误", toFriendlyPageError(error), "error");
+    setupRejectedKey = testedKey;
+    if (!renderSetupFeedback(`✗ 网络错误：${toFriendlyPageError(error)}`)) {
+      renderStatus("网络错误", toFriendlyPageError(error), "error");
+    }
   }
 }
 
@@ -1567,11 +2030,65 @@ function stopStatusPolling() {
   }
 }
 
+// The retry button shows only when the page still has failed (retryable)
+// blocks and nothing is in flight; its label names the count.
+function renderRetryFailed(status) {
+  if (!elements.retryFailed) {
+    return;
+  }
+  const retryable = Number(
+    status?.failedRetryable ?? (Number(status?.failed) > 0 ? status.failed : 0)
+  );
+  const visible = retryable > 0 && status?.phase !== "translating";
+  elements.retryFailed.hidden = !visible;
+  if (visible) {
+    elements.retryFailed.textContent = `重试失败的 ${retryable} 段`;
+  }
+}
+
+// The progress bar only fills while translating (its track is hidden by CSS
+// unless the card is in the loading tone).
+function renderProgress(status) {
+  if (!elements.statusProgress) {
+    return;
+  }
+  const total = Number(status?.total || 0);
+  const translated = Number(status?.translated || 0);
+  const percent = total > 0
+    ? Math.max(0, Math.min(100, Math.round((translated / total) * 100)))
+    : 0;
+  elements.statusProgress.style.width = `${percent}%`;
+}
+
+function hideStatusCard() {
+  if (elements.statusWrap) {
+    elements.statusWrap.hidden = true;
+  }
+}
+
 function renderTranslationStatus(status) {
   updateExportAvailability(status);
+  renderRetryFailed(status);
+  renderProgress(status);
+  // 还原原文 needs an active (translated) page.
+  if (elements.restore) {
+    elements.restore.disabled = !status?.active;
+  }
+
+  // A restricted tab keeps its cannot-translate notice; no status the page
+  // could send may replace it (there should be none — no injection).
+  if (pageRestricted) {
+    renderRestrictedNotice();
+    return;
+  }
 
   if (!status?.active) {
-    passiveStatus("准备就绪", "可整页翻译，或在页面上划词查看译文", "idle");
+    // No idle card: with nothing to report the whole status area collapses,
+    // and any explicit setStatus() brings it back. A still-pending key
+    // connection test keeps its own card visible.
+    if (!(keyTestPendingOp && keyTestPendingOp === keyTestOp)) {
+      hideStatusCard();
+    }
     return;
   }
 
@@ -1584,17 +2101,27 @@ function renderTranslationStatus(status) {
   }
 
   if (status.phase === "error") {
+    noteProviderKeyError(status.error);
     passiveStatus("翻译失败", status.error || "请检查 API 设置后重试", "error");
     return;
   }
 
-  const failureText = status.failed > 0 ? `，${status.failed} 段失败` : "";
+  const failed = Number(status.failedRetryable ?? status.failed ?? 0);
+  if (failed > 0) {
+    passiveStatus(
+      "部分未完成",
+      `已翻译 ${status.translated} 段，${failed} 段失败（可重试，只重发失败段）`,
+      "warning"
+    );
+    return;
+  }
+
   const modeLabel = {
     bilingual: "双语对照",
     "translation-only": "仅译文",
     original: "原文"
   }[status.displayMode] || "双语对照";
-  passiveStatus("翻译已开启", `已翻译 ${status.translated} 段${failureText} · ${modeLabel} · 自动跟译新内容`, "success");
+  passiveStatus("翻译已开启", `已翻译 ${status.translated} 段 · ${modeLabel} · 自动跟译新内容`, "success");
 }
 
 async function runExportAction(type, pendingTitle, successDetail) {
@@ -1643,6 +2170,11 @@ function passiveStatus(title, detail, tone) {
 }
 
 function renderStatus(title, detail, tone) {
+  // An explicit status always (re)shows the card — the idle collapse in
+  // renderTranslationStatus only ever hides it.
+  if (elements.statusWrap) {
+    elements.statusWrap.hidden = false;
+  }
   elements.statusTitle.textContent = title;
   elements.statusDetail.textContent = detail;
   elements.statusCard.dataset.tone = tone;

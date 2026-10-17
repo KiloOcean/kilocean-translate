@@ -145,7 +145,11 @@ function collectHtmlReferences(rootDir, htmlRel, add) {
 }
 
 // chrome.scripting.executeScript({ files: ["shared.js", "content.js"] }) —
-// the injection file lists live in script source, not the manifest.
+// the injection file lists live in script source, not the manifest. Extension
+// pages opened via chrome.runtime.getURL("welcome.html") are the same kind of
+// hidden reference: the manifest never names them, so follow the string
+// literals here too (query/hash stripped — popup.html?view=settings is just
+// popup.html, which the Set de-duplicates against the manifest popup).
 function collectScriptFileLists(rootDir, jsRel, add) {
   const source = fs.readFileSync(path.join(rootDir, jsRel), "utf8");
   for (const list of source.matchAll(/files\s*:\s*\[([^\]]*)\]/g)) {
@@ -153,6 +157,12 @@ function collectScriptFileLists(rootDir, jsRel, add) {
       if (isLocalReference(item[1])) {
         add(toPosix(item[1]), `injected by ${jsRel}`);
       }
+    }
+  }
+  for (const call of source.matchAll(/chrome\.runtime\.getURL\s*\(\s*(["'])([^"']*)\1/g)) {
+    const page = call[2].replace(/[?#].*$/, "");
+    if ((page.endsWith(".html") || page.endsWith(".htm")) && isLocalReference(page)) {
+      add(toPosix(page), `opened via chrome.runtime.getURL in ${jsRel}`);
     }
   }
 }
