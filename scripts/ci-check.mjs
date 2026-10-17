@@ -7320,6 +7320,131 @@ async function checkPopupViews150() {
     assertEqual(popup.hooks.getAppView(), "main", "paste-then-edit: B's ok verdict is what graduates the setup card");
   }
 
+  // (19b)/(19c) PR #19 follow-up — the popup side of the OTHER interleavings
+  // (mirroring the welcome (b3)/(b4) tests in checkKeyVerifierGate): paste
+  // key A (its TEST_CONNECTION parks), paste key B; B's verdict lands FIRST,
+  // then A's stale verdict for the replaced key arrives. Only the verdict for
+  // the value the input now holds (B) applies — B's 401 persists failed for
+  // B's fingerprint and A's late ok flips nothing (no graduation, no verified
+  // write, no 已连接 anywhere), while B's ok persists verified + graduates the
+  // setup card and A's late 401 writes no failed status over it. The settings
+  // key field (?view=settings) runs the same pair; its verdicts render through
+  // the status card, so the surviving truth is asserted on the key-status row
+  // and storage.
+  const pasteReplaceOrdering = async ({ settingsView = false, bFails = false } = {}) => {
+    const label = `paste-replace (${settingsView ? "settings" : "setup"}, ${bFails ? "401 first" : "ok first"})`;
+    const A_KEY = fakeKey(bFails ? "slowOkA" : "slowFailA", 24);
+    const B_KEY = fakeKey(bFails ? "fast401B" : "fastOkB", 25);
+    const fingerprintOf = (key) => `${key.length}:${key.slice(-4)}`;
+    const held = [];
+    let tests = 0;
+    const popup = createPopupVm(
+      settingsView
+        ? seededMain()
+        : { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash" },
+      {
+        locationSearch: settingsView ? "?view=settings" : "",
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            tests += 1;
+            // The FIRST test (A's) parks; every later one (B's) answers at once.
+            if (held.length === 0) {
+              return new Promise((resolve) => {
+                held.push(resolve);
+              });
+            }
+            return bFails ? { ok: false, code: "API_401", error: "Key 不正确" } : { ok: true };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    const writes = recordWrites(popup);
+    await popup.hooks.initializePromise;
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = A_KEY;
+    fire(keyInput, "paste"); // A's test parks
+    await waitFor(() => held.length === 1, `${label}: A's test is in flight`);
+    keyInput.value = B_KEY;
+    fire(keyInput, "paste"); // B's paste bills its own immediate test
+    await waitFor(() => tests === 2, `${label}: A and B each bill their own TEST_CONNECTION`);
+    const bStatus = bFails ? "failed" : "verified";
+    const bRowText = bFails ? `验证失败 · 尾号 ${B_KEY.slice(-4)}` : `已连接 · 尾号 ${B_KEY.slice(-4)}`;
+    const bView = settingsView ? "settings" : (bFails ? "setup" : "main");
+    await waitFor(
+      () => popup.storage.deepseekKeyStatus === bStatus && popup.storage.deepseekKeyStatusFor === fingerprintOf(B_KEY),
+      `${label}: B's verdict persists ${bStatus} for B's fingerprint`
+    );
+    assertEqual(popup.storage.deepseekApiKey, B_KEY, `${label}: storage holds B, never A`);
+    assertEqual(
+      popup.dom.get("key-status-deepseek-value").textContent,
+      bRowText,
+      `${label}: the key-status row names B's verdict`
+    );
+    assertEqual(
+      popup.hooks.getAppView(),
+      bView,
+      `${label}: B's ${bFails ? "401 keeps the setup card" : "ok is what graduates the setup card"}`
+    );
+    // NOW A's stale verdict lands — the OPPOSITE verdict, for the replaced key.
+    held[0](bFails ? { ok: true } : { ok: false, code: "API_401", error: "Key 不正确" });
+    await tick();
+    await tick();
+    assertEqual(tests, 2, `${label}: A's late verdict bills nothing new`);
+    assertEqual(popup.hooks.getAppView(), bView, `${label}: A's late verdict flips no view`);
+    assertFalse(
+      writes.some((write) => write.deepseekKeyStatus === (bFails ? "verified" : "failed")),
+      `${label}: A's late verdict persists no ${bFails ? "verified" : "failed"} status`
+    );
+    assertFalse(
+      // A's own save legitimately wrote "unverified" for A; only a VERDICT
+      // (verified/failed) for A's fingerprint would be the stale-apply bug.
+      writes.some((write) => write.deepseekKeyStatusFor === fingerprintOf(A_KEY) && write.deepseekKeyStatus !== "unverified"),
+      `${label}: no verdict write ever carries A's fingerprint`
+    );
+    assertEqual(popup.storage.deepseekApiKey, B_KEY, `${label}: storage keeps B after A's late verdict`);
+    assertEqual(popup.storage.deepseekKeyStatus, bStatus, `${label}: B's persisted verdict survives A's late one`);
+    assertEqual(
+      popup.storage.deepseekKeyStatusFor,
+      fingerprintOf(B_KEY),
+      `${label}: the surviving fingerprint still names B`
+    );
+    assertEqual(
+      popup.dom.get("key-status-deepseek-value").textContent,
+      bRowText,
+      `${label}: the row still names B's verdict after A's late one`
+    );
+    if (settingsView) {
+      assertEqual(
+        popup.dom.get("status-title").textContent,
+        bFails ? "Key 无效" : "Key 有效",
+        `${label}: the status card keeps B's verdict message`
+      );
+    } else if (bFails) {
+      assertTrue(
+        String(popup.dom.get("setup-feedback").textContent).includes("✗ Key 无效"),
+        `${label}: B's 401 stays rendered on the setup card`
+      );
+      assertFalse(
+        String(popup.dom.get("setup-feedback").textContent).includes("已连接"),
+        `${label}: the setup card never says 已连接`
+      );
+      assertFalse(
+        String(popup.dom.get("provider-status-label").textContent).includes("已连接"),
+        `${label}: the provider line never says 已连接`
+      );
+    } else {
+      assertTrue(
+        String(popup.dom.get("provider-status-label").textContent).includes("✓ DeepSeek 已连接"),
+        `${label}: B's connected line survives A's late 401`
+      );
+    }
+  };
+  await pasteReplaceOrdering({ bFails: true }); // (19b) setup card
+  await pasteReplaceOrdering({ bFails: false }); // (19c) setup card
+  await pasteReplaceOrdering({ settingsView: true, bFails: true }); // (19b) settings key field
+  await pasteReplaceOrdering({ settingsView: true, bFails: false }); // (19c) settings key field
+
   // (20) PR #19 follow-up (restricted by behavior): without the tabs
   // permission the popup cannot read the URL, so a chrome:// page passes the
   // URL probe — the injection itself refusing (PING and executeScript both

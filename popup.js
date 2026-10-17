@@ -1995,8 +1995,15 @@ async function persistKeyVerdict(provider, key, result) {
   if (!status) {
     return;
   }
+  const patch = Utils.keyStatusPatch(provider, status, key);
   try {
-    await enqueueSettingsWrite(Utils.keyStatusPatch(provider, status, key));
+    await enqueueSettingsWrite(patch);
+    // Merge our own committed write into the snapshot right away (exactly
+    // what the storage.onChanged echo will deliver later): the verdict render
+    // that follows must read the status it just persisted — a failed verdict
+    // has no session flag (keyVerified covers only success), so without this
+    // the row would read 未验证 until the echo arrived.
+    reconcile(patch);
   } catch {
     // The verdict still renders; the status stays "unverified".
   }
