@@ -17,13 +17,14 @@ Open a foreign-language page, click the extension, and translate the current tab
 • Skips code blocks, inputs, URL-like text, and pure numbers  
 • Export translated page as HTML, or print / save as PDF  
 • API key stored only in local Chrome storage  
-• Uses activeTab — only accesses the tab after you click
+• Uses activeTab — only accesses the tab after you click the icon, press a shortcut (Alt+A page / Alt+T selection) or use the right-click menu  
+• contextMenus (1.5.0) — adds “翻译选中文字 / 翻译此页” to the right-click menu; no install or update permission warning, and it does not read page content by itself
 
 ### How to use
 1. Install the extension and open a normal webpage  
 2. Open the popup and paste your DeepSeek API key (https://platform.deepseek.com/api_keys)  
 3. Pick target language + model  
-4. Click “Translate current page”
+4. Click “翻译此页” (Translate this page), or press Alt+A; select text and press Alt+T to translate a selection
 
 ### Privacy
 Page text is sent directly to DeepSeek’s official API. The developer never receives your key or page content.  

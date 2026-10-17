@@ -235,8 +235,22 @@ const SELECTION_SEND_WINDOW_LIMIT = 8;
 /** @type {number[]} */
 let selectionSendTimes = [];
 
-chrome.runtime.onInstalled.addListener(async () => {
+chrome.runtime.onInstalled.addListener(async (details) => {
   await loadSettings();
+  // Entry-point context menus are (re)created on every install/update: the
+  // ids stay stable, so removeAll + recreate replaces a stale menu from an
+  // older version instead of stacking a duplicate.
+  createContextMenus();
+  if (details?.reason === "install") {
+    // First-run walk-through — never on update (an upgrade must not pull an
+    // existing user out of their workflow).
+    try {
+      await chrome.tabs.create({ url: chrome.runtime.getURL("welcome.html") });
+    } catch {
+      // tabs.create/getURL may be absent under old test harnesses; the
+      // install itself still completes.
+    }
+  }
 });
 
 // Browser start re-runs the worker cold: run the <=1.3.x key / legacy model
@@ -270,6 +284,227 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     cancelTabTranslateBatches(tabId);
   }
 });
+
+// ---- 1.5.0 entry points: keyboard shortcuts + context menu ----
+// Both gestures grant activeTab for the tab they fired in, so the content
+// script is injected on demand — no content_scripts, no new host permissions.
+
+const CONTEXT_MENU_COMMANDS = Object.freeze({
+  "kilocean-translate-selection": "translate-selection",
+  "kilocean-translate-page": "translate-page"
+});
+// How long the "!" badge for an unavailable tab stays up before clearing.
+const COMMAND_BADGE_CLEAR_MS = 2000;
+// welcome.html's sample copy is small by design; anything longer is rejected
+// before a provider call is ever made.
+const WELCOME_SAMPLE_MAX_CHARS = 1200;
+
+// chrome.commands has passed the tab along since Chrome 86; keep the guard so
+// old harnesses (or API-less contexts) never break worker startup.
+if (chrome.commands?.onCommand) {
+  chrome.commands.onCommand.addListener((command, tab) => {
+    // Fire-and-forget: handleTranslateCommand never rejects.
+    void handleTranslateCommand(command, tab);
+  });
+}
+
+if (chrome.contextMenus?.onClicked) {
+  chrome.contextMenus.onClicked.addListener((info, tab) => {
+    const command = CONTEXT_MENU_COMMANDS[info?.menuItemId];
+    if (command) {
+      void handleTranslateCommand(command, tab, {
+        source: "contextMenu",
+        selectionText: info?.selectionText
+      });
+    }
+  });
+}
+
+function createContextMenus() {
+  // chrome.contextMenus may be missing under old test harnesses — a missing
+  // menu must never break install/startup.
+  const menus = chrome.contextMenus;
+  if (!menus?.removeAll || !menus?.create) {
+    return;
+  }
+  menus.removeAll(() => {
+    // Reading lastError swallows Chrome's "unchecked runtime.lastError".
+    void chrome.runtime.lastError;
+    for (const item of [
+      { id: "kilocean-translate-selection", title: "翻译选中文字", contexts: ["selection"] },
+      { id: "kilocean-translate-page", title: "翻译此页", contexts: ["page"] }
+    ]) {
+      menus.create(item, () => {
+        void chrome.runtime.lastError;
+      });
+    }
+  });
+}
+
+// Route one entry-point gesture to its tab action. Named and never-rejecting
+// so both listeners (and the ci vm harnesses) drive the shipping path.
+async function handleTranslateCommand(command, tab, { source = "command", selectionText } = {}) {
+  try {
+    if (command !== "translate-selection" && command !== "translate-page") {
+      return;
+    }
+    const targetTab = await resolveActiveTab(tab);
+    const tabId = targetTab?.id;
+    if (!Number.isInteger(tabId)) {
+      return;
+    }
+    if (command === "translate-selection") {
+      await sendSelectionTranslateCommand(tabId, source, selectionText);
+    } else {
+      await startPageTranslationFromCommand(tabId);
+    }
+  } catch {
+    // An entry point must never leave an unhandled rejection in the worker.
+  }
+}
+
+// Commands carry their tab (Chrome >= 86); fall back to the active-tab query
+// for marginal dispatch shapes.
+async function resolveActiveTab(tab) {
+  if (tab && Number.isInteger(tab.id)) {
+    return tab;
+  }
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    return Array.isArray(tabs) && tabs.length > 0 ? tabs[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Same contract as popup.js's ensureContentScript: ping the live content
+// script first, inject on demand when nobody answers. False on pages that
+// cannot host the script at all (chrome://, Web Store, PDF viewer).
+async function ensureContentScriptInTab(tabId) {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { type: "PING_CONTENT" });
+    if (response?.ok) {
+      return true;
+    }
+  } catch {
+    // No content script in this tab yet — inject below.
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["shared.js", "content.js"]
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Alt+T / 右键「翻译选中文字」: the trusted browser gesture is the billing
+// consent and content.js owns the key gate itself — the worker only delivers
+// the command to the top frame's live selection.
+async function sendSelectionTranslateCommand(tabId, source, selectionText) {
+  if (!(await ensureContentScriptInTab(tabId))) {
+    await flagTabUnavailable(tabId);
+    return;
+  }
+  const message = {
+    type: "COMMAND_SELECTION_TRANSLATE",
+    source: source === "contextMenu" ? "contextMenu" : "command"
+  };
+  if (typeof selectionText === "string" && selectionText) {
+    message.selectionText = selectionText;
+  }
+  try {
+    await chrome.tabs.sendMessage(tabId, message, { frameId: 0 });
+  } catch {
+    await flagTabUnavailable(tabId);
+  }
+}
+
+// Alt+A / 右键「翻译此页」: same no-key rule as the popup's translate button —
+// without a provider key nothing billable starts, the user lands in settings.
+async function startPageTranslationFromCommand(tabId) {
+  const settings = await loadSettings();
+  const providerConfig = getProviderConfig(settings.provider);
+  if (!String(settings[providerConfig.keyField] || "").trim()) {
+    await openSettingsTab();
+    return;
+  }
+  if (!(await ensureContentScriptInTab(tabId))) {
+    await flagTabUnavailable(tabId);
+    return;
+  }
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "START_TRANSLATION",
+      options: {
+        provider: settings.provider,
+        targetLanguage: settings.targetLanguage,
+        model: settings.model,
+        displayMode: settings.displayMode
+      }
+    });
+  } catch {
+    await flagTabUnavailable(tabId);
+  }
+}
+
+// popup.html doubles as the full settings page (?view=settings opens the
+// settings view); opening it is the safe fallback from any own surface.
+async function openSettingsTab() {
+  try {
+    await chrome.tabs.create({ url: chrome.runtime.getURL("popup.html?view=settings") });
+  } catch {
+    // tabs.create may be absent under old test harnesses.
+  }
+}
+
+// A page that cannot host the content script gets a brief "!" badge — the
+// only honest feedback a background worker can give for a dead entry point.
+async function flagTabUnavailable(tabId) {
+  try {
+    await chrome.action.setBadgeText({ tabId, text: "!" });
+  } catch {
+    return; // Tab already gone.
+  }
+  setTimeout(() => {
+    void clearTabBadge(tabId);
+  }, COMMAND_BADGE_CLEAR_MS);
+}
+
+async function clearTabBadge(tabId) {
+  try {
+    await chrome.action.setBadgeText({ tabId, text: "" });
+  } catch {
+    // Tab closed in the meantime.
+  }
+}
+
+// welcome.html's sample translation: only the bundled welcome page may bill
+// it. Content scripts carry the PAGE's url in sender.url and forged senders
+// carry anything else — only a real welcome.html document gets the
+// chrome-extension:// URL this checks against.
+async function handleWelcomeSampleTranslate(message, sender) {
+  if (
+    typeof sender.url !== "string" ||
+    !sender.url.startsWith(chrome.runtime.getURL("welcome.html"))
+  ) {
+    throw createError("示例翻译仅限新手引导页使用", "WELCOME_FORBIDDEN");
+  }
+  const text = String(message?.text || "").trim();
+  if (!text || text.length > WELCOME_SAMPLE_MAX_CHARS) {
+    throw createError("示例文本长度需在 1–1200 字之间", "WELCOME_SAMPLE_INVALID_TEXT");
+  }
+  const settings = await loadSettings();
+  const translations = await translateBatch(
+    [text],
+    settings.targetLanguage,
+    settings.model,
+    settings.provider
+  );
+  return translations[0];
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) {
@@ -420,6 +655,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })
       .then((pending) => sendResponse({ ok: true, pending }))
       .catch((error) => sendResponse({ ok: false, error: error.code || error.message }));
+    return true;
+  }
+
+  if (message?.type === "OPEN_SETTINGS") {
+    // Any of our senders (sender.id already checked above) may ask — popup,
+    // content bubble, welcome page. Opening the settings tab is harmless even
+    // if a page forged the message.
+    openSettingsTab()
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message?.type === "WELCOME_SAMPLE_TRANSLATE") {
+    handleWelcomeSampleTranslate(message, sender)
+      .then((translation) => sendResponse({ ok: true, translation }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message,
+        code: error.code || "WELCOME_SAMPLE_FAILED"
+      }));
     return true;
   }
 

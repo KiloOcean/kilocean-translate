@@ -29,6 +29,10 @@
   const SELECTION_SEND_MIN_INTERVAL_MS = 1000;
   const SELECTION_SEND_WINDOW_MS = 10000;
   const SELECTION_SEND_WINDOW_LIMIT = 8;
+  // A >5000-char segment split into halves came back with an empty/blank half:
+  // that segment FAILED (never silently skipped) — surfaced via state.error,
+  // the progress pill and the in-place failed marker.
+  const SPLIT_EMPTY_RESULT_MESSAGE = "长段落分段翻译返回空结果";
   // On X hosts the page is mostly untranslated UI chrome (sidebar, trends,
   // follow rows, footer); only tweet bodies and profile bios get translated.
   // Generic sites keep the full-page behavior.
@@ -46,12 +50,23 @@
   const ownedOriginalWraps = new WeakSet();
   /** Blocks holding a failure slot in state.failed — a retry replaces the slot. */
   const failedBlocks = new Set();
+  // In-place failure markers we own (owned element per failed block; tracked
+  // like ownedOriginalWraps so page-planted data-kilocean-failed-marker nodes
+  // never count as ours). WeakMap: entries die with their block.
+  const failedMarkers = new WeakMap();
 
   let mutationObserver = null;
   let dynamicTimer = null;
   let workQueue = Promise.resolve();
   let generation = 0;
   let toastTimer = null;
+  /** Progress pill host + closed shadow ref (page can never reach inside). */
+  let progressPillHost = null;
+  let progressPillShadow = null;
+  /** Last rendered pill signature (phase/counts/mode) — re-render only on change. */
+  let progressPillSignature = "";
+  let pillCollapseTimer = null;
+  let pillCollapsed = false;
   let selectionTimer = null;
   let selectionGeneration = 0;
   /** Last selection translate key (target\0model\0text\0range) to avoid rebill on Shift release. */
@@ -147,6 +162,7 @@
       state.displayMode = Utils.normalizeDisplayMode(changes.displayMode.newValue);
       applyDocumentDisplayMode(state.displayMode);
       refreshAllBlockDisplays();
+      updateProgressPill();
     }
     if (changes.targetLanguage?.newValue) {
       // Keep the active page run stable while translations remain on-screen.
@@ -207,13 +223,58 @@
     }
 
     if (message?.type === "SET_DISPLAY_MODE") {
-      const mode = Utils.normalizeDisplayMode(message.displayMode);
-      state.displayMode = mode;
-      applyDocumentDisplayMode(mode);
-      refreshAllBlockDisplays();
-      chrome.storage.local.set({ displayMode: mode });
+      setDisplayModePreference(message.displayMode);
       sendResponse({ ok: true, status: getPublicStatus() });
       return false;
+    }
+
+    if (message?.type === "COMMAND_SELECTION_TRANSLATE") {
+      // Trusted billing trigger: runtime messages cannot be forged by page
+      // script, and this one originates from the browser Alt+T command /
+      // context-menu item (relayed by our background). The Alt+T / popup
+      // gesture itself is the billing consent — same model as CONFIRM below.
+      // Capture the LIVE selection synchronously: page script must never get
+      // a window to swap it in during any await.
+      const gesture = captureSelectionGesture();
+      if (!gesture) {
+        // Nothing selected here (or the selection lives in a frame we cannot
+        // read — message.selectionText is then stale/unverifiable text the
+        // user cannot see, so it is never billed): non-billable hint state.
+        // A selection INSIDE a textarea / text-like input is a special case
+        // (PR #19 follow-up): the user did select text, but input-field text
+        // is not page content this extension can annotate — say so instead
+        // of the generic 先选中 hint. Still never billed.
+        const inputSelection = activeElementHasTextSelection();
+        showSelectionHintPanel(
+          inputSelection ? "暂不支持翻译输入框内的文字" : "先选中要翻译的文字，再按 Alt+T 或右键「翻译选中文字」"
+        );
+        sendResponse({
+          ok: false,
+          error: inputSelection
+            ? "暂不支持翻译输入框内的文字"
+            : "先选中要翻译的文字，再按 Alt+T 或右键「翻译选中文字」"
+        });
+        return false;
+      }
+      // The live selection wins over message.selectionText: the context-menu
+      // text can be stale, while the live selection is what the user sees.
+      // sendSelectionTranslation revalidates it, runs the key gate + rate
+      // limit, and drives the bubble loading/result/error states.
+      sendSelectionTranslation(gesture)
+        .then((result) => sendResponse(result?.ok === false
+          ? { ok: false, error: result.error || "划词翻译失败" }
+          : { ok: true }))
+        .catch((error) => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
+
+    if (message?.type === "RETRY_FAILED") {
+      // Retry ONLY the currently failed blocks — never restoreOriginal, never
+      // a full re-run (that would re-bill finished segments).
+      retryFailedBlocks()
+        .then(() => sendResponse({ ok: true, status: getPublicStatus() }))
+        .catch((error) => sendResponse({ ok: false, error: error.message }));
+      return true;
     }
 
     if (message?.type === "CONFIRM_SELECTION_TRANSLATE") {
@@ -263,10 +324,26 @@
         assertExportReady();
         sendResponse({ ok: true });
         setTimeout(() => {
-          // Live print includes fixed overlays; HTML export already strips the host.
+          // Live print includes fixed overlays; HTML export already strips our hosts.
+          // Failure markers must hide too — otherwise the red “这段没翻译成功”
+          // banner and its Retry control land in the printed page / PDF.
           hideSelectionPanel();
           hideToast();
+          const pillHost = progressPillHost;
+          if (pillHost) {
+            pillHost.style.display = "none";
+          }
+          const markerHosts = [...document.querySelectorAll("[data-kilocean-failed-marker]")];
+          for (const host of markerHosts) {
+            host.style.display = "none";
+          }
           window.print();
+          if (pillHost) {
+            pillHost.style.display = "";
+          }
+          for (const host of markerHosts) {
+            host.style.display = "";
+          }
         }, 80);
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
@@ -333,15 +410,23 @@
       notifyPopupStatus();
     }
 
-    showToast("正在识别网页内容…", "loading");
+    // Fresh run: stale failure markers (and their failedBlocks slots — even
+    // when blockRecords is empty because EVERY block failed last time) must
+    // not leak into this run's counts.
+    clearFailedMarkers();
+    failedBlocks.clear();
     startObserving();
 
     const blocks = collectBlocks(document.body || document.documentElement);
     state.total = blocks.length;
+    // Page-run feedback lives in the bottom-right progress pill (real
+    // state.translated / state.total), replacing the old static loading toast.
+    updateProgressPill();
 
     if (blocks.length === 0) {
       state.phase = "translated";
       finishRunSettings();
+      updateProgressPill();
       showToast("没有发现需要翻译的内容", "info");
       notifyPopupStatus();
       return;
@@ -362,20 +447,17 @@
     if (hasPendingDynamicWork()) {
       state.phase = "translating";
       finishRunSettings();
+      updateProgressPill();
       notifyPopupStatus();
       return;
     }
 
     state.phase = state.failed > 0 && state.translated === 0 ? "error" : "translated";
     finishRunSettings();
+    // Terminal state shows in the pill (partial/error stay persistent there
+    // with their retry/settings exits — no vanishing toast).
+    updateProgressPill();
     notifyPopupStatus();
-    if (state.phase === "error") {
-      showToast(state.error || "翻译失败", "error", 6000);
-    } else if (state.failed > 0) {
-      showToast(`已翻译 ${state.translated} 条，${state.failed} 条失败`, "warning", 5000);
-    } else {
-      showToast(`已翻译 ${state.translated} 条内容`, "success");
-    }
   }
 
   function finishRunSettings() {
@@ -436,6 +518,9 @@
     stopObserving();
     activeRunSettings = null;
     deferredRunSettings = null;
+    // Pill and in-place failure markers are session UI — both go away here.
+    hideProgressPill();
+    clearFailedMarkers();
     failedBlocks.clear();
     // Session end: cached translations belong to the translated session, not
     // to the restored page.
@@ -523,6 +608,7 @@
         pendingRefreshBlocks.delete(block);
       }
     }
+    clearFailedMarkers();
     failedBlocks.clear();
     if (dynamicTimer) {
       clearTimeout(dynamicTimer);
@@ -536,6 +622,7 @@
     state.failed = 0;
     state.error = "";
     state.phase = "translating";
+    updateProgressPill();
     notifyPopupStatus();
     // Re-discover once the SPA swap settles; the dynamic path reuses the
     // pinned run settings and every runId race-token check.
@@ -609,11 +696,13 @@
       }
       discardBlockRecord(block);
     }
-    // Failed blocks that left the page release their failed/total slots too.
+    // Failed blocks that left the page release their failed/total slots too
+    // (and their in-place markers, which usually left with them).
     for (const block of [...failedBlocks]) {
       if (block.isConnected) {
         continue;
       }
+      removeFailedMarker(block);
       failedBlocks.delete(block);
       if (state.failed > 0) {
         state.failed -= 1;
@@ -1061,7 +1150,7 @@
     return "";
   }
 
-  async function translateBlocks(blocks, runId, isDynamic) {
+  async function translateBlocks(blocks, runId, isDynamic, options = {}) {
     const runSettings = getRunSettings();
     const candidates = [...new Set(blocks)].filter((block) => block?.isConnected && !blockRecords.has(block));
 
@@ -1111,10 +1200,25 @@
         }
       }
       state.total += newTotalSlots;
-      showToast("正在翻译新加载的内容…", "loading");
+      showToast(options.retry ? "正在重试未完成的段落…" : "正在翻译新加载的内容…", "loading");
+      updateProgressPill();
     }
 
-    const batches = Utils.chunkSegments(segments, 5000, 24);
+    // Visible-area-first for the INITIAL run: viewport blocks land in the
+    // first batches so the user watching the page sees progress immediately,
+    // then the next screen below, then the rest. Dynamic follow-ups and
+    // failed-block retries keep discovery (DOM) order. One rect read per
+    // block, inside orderSegmentsByViewport.
+    const orderedSegments = isDynamic
+      ? segments
+      : Utils.orderSegmentsByViewport(
+        segments,
+        // Items are segments ({ block, text, ... }), not elements.
+        (segment) => segment.block.getBoundingClientRect(),
+        window.innerHeight
+      );
+
+    const batches = Utils.chunkSegments(orderedSegments, 5000, 24);
 
     // Concurrency cap: at most Utils.MAX_INFLIGHT_TRANSLATE_BATCHES batches
     // may be in flight. The sequential loop below (one await per batch) keeps
@@ -1125,6 +1229,7 @@
         return;
       }
       await translateBatchWithFallback(batch, runId, runSettings);
+      updateProgressPill();
     }
 
     if (isDynamic && runId === generation) {
@@ -1144,8 +1249,9 @@
         showToast(`已翻译 ${state.translated} 条，${state.failed} 条失败`, "warning", 5000);
       } else {
         state.phase = "translated";
-        showToast("新内容已翻译", "success");
+        showToast(options.retry ? "重试完成" : "新内容已翻译", "success");
       }
+      updateProgressPill();
       notifyPopupStatus();
     }
   }
@@ -1415,18 +1521,22 @@
     }
   }
 
-  function noteSegmentFailure(segment) {
+  function noteSegmentFailure(segment, reason = "") {
     const block = segment?.block;
     // A block already holding a failure slot keeps it: when the observer
     // retries the same block, the retry must replace the slot (see the
     // success path below), never stack a second failed/total count.
     if (block && failedBlocks.has(block)) {
+      updateFailedMarker(block, reason);
+      updateProgressPill();
       return;
     }
     if (block) {
       failedBlocks.add(block);
+      showFailedMarker(block, reason);
     }
     state.failed += 1;
+    updateProgressPill();
   }
 
   function applyTranslatedSegment(segment, translation) {
@@ -1462,9 +1572,11 @@
           state.failed -= 1;
         }
       }
+      removeFailedMarker(segment.block);
       if (state.total > 0) {
         state.total -= 1;
       }
+      updateProgressPill();
       return true;
     }
 
@@ -1482,7 +1594,9 @@
         state.failed -= 1;
       }
     }
+    removeFailedMarker(segment.block);
     state.translated += 1;
+    updateProgressPill();
     return true;
   }
 
@@ -1509,7 +1623,18 @@
       const segment = batch[0];
       try {
         const joined = await translateSegmentTextWithSplit(segment.text, runId, runSettings);
-        if (joined == null || runId !== generation) {
+        if (runId !== generation) {
+          // Stale run — no failure accounting for the replacement run.
+          return;
+        }
+        if (joined == null || !String(joined).trim()) {
+          // A half came back empty: the whole segment is UNTRANSLATED — the
+          // old code silently skipped it (silent long-paragraph loss). Count
+          // it as a failure so the pill/marker/summary surface the gap.
+          noteSegmentFailure(segment, SPLIT_EMPTY_RESULT_MESSAGE);
+          if (!state.error) {
+            state.error = SPLIT_EMPTY_RESULT_MESSAGE;
+          }
           return;
         }
         if (!applyTranslatedSegment(segment, joined)) {
@@ -1521,7 +1646,7 @@
           // Stale run — must not pollute the replacement run's failure counts.
           return;
         }
-        noteSegmentFailure(segment);
+        noteSegmentFailure(segment, error.message);
         state.error = error.message;
         return;
       }
@@ -1542,7 +1667,7 @@
         // Stale/empty/disconnected segments reject here — count them so the
         // run summary does not silently under-report.
         if (!applyTranslatedSegment(batch[index], translation)) {
-          noteSegmentFailure(batch[index]);
+          noteSegmentFailure(batch[index], translation ? "译文无效" : "未返回译文");
         }
       });
     } catch (error) {
@@ -1566,7 +1691,16 @@
         const segment = batch[0];
         try {
           const joined = await translateSegmentTextWithSplit(segment.text, runId, runSettings, { forceSplit: true });
-          if (joined == null || runId !== generation) {
+          if (runId !== generation) {
+            // Stale run — must not pollute the replacement run's failure counts.
+            return;
+          }
+          if (joined == null || !String(joined).trim()) {
+            // Empty split half = untranslated segment, never a silent skip.
+            noteSegmentFailure(segment, SPLIT_EMPTY_RESULT_MESSAGE);
+            if (!state.error) {
+              state.error = SPLIT_EMPTY_RESULT_MESSAGE;
+            }
             return;
           }
           if (!applyTranslatedSegment(segment, joined)) {
@@ -1578,14 +1712,14 @@
             // Stale run — must not pollute the replacement run's failure counts.
             return;
           }
-          noteSegmentFailure(segment);
+          noteSegmentFailure(segment, splitError.message);
           state.error = splitError.message;
           return;
         }
       }
 
       for (const segment of batch) {
-        noteSegmentFailure(segment);
+        noteSegmentFailure(segment, error.message);
       }
       state.error = error.message;
     }
@@ -1837,19 +1971,19 @@
     styleHost.id = "kilocean-translator-style";
     styleHost.setAttribute("data-deepseek-translator-ui", "true");
     styleHost.textContent = `
+      /* Translated text (1.5.0): color-only separation — no dashed top border,
+         no padding-top; inherits the page font/size (CONTRACT light tokens). */
       [data-kilocean-block] > .kilocean-translation {
         display: block;
-        margin-top: 0.4em;
-        padding-top: 0.3em;
-        border-top: 1px dashed rgba(112, 135, 255, 0.38);
+        margin-top: 0.3em;
+        color: #4B5563;
         line-height: inherit;
         white-space: pre-wrap;
       }
       [data-kilocean-block] > .kilocean-translation.kilocean-translation--inline {
         display: inline;
         margin-top: 0;
-        padding-top: 0;
-        border-top: 0;
+        color: inherit;
       }
       [data-kilocean-block][data-kilocean-layout="flow"] > .kilocean-translation--flow {
         flex: 0 0 100%;
@@ -1863,9 +1997,8 @@
         width: 100%;
         max-width: 100%;
         box-sizing: border-box;
-        margin-top: 0.4em;
-        padding-top: 0.3em;
-        border-top: 1px dashed rgba(112, 135, 255, 0.38);
+        margin-top: 0.3em;
+        color: #4B5563;
         line-height: inherit;
         white-space: pre-wrap;
       }
@@ -1891,18 +2024,12 @@
       /* flow/after: hide only owned original wraps — never page-owned images/inputs */
       html[data-kilocean-display="translation-only"] [data-kilocean-block] > .kilocean-translation {
         display: block;
-        margin-top: 0;
-        padding-top: 0;
-        border-top: 0;
       }
       html[data-kilocean-display="translation-only"] [data-kilocean-block] > .kilocean-translation.kilocean-translation--inline {
         display: inline;
       }
       html[data-kilocean-display="translation-only"] .kilocean-translation--after[data-deepseek-translator-ui] {
         display: block;
-        margin-top: 0;
-        padding-top: 0;
-        border-top: 0;
       }
       html[data-kilocean-display="original"] [data-kilocean-block] [data-kilocean-original-wrap] {
         display: contents;
@@ -2285,6 +2412,27 @@
     }
   }
 
+  // Pill 停止: cancel the in-flight run but KEEP finished translations —
+  // unlike restoreOriginal nothing is unwrapped, the session stays active
+  // (display-mode toggling / export / later retry keep working), and the
+  // translation cache survives so a retry never re-bills finished segments.
+  function stopTranslation() {
+    if (!state.active) {
+      return;
+    }
+    const abandonedRunId = generation;
+    generation += 1;
+    workQueue = Promise.resolve();
+    cancelAbandonedRunBatches(abandonedRunId);
+    stopObserving();
+    pendingRoots.clear();
+    pendingRefreshBlocks.clear();
+    finishRunSettings();
+    state.phase = state.translated > 0 ? "translated" : "idle";
+    updateProgressPill();
+    notifyPopupStatus();
+  }
+
   function hasPendingDynamicWork() {
     return dynamicTimer != null || pendingRoots.size > 0 || pendingRefreshBlocks.size > 0;
   }
@@ -2378,6 +2526,9 @@
       translated: state.translated,
       total: state.total,
       failed: state.failed,
+      // Failed blocks still on the page and individually retryable (pill
+      // 重试 / marker 重试 / popup RETRY_FAILED).
+      failedRetryable: [...failedBlocks].filter((block) => block?.isConnected).length,
       error: state.error,
       targetLanguage: state.targetLanguage,
       displayMode: state.displayMode
@@ -2397,8 +2548,11 @@
     assertExportReady();
 
     const clone = document.documentElement.cloneNode(true);
+    // Strip every extension-owned host: toast, selection bubble, progress pill
+    // and the in-place failed-segment markers.
     clone.querySelectorAll(
-      "script, iframe, object, embed, #deepseek-translator-toast-host, #kilocean-selection-host"
+      "script, iframe, object, embed, #deepseek-translator-toast-host, " +
+      "#kilocean-selection-host, #kilocean-progress-host, [data-kilocean-failed-marker]"
     ).forEach((element) => element.remove());
     // Keep #kilocean-translator-style so exported HTML honors data-kilocean-display.
     clone.querySelectorAll('meta[http-equiv="Content-Security-Policy" i], base').forEach((element) => element.remove());
@@ -2418,7 +2572,7 @@
     base.setAttribute("href", document.baseURI || location.href);
     const generator = document.createElement("meta");
     generator.setAttribute("name", "generator");
-    generator.setAttribute("content", "千浩翻译 · Kilocean Translate 1.4.3");
+    generator.setAttribute("content", "千浩翻译 · Kilocean Translate 1.5.0");
     const source = document.createElement("meta");
     source.setAttribute("name", "deepseek-translator-source");
     source.setAttribute("content", location.href);
@@ -2477,34 +2631,43 @@
       const shadow = host.attachShadow({ mode: "open" });
       shadow.innerHTML = `
         <style>
+          /* ---- toast · light theme (CONTRACT 1.5.0 tokens: #fff card, #111827
+             text, brand #3D5AFE, ok #15803D, warn #B45309, err #C62828) ---- */
           .toast {
             display: flex;
             align-items: center;
             gap: 9px;
             max-width: 320px;
             padding: 11px 14px;
-            color: #f6f8ff;
-            background: rgba(16, 22, 38, 0.94);
-            border: 1px solid rgba(255, 255, 255, 0.12);
+            color: #111827;
+            background: #ffffff;
+            border: 1px solid #E5E7EB;
             border-radius: 12px;
-            box-shadow: 0 12px 34px rgba(0, 0, 0, 0.28);
-            font: 500 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            box-shadow: 0 8px 24px rgba(17, 24, 39, 0.12);
+            font: 500 13px/1.4 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
             opacity: 0;
             transform: translateY(8px);
             transition: opacity 160ms ease, transform 160ms ease;
           }
           .toast.visible { opacity: 1; transform: translateY(0); }
-          .dot { width: 8px; height: 8px; border-radius: 50%; background: #6c8cff; flex: 0 0 auto; }
-          .loading .dot { animation: pulse 1s ease infinite; }
-          .success .dot { background: #42d392; }
-          .warning .dot { background: #f8b84e; }
-          .error .dot { background: #ff6b78; }
+          .dot { width: 8px; height: 8px; border-radius: 50%; background: #6B7280; flex: 0 0 auto; }
+          .loading .dot { background: #3D5AFE; animation: pulse 1s ease infinite; }
+          .success .dot { background: #15803D; }
+          .warning .dot { background: #B45309; }
+          .error .dot { background: #C62828; }
           @keyframes pulse { 50% { opacity: .35; transform: scale(.8); } }
+          @media (prefers-reduced-motion: reduce) {
+            .toast { transition: none; }
+            .loading .dot { animation: none; }
+          }
         </style>
         <div class="toast"><span class="dot"></span><span class="message"></span></div>
       `;
     }
 
+    // Keep the toast clear of the progress pill: it sits above the pill while
+    // a page run shows one (pill = bottom 16px + ~44px tall).
+    host.style.bottom = progressPillHost?.isConnected ? "76px" : "22px";
     const toast = host.shadowRoot.querySelector(".toast");
     toast.className = `toast ${tone}`;
     host.shadowRoot.querySelector(".message").textContent = message;
@@ -2516,6 +2679,499 @@
     if (tone !== "loading") {
       toastTimer = setTimeout(() => toast.classList.remove("visible"), duration);
     }
+  }
+
+  // ====================================================================
+  // 1.5.0 page-run UI: progress pill + in-place failed-segment markers.
+  // Security model: everything rendered here lives in CLOSED shadow roots on
+  // hosts marked data-deepseek-translator-ui (ignored by collectBlocks / the
+  // mutation observer, stripped from exports and print). Billing-capable
+  // actions (重试) fire only from trusted clicks (event.isTrusted) — page
+  // script can neither forge the click nor reach inside the shadow root.
+  // ====================================================================
+
+  // ---- shared helpers ----
+
+  // Key-shaped failures (missing key / 401) get an 打开设置 exit in the pill;
+  // everything else offers 重试.
+  function isKeyRelatedError(message) {
+    const text = String(message || "");
+    return /API Key/i.test(text) && /无效|填写|配置/.test(text);
+  }
+
+  // Marker/pill reason lines stay one short line.
+  function shortenReason(reason) {
+    return String(reason || "").replace(/\s+/gu, " ").trim().slice(0, 24);
+  }
+
+  function escapePillText(value) {
+    return String(value ?? "")
+      .replace(/&/gu, "&amp;")
+      .replace(/</gu, "&lt;")
+      .replace(/>/gu, "&gt;")
+      .replace(/"/gu, "&quot;");
+  }
+
+  // Non-billable exit: opens the extension settings focused on the key field.
+  // Harmless if a page somehow forges the click (worst case: a settings tab).
+  function openSettingsForKey() {
+    try {
+      void chrome.runtime.sendMessage({ type: "OPEN_SETTINGS", focus: "key" }).catch?.(() => {});
+    } catch {
+      // Worker may be asleep.
+    }
+  }
+
+  // Same effect as the SET_DISPLAY_MODE message, used by the pill's segmented
+  // control (trusted click only).
+  function setDisplayModePreference(mode) {
+    const normalized = Utils.normalizeDisplayMode(mode);
+    if (!normalized) {
+      return;
+    }
+    state.displayMode = normalized;
+    applyDocumentDisplayMode(normalized);
+    refreshAllBlockDisplays();
+    chrome.storage.local.set({ displayMode: normalized });
+    updateProgressPill();
+  }
+
+  // ---- progress pill ----
+
+  /* ---- pill CSS · light theme (CONTRACT 1.5.0 tokens: #fff card, #111827
+     text, #6B7280 muted, #3D5AFE brand, #B45309 warn, #C62828 err, radius 12,
+     shadow 0 8px 24px rgba(17,24,39,.12)) — keep in one template string so a
+     UI pass can restyle it wholesale. ---- */
+  const PROGRESS_PILL_CSS = `
+    .pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      max-width: min(92vw, 520px);
+      padding: 5px 6px 5px 8px;
+      background: #fff;
+      border: 1px solid #E5E7EB;
+      border-radius: 999px;
+      box-shadow: 0 8px 24px rgba(17, 24, 39, 0.12);
+      font: 500 12.5px/1.2 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
+      color: #111827;
+    }
+    .pill.error { border-color: #FECACA; }
+    .pill .tx { display: flex; flex-direction: column; line-height: 1.25; padding: 2px 2px; }
+    .pill .tx b { font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+    .pill.error .tx b { color: #C62828; }
+    .pill .tx span { font-size: 11px; color: #6B7280; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pill .ring { width: 16px; height: 16px; flex: 0 0 auto; border-radius: 50%; border: 2px solid #EEF1FF; border-top-color: #3D5AFE; }
+    /* The spin animation exists ONLY in the translating state (PR #19
+       follow-up): error / partial / done must never animate — a terminal
+       state showing a spinner reads as work still in flight. */
+    .pill.translating .ring { animation: pill-spin 0.9s linear infinite; }
+    .pill .ringp { position: relative; width: 16px; height: 16px; flex: 0 0 auto; border-radius: 50%; }
+    .pill .ringp::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: #fff; }
+    .pill .cb {
+      height: 26px; min-height: 24px; padding: 0 10px;
+      border-radius: 999px; border: 1px solid #E5E7EB; background: #fff;
+      color: #374151; font-family: inherit; font-size: 12px; line-height: 1;
+      cursor: pointer; white-space: nowrap;
+    }
+    .pill .cb:hover { background: #F9FAFB; }
+    .pill .cb.primary { background: #3D5AFE; border-color: #3D5AFE; color: #fff; }
+    .pill .cb.primary:hover { background: #2F48D8; }
+    .pill .cb.warnb { border-color: #FDE68A; background: #FFFBEB; color: #B45309; }
+    .pill .mseg { display: flex; gap: 2px; padding: 2px; background: #F3F4F6; border-radius: 999px; }
+    .pill .mseg button { height: 24px; padding: 0 9px; border: 0; border-radius: 999px; background: transparent; color: #6B7280; font-family: inherit; font-size: 12px; cursor: pointer; }
+    .pill .mseg button[aria-checked="true"] { background: #fff; color: #111827; font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08); }
+    .pill .count { padding: 0 2px; color: #4B5563; white-space: nowrap; }
+    .pill[data-collapsed="true"] .count { display: none; }
+    @keyframes pill-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .pill.translating .ring { animation: none; }
+    }
+  `;
+
+  function ensureProgressPill() {
+    if (progressPillHost?.isConnected && progressPillShadow) {
+      return progressPillHost;
+    }
+    const host = document.createElement("div");
+    host.id = "kilocean-progress-host";
+    host.setAttribute("data-deepseek-translator-ui", "true");
+    Object.assign(host.style, {
+      all: "initial",
+      position: "fixed",
+      right: "16px",
+      bottom: "16px",
+      zIndex: "2147483646"
+    });
+    document.documentElement.appendChild(host);
+    // Closed shadow root: page script can never reach (or restyle) the pill
+    // internals; all our access goes through the stored ref below.
+    const shadow = host.attachShadow({ mode: "closed" });
+    const style = document.createElement("style");
+    style.textContent = PROGRESS_PILL_CSS;
+    shadow.appendChild(style);
+    const root = document.createElement("div");
+    root.className = "pill";
+    root.addEventListener("click", onPillClick);
+    shadow.appendChild(root);
+    progressPillHost = host;
+    progressPillShadow = shadow;
+    return host;
+  }
+
+  // Render the pill for the current state; no-op when nothing changed. Called
+  // on every applied batch / failure / phase transition / displayMode toggle.
+  function updateProgressPill() {
+    if (!state.active || state.total === 0) {
+      hideProgressPill();
+      return;
+    }
+    ensureProgressPill();
+    const signature = [
+      state.phase,
+      state.translated,
+      state.total,
+      state.failed,
+      state.displayMode,
+      isKeyRelatedError(state.error)
+    ].join("\u0000");
+    if (signature === progressPillSignature) {
+      return;
+    }
+    const phaseChanged = !progressPillSignature.startsWith(state.phase);
+    progressPillSignature = signature;
+    renderProgressPill(phaseChanged);
+  }
+
+  function renderProgressPill(resetCollapse = true) {
+    const shadow = progressPillShadow;
+    const root = shadow?.querySelector(".pill");
+    if (!root) {
+      return;
+    }
+    if (resetCollapse) {
+      if (pillCollapseTimer) {
+        clearTimeout(pillCollapseTimer);
+        pillCollapseTimer = null;
+      }
+      pillCollapsed = false;
+    }
+    root.className = "pill";
+    root.removeAttribute("data-collapsed");
+
+    if (state.phase === "translating") {
+      root.classList.add("translating");
+      root.innerHTML = `
+        <span class="ring" aria-hidden="true"></span>
+        <span class="tx"><b>翻译中 ${state.translated} / ${state.total}</b><span>先翻可见区域</span></span>
+        <button class="cb" type="button" data-action="stop" title="停止（保留已翻译内容）">✕ 停止</button>`;
+      return;
+    }
+
+    if (state.phase === "error") {
+      // Persistent (never auto-hides): what happened + the next step.
+      root.classList.add("error");
+      const reason = escapePillText(shortenReason(state.error));
+      const action = isKeyRelatedError(state.error)
+        ? '<button class="cb primary" type="button" data-action="settings">打开设置</button>'
+        : '<button class="cb primary" type="button" data-action="retry">重试</button>';
+      root.innerHTML = `
+        <span class="ringp" style="background: conic-gradient(#C62828 25%, #FECACA 0)" aria-hidden="true"></span>
+        <span class="tx"><b>翻译失败</b><span>${reason || "未知原因"}</span></span>
+        ${action}`;
+      return;
+    }
+
+    // Terminal on this run (phase translated / stopped mid-run): pick the
+    // view from the counts so a stopped run still shows its outcome.
+    if (state.failed > 0) {
+      const progress = state.total > 0 ? Math.round((state.translated / state.total) * 100) : 0;
+      root.classList.add("partial");
+      // A key error that lands mid-run (some segments already translated)
+      // still has state.failed > 0, so we reach this branch — not the pure
+      // error branch. Offer 「打开设置」 instead of Retry, or every click
+      // would re-bill the known-invalid credential (Codex PR #19 P2).
+      const action = isKeyRelatedError(state.error)
+        ? '<button class="cb primary" type="button" data-action="settings">打开设置</button>'
+        : `<button class="cb warnb" type="button" data-action="retry">重试 ${state.failed} 段</button>`;
+      root.innerHTML = `
+        <span class="ringp" style="background: conic-gradient(#B45309 ${progress}%, #FDE68A 0)" aria-hidden="true"></span>
+        <span class="tx"><b>${state.translated} / ${state.total}</b><span>${state.failed} 段未完成</span></span>
+        ${action}
+        <button class="cb" type="button" data-action="jump">跳到未完成 ↓</button>`;
+      return;
+    }
+
+    root.classList.add("done");
+    const modes = [
+      [Utils.DISPLAY_MODES.bilingual, "双语"],
+      [Utils.DISPLAY_MODES.translationOnly, "译文"],
+      [Utils.DISPLAY_MODES.original, "原文"]
+    ];
+    root.innerHTML = `
+      <span class="count">已翻译 ${state.translated} 段</span>
+      <div class="mseg" role="radiogroup" aria-label="显示方式">
+        ${modes.map(([mode, label]) =>
+    `<button type="button" role="radio" data-action="mode" data-mode="${mode}" aria-checked="${state.displayMode === mode}">${label}</button>`
+  ).join("")}
+      </div>
+      <button class="cb" type="button" data-action="restore">还原</button>`;
+    // Never covers content badly: after ~4 s only the compact segmented
+    // control + 还原 remain (the count line collapses away).
+    if (pillCollapseTimer) {
+      clearTimeout(pillCollapseTimer);
+    }
+    pillCollapseTimer = setTimeout(() => {
+      pillCollapseTimer = null;
+      pillCollapsed = true;
+      progressPillShadow?.querySelector(".pill")?.setAttribute("data-collapsed", "true");
+    }, 4000);
+  }
+
+  function hideProgressPill() {
+    if (pillCollapseTimer) {
+      clearTimeout(pillCollapseTimer);
+      pillCollapseTimer = null;
+    }
+    pillCollapsed = false;
+    progressPillSignature = "";
+    const host = progressPillHost;
+    progressPillHost = null;
+    progressPillShadow = null;
+    host?.remove();
+  }
+
+  // One delegated listener for every pill button. Trusted clicks only: the
+  // pill lives in page DOM, so synthetic page-script events must be inert —
+  // especially the retry actions, which spend the user's API key.
+  function onPillClick(event) {
+    if (event.isTrusted === false) {
+      return;
+    }
+    const button = event.target?.closest?.("button[data-action]");
+    if (!button) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const action = button.dataset.action;
+    if (action === "stop") {
+      stopTranslation();
+    } else if (action === "restore") {
+      restoreOriginal();
+    } else if (action === "mode") {
+      setDisplayModePreference(button.dataset.mode);
+    } else if (action === "retry") {
+      void retryFailedBlocks();
+    } else if (action === "jump") {
+      scrollNextFailedBlockIntoView();
+    } else if (action === "settings") {
+      openSettingsForKey();
+    }
+  }
+
+  function scrollNextFailedBlockIntoView() {
+    const blocks = [...failedBlocks].filter((block) => block?.isConnected);
+    if (blocks.length === 0) {
+      return;
+    }
+    const next = blocks.find((block) => {
+      try {
+        return block.getBoundingClientRect().bottom > window.innerHeight;
+      } catch {
+        return false;
+      }
+    });
+    const target = next || blocks[0];
+    try {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+    } catch {
+      // Detached between the filter and here — ignore.
+    }
+  }
+
+  // ---- in-place failed-segment markers ----
+
+  /* ---- marker CSS · light theme (err #C62828 on #FEF2F2, radius 12) — one
+     template string for easy restyling. ---- */
+  const FAILED_MARKER_CSS = `
+    .marker {
+      display: block;
+      max-width: 640px;
+      margin: 4px 0;
+      padding: 5px 10px;
+      background: #FEF2F2;
+      border: 1px solid #FECACA;
+      border-radius: 10px;
+      color: #C62828;
+      font: 500 12.5px/1.45 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .marker button.retry {
+      margin-left: 8px;
+      height: 24px;
+      padding: 0 10px;
+      border-radius: 999px;
+      border: 1px solid #FECACA;
+      background: #fff;
+      color: #C62828;
+      font: inherit;
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+    }
+    .marker button.retry:hover { background: #FEF2F2; }
+  `;
+
+  // Codex PR #19 P2-3: where may a failed-segment marker live? HTML's content
+  // models forbid most direct children of table/list structures — a div can
+  // never sit under tr/tbody/ul/dl, and a stray wrapper there breaks layout
+  // or gets relocated by the parser. Blocks that ARE those restricted slots
+  // (cells, captions, list items, definition terms) and any block whose
+  // PARENT is a restricted container get the marker INSIDE the block (a span
+  // appended as its last child); every other block gets a sibling div after
+  // it, as before.
+  const MARKER_HOST_INSIDE_TAGS = new Set(["TD", "TH", "CAPTION", "LI", "DT", "DD"]);
+  const MARKER_SIBLING_FORBIDDEN_PARENTS = new Set([
+    "TR", "TABLE", "THEAD", "TBODY", "TFOOT", "UL", "OL", "DL",
+    "SELECT", "COLGROUP", "OPTGROUP", "DATALIST"
+  ]);
+
+  // Pure: given the failed block, return { parent, before, tag } describing
+  // the marker host's insertion — parent.insertBefore(host, before) (a null
+  // `before` appends). Deliberately free of Node.* constants so plain-object
+  // harnesses can drive it.
+  function resolveMarkerPlacement(block) {
+    const tagName = String(block?.tagName || "").toUpperCase();
+    const parentNode = block?.parentNode || null;
+    const parentElement = parentNode && parentNode.nodeType === 1 ? parentNode : null;
+    const parentTag = String(parentElement?.tagName || "").toUpperCase();
+    if (MARKER_HOST_INSIDE_TAGS.has(tagName) || MARKER_SIBLING_FORBIDDEN_PARENTS.has(parentTag)) {
+      return { parent: block, before: null, tag: "span" };
+    }
+    return { parent: parentElement || block, before: block.nextSibling, tag: "div" };
+  }
+
+  // Small owned marker right after a failed block: "这段没翻译成功（原因）·
+  // 重试". Closed shadow root; the retry only fires on a trusted click.
+  // Restricted-parent blocks (table cells, list items…) host the marker
+  // INSIDE themselves — see resolveMarkerPlacement above.
+  function showFailedMarker(block, reason = "") {
+    if (!block?.isConnected || !block.parentNode) {
+      return;
+    }
+    removeFailedMarker(block);
+    const gen = beginApplyingDom();
+    try {
+      const placement = resolveMarkerPlacement(block);
+      const host = document.createElement(placement.tag);
+      host.setAttribute("data-kilocean-failed-marker", "true");
+      host.setAttribute("data-deepseek-translator-ui", "true");
+      const shadow = host.attachShadow({ mode: "closed" });
+      const style = document.createElement("style");
+      style.textContent = FAILED_MARKER_CSS;
+      const root = document.createElement("div");
+      root.className = "marker";
+      const text = document.createElement("span");
+      text.className = "tx";
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "retry";
+      retry.textContent = "重试";
+      root.appendChild(text);
+      root.appendChild(retry);
+      root.addEventListener("click", (event) => onFailedMarkerRetry(event, block));
+      shadow.appendChild(style);
+      shadow.appendChild(root);
+      // null `before` appends — for inside-placement hosts the marker becomes
+      // the block's last child; the data-deepseek-translator-ui ownership
+      // flags already keep it out of text collection and mutation handling.
+      placement.parent.insertBefore(host, placement.before);
+      failedMarkers.set(block, { host, shadow });
+      updateFailedMarkerText(shadow, reason);
+    } finally {
+      endApplyingDom(gen);
+    }
+  }
+
+  function updateFailedMarker(block, reason = "") {
+    const entry = failedMarkers.get(block);
+    if (!entry?.shadow || !entry.host?.isConnected) {
+      return;
+    }
+    updateFailedMarkerText(entry.shadow, reason);
+  }
+
+  function updateFailedMarkerText(shadow, reason) {
+    const text = shadow?.querySelector(".tx");
+    if (!text) {
+      return;
+    }
+    const short = shortenReason(reason);
+    text.textContent = short ? `这段没翻译成功（${short}）` : "这段没翻译成功";
+  }
+
+  function removeFailedMarker(block) {
+    const entry = failedMarkers.get(block);
+    if (!entry) {
+      return;
+    }
+    failedMarkers.delete(block);
+    entry.host?.remove();
+  }
+
+  function clearFailedMarkers() {
+    for (const block of [...failedBlocks]) {
+      removeFailedMarker(block);
+    }
+  }
+
+  // Marker button: retry ONLY this block. Trusted click only — this is a
+  // billable action rendered in page DOM.
+  function onFailedMarkerRetry(event, block) {
+    if (event.isTrusted === false) {
+      return;
+    }
+    const button = event.target?.closest?.("button.retry");
+    if (!button) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (!block?.isConnected) {
+      return;
+    }
+    void retryFailedBlocks(block);
+  }
+
+  // ---- failed-block retry (pill 重试 N 段 / marker 重试 / popup RETRY_FAILED) ----
+
+  /**
+   * Re-translate ONLY the currently failed blocks: never restoreOriginal,
+   * never reset translated counts. Failure slots are replaced, not stacked
+   * (the existing failedBlocks logic inside translateBlocks/
+   * applyTranslatedSegment), and the requests run on the CURRENT generation
+   * through the shared workQueue.
+   */
+  async function retryFailedBlocks(onlyBlock = null) {
+    if (!state.active) {
+      return;
+    }
+    const targets = [...failedBlocks].filter((block) =>
+      block?.isConnected && (!onlyBlock || block === onlyBlock));
+    if (targets.length === 0) {
+      updateProgressPill();
+      return;
+    }
+    const runId = generation;
+    state.phase = "translating";
+    updateProgressPill();
+    notifyPopupStatus();
+    // translateBlocks re-extracts each block's text exactly like the normal
+    // path; the isDynamic accounting keeps retried (already-slotted) blocks
+    // from double-counting state.total.
+    const job = workQueue.then(() => translateBlocks(targets, runId, true, { retry: true }));
+    workQueue = job.catch(() => {});
+    await job;
   }
 
   // Same DOM event reaches both window and document capture listeners. Process
@@ -2656,6 +3312,54 @@
    * @returns {{ text: string, rangeId: string } | null} null unless the user
    *   genuinely holds a non-collapsed selection of billable length.
    */
+  // ---- input-field selection detection (COMMAND_SELECTION_TRANSLATE hint) ----
+
+  // Input types whose value the user can select with the caret (and that
+  // expose selectionStart/selectionEnd). Checkbox/radio/file/… never carry a
+  // text selection; <select> is not an editable field at all.
+  const TEXT_SELECTION_INPUT_TYPES = new Set(["text", "search", "url", "tel", "password", "email"]);
+
+  // The deepest focused element, walking into OPEN shadow roots (a closed
+  // root is unreachable by design — it reads as its host and cannot be a
+  // textarea anyway). Pure over (activeElement, shadowRoot) so tests can
+  // drive it with a fake tree.
+  function deepActiveElement(root) {
+    let element = (root || document).activeElement;
+    let guard = 0;
+    while (element && element.shadowRoot && guard < 64) {
+      element = element.shadowRoot.activeElement;
+      guard += 1;
+    }
+    return element || null;
+  }
+
+  // True when focus sits in a textarea / text-like input with a REAL
+  // selection (selectionStart !== selectionEnd) — text the user selected,
+  // but inside a field this extension cannot annotate in place (PR #19
+  // follow-up: the no-gesture hint must explain that, not claim nothing is
+  // selected).
+  function activeElementHasTextSelection(root) {
+    const element = deepActiveElement(root);
+    if (!element) {
+      return false;
+    }
+    const tag = element.tagName;
+    const isField =
+      tag === "TEXTAREA" ||
+      (tag === "INPUT" && TEXT_SELECTION_INPUT_TYPES.has(String(element.type || "text").toLowerCase()));
+    if (!isField) {
+      return false;
+    }
+    try {
+      const start = element.selectionStart;
+      const end = element.selectionEnd;
+      return typeof start === "number" && typeof end === "number" && start !== end;
+    } catch {
+      // Some input types throw on selectionStart access — no selection then.
+      return false;
+    }
+  }
+
   function captureSelectionGesture() {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
@@ -2720,11 +3424,12 @@
   /**
    * Open the page panel as a non-billable preview for a gesture snapshot.
    * The panel lives in the page DOM behind an open shadow root, so it can
-   * never be a billing-consent surface: it only previews the selection and
-   * points the user at the extension popup. SELECTION_TRANSLATE_BATCH fires
-   * only after that popup confirm (CONFIRM_SELECTION_TRANSLATE), and
-   * sendSelectionTranslation revalidates the live Selection against the
-   * gesture snapshot before anything is billed.
+   * never be a billing-consent surface: it previews the selection and hints
+   * at the trusted entries (Alt+T / context menu / popup fallback confirm).
+   * SELECTION_TRANSLATE_BATCH fires only after COMMAND_SELECTION_TRANSLATE
+   * (trusted browser gesture) or the popup confirm
+   * (CONFIRM_SELECTION_TRANSLATE), and sendSelectionTranslation revalidates
+   * the live Selection against the gesture snapshot before anything is billed.
    */
   function showSelectionConfirm(event, gesture) {
     // The gesture snapshot taken synchronously at the trusted event is the
@@ -2773,8 +3478,10 @@
     }
 
     // Preview-only: showing this page panel never bills — the panel is
-    // page-hosted DOM and cannot be a consent surface. Billing needs the
-    // extension popup's confirm, always bound to this stored gesture
+    // page-hosted DOM and cannot be a consent surface. Billing happens via the
+    // trusted browser entries (Alt+T command / context menu →
+    // COMMAND_SELECTION_TRANSLATE) or the extension popup's confirm
+    // (CONFIRM_SELECTION_TRANSLATE), always bound to this stored gesture
     // snapshot.
     pendingSelectionGesture = gesture;
     const panel = ensureSelectionPanel();
@@ -2792,12 +3499,14 @@
   }
 
   /**
-   * Billable selection path — runs only after extension-popup confirm
-   * (CONFIRM_SELECTION_TRANSLATE), with the stored gesture snapshot
-   * (never a fresh selection read). Never triggered by page-DOM controls.
-   * Guard rejections resolve to { ok: false, error } so the popup learns the
-   * confirm did not produce a translation; only superseded requests (a newer
-   * selection generation claimed the slot) resolve without a rejection.
+   * Billable selection path — runs only after a TRUSTED trigger:
+   * COMMAND_SELECTION_TRANSLATE (Alt+T command / context menu, relayed by the
+   * background) or the extension-popup confirm (CONFIRM_SELECTION_TRANSLATE),
+   * always with the stored gesture snapshot (never a fresh selection read).
+   * Never triggered by page-DOM controls. Guard rejections resolve to
+   * { ok: false, error } so the caller learns the confirm did not produce a
+   * translation; only superseded requests (a newer selection generation
+   * claimed the slot) resolve without a rejection.
    */
   async function sendSelectionTranslation(gesture) {
     // The gesture snapshot the panel previewed is the only billable payload.
@@ -2944,7 +3653,9 @@
       const gateKey = legacyKeyStore ? stored.apiKey : stored[providerKeyField];
       if (!String(gateKey || "").trim()) {
         lastSelectionKey = "";
-        setSelectionPanelState(panel, "error", "请先在扩展弹窗中填写 API Key");
+        // keyGate renders "还没有配置 API Key" + the 打开设置 exit (non-billable
+        // button); the message/reply keep the canonical gate error string.
+        setSelectionPanelState(panel, "error", "请先在扩展弹窗中填写 API Key", "", { keyGate: true });
         return { ok: false, error: "请先在扩展弹窗中填写 API Key" };
       }
 
@@ -3054,15 +3765,18 @@
     const shadow = host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
       <style>
+        /* ---- selection bubble · light theme (CONTRACT 1.5.0 tokens: #fff
+           card, #111827 text, #4B5563 secondary, #6B7280 muted, brand
+           #3D5AFE, err #C62828, radius 12, shadow 0 8px 24px rgba(17,24,39,.12)) ---- */
         .panel {
           width: min(360px, calc(100vw - 24px));
           padding: 12px 12px 10px;
-          color: #f5f7ff;
-          background: rgba(14, 18, 30, 0.96);
-          border: 1px solid rgba(255, 255, 255, 0.12);
+          color: #111827;
+          background: #ffffff;
+          border: 1px solid #E5E7EB;
           border-radius: 12px;
-          box-shadow: 0 14px 36px rgba(0, 0, 0, 0.32);
-          font: 500 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          box-shadow: 0 8px 24px rgba(17, 24, 39, 0.12);
+          font: 500 13px/1.45 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
         }
         .top {
           display: flex;
@@ -3072,25 +3786,26 @@
           margin-bottom: 8px;
         }
         .label {
-          color: #91a4ff;
+          color: #6B7280;
           font-size: 11px;
         }
         .close {
           border: 0;
           background: transparent;
-          color: #aab0c1;
+          color: #6B7280;
           cursor: pointer;
           font-size: 14px;
           line-height: 1;
-          padding: 2px 4px;
+          padding: 4px 6px;
         }
+        .close:hover { color: #111827; }
         .source {
           white-space: pre-wrap;
           word-break: break-word;
           max-height: 72px;
           overflow: auto;
-          color: #7f879b;
-          font-size: 11px;
+          color: #4B5563;
+          font-size: 12px;
         }
         .source[hidden] { display: none; }
         .body {
@@ -3100,14 +3815,32 @@
           overflow: auto;
         }
         .body[hidden] { display: none; }
-        .body.loading { color: #9299ae; }
-        .body.error { color: #ff8b96; }
+        .body.loading { color: #4B5563; }
+        .body.error { color: #C62828; }
+        .body.hint { color: #111827; }
         .hint {
           margin-top: 8px;
-          color: #91a4ff;
-          font-size: 11px;
+          color: #4B5563;
+          font-size: 11.5px;
         }
         .hint[hidden] { display: none; }
+        .actions {
+          margin-top: 10px;
+          display: flex;
+          gap: 8px;
+        }
+        .actions[hidden] { display: none; }
+        .actions .settings {
+          height: 28px;
+          padding: 0 12px;
+          border: 0;
+          border-radius: 8px;
+          background: #3D5AFE;
+          color: #fff;
+          font: inherit;
+          cursor: pointer;
+        }
+        .actions .settings:hover { background: #2F48D8; }
       </style>
       <div class="panel" role="dialog" aria-label="选中翻译">
         <div class="top">
@@ -3116,7 +3849,8 @@
         </div>
         <div class="source" hidden></div>
         <div class="body loading">正在翻译选中文本…</div>
-        <div class="hint" hidden>请在扩展弹窗中确认翻译（点击工具栏中的扩展图标）</div>
+        <div class="hint" hidden>按 Alt+T 翻译选中文字 · 右键也可以</div>
+        <div class="actions" hidden><button class="settings" type="button">打开设置</button></div>
       </div>
     `;
 
@@ -3137,12 +3871,23 @@
       event.preventDefault();
     });
 
-    // Deliberately no translate button here: the panel is page-hosted DOM
-    // behind an open shadow root, so page script could restyle or overlay any
-    // button and a trusted click on it would not establish informed consent.
-    // The .hint copy above directs the user to the extension popup — the only
-    // surface that can confirm SELECTION_TRANSLATE_BATCH (popup confirm →
-    // CONFIRM_SELECTION_TRANSLATE → sendSelectionTranslation).
+    // Non-billable exit for key-gate errors: 打开设置 just asks the background
+    // to open the settings view (harmless even if a page forges the click —
+    // trusted-click gated anyway). Still deliberately NO translate button
+    // here: the panel is page-hosted DOM behind an open shadow root, so page
+    // script could restyle or overlay any button and a trusted click on it
+    // would not establish informed consent. Billing consent stays with the
+    // trusted browser entries: popup confirm (CONFIRM_SELECTION_TRANSLATE →
+    // sendSelectionTranslation) and Alt+T / context menu
+    // (COMMAND_SELECTION_TRANSLATE), both arriving via runtime.onMessage.
+    shadow.querySelector(".settings").addEventListener("click", (event) => {
+      if (event.isTrusted === false) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      openSettingsForKey();
+    });
 
     return host;
   }
@@ -3164,15 +3909,40 @@
     host.style.top = `${Math.round(top)}px`;
   }
 
-  function setSelectionPanelState(host, tone, message, sourceText) {
+  // No-rect positioning for the COMMAND_SELECTION_TRANSLATE hint state: near
+  // the viewport top-right, never over the selection the user is about to make.
+  function positionSelectionPanelTopRight(host) {
+    const panelWidth = Math.min(360, window.innerWidth - 24);
+    host.style.left = `${Math.round(Math.max(12, window.innerWidth - panelWidth - 16))}px`;
+    host.style.top = "16px";
+  }
+
+  // Non-billable hint bubble: Alt+T / context menu arrived with nothing (or
+  // only frame-inaccessible text) selected. Pure guidance — no request. The
+  // optional message overrides the generic copy (the input-field case).
+  function showSelectionHintPanel(message) {
+    const panel = ensureSelectionPanel();
+    positionSelectionPanelTopRight(panel);
+    setSelectionPanelState(
+      panel,
+      "hint",
+      message || "先选中要翻译的文字，再按 Alt+T 或右键「翻译选中文字」"
+    );
+  }
+
+  function setSelectionPanelState(host, tone, message, sourceText, options = {}) {
     const body = host.shadowRoot.querySelector(".body");
     const source = host.shadowRoot.querySelector(".source");
     const hint = host.shadowRoot.querySelector(".hint");
+    const actions = host.shadowRoot.querySelector(".actions");
     body.className = `body ${tone}`;
-    body.textContent = message;
-    // Confirm/preview state: show the selected text plus the popup-confirm
-    // hint. The panel itself holds no billable control — consent lives in
-    // the extension popup only.
+    // Key-gate failures render the friendly "还没有配置 API Key" copy plus the
+    // 打开设置 exit; `message` stays the canonical gate error string that the
+    // popup/background (and ci-check) rely on.
+    body.textContent = options.keyGate ? "还没有配置 API Key" : message;
+    // Confirm/preview state: show the selected text plus the Alt+T hint. The
+    // panel itself holds no billable control — consent lives in the trusted
+    // extension surfaces only.
     body.hidden = tone === "confirm";
     if ((tone === "confirm" || tone === "success") && sourceText) {
       source.hidden = false;
@@ -3183,6 +3953,9 @@
     }
     if (hint) {
       hint.hidden = tone !== "confirm";
+    }
+    if (actions) {
+      actions.hidden = !options.keyGate;
     }
     host.hidden = false;
   }

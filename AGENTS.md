@@ -13,13 +13,14 @@ No package.json. Load unpacked extension from repo root in chrome://extensions.
 ## Do
 
 - Keep PRs small; one issue → one focused PR.
-- Preserve permissions: activeTab, scripting, storage; host only https://api.deepseek.com/*.
+- Preserve permissions: activeTab, scripting, storage, contextMenus (1.5.0, no install warning); host only the translation APIs (https://api.deepseek.com/*, https://api.moonshot.cn/*). No content_scripts — inject on demand from user gestures (popup / commands / context menu).
 - Watch selection race tokens and displayMode vs chrome.storage sync.
 - Route every popup.js storage write through the serialized write queue (`enqueueSettingsWrite` / `saveSettings`) — CI enforces exactly one `chrome.storage.local.set` call site.
 - Await the STABLE save (`await saveSettings()` resolves only after every follow-up write committed and no dirty edit remains; it rejects on write failure) in every popup action that needs persisted settings (translate, selection confirm, key test, import, export, display-mode send). CI statically rejects un-awaited, un-caught `saveSettings()`/`enqueueSettingsWrite()` calls — the only sanctioned fire-and-forget shape is `persistSettingsInBackground()` (`.catch`-handled: debounce ticks, change/blur persists, init's closing flush, the hide-time flush).
 - Make every popup user action that reads or writes settings await the single init-ready promise via the `whenReady(...)` listener wrapper — acting before `initialize()` finishes uses the DEFAULT_SETTINGS snapshot (Codex P1: pre-init Export shipped defaults with no keys). Handlers that bank edits pre-init keep the bank synchronous and gate only their save. CI statically enforces wrapped listeners plus a documented allowlist.
 - For any new gated popup action, add a held-initial-storage-read test: park the first `chrome.storage.local.get`, fire the action, assert nothing happened, release, assert it used the stored values (see `checkPopupActionInitGate` in scripts/ci-check.mjs).
 - Add concurrency tests (controlled fake storage whose `set()` resolves manually) for any new popup.js write path.
+- **Click-path invariant (PR #19 P1-C):** blur / input / change handlers must never synchronously disable (or hide) a button that may be about to be clicked — a click's mousedown blurs the focused input first, and a button disabled before the click lands swallows it. Those handlers update state only (e.g. `verified = false`, an in-flight run variable); decide "is the key verified?" inside the click/submit handler (await the in-flight check of the current value there). An event on an unchanged, already-verified value must be a no-op. Regression shape: real paste/typing, then ONE real `page.click` (natural focus/blur) must succeed.
 - Fill the PR template; call out content-script / permission risk.
 - Prefer **ready-for-review** (not forever-draft) when CI should auto-merge.
 

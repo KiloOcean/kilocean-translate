@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>欢迎使用千浩翻译</title>
+    <link rel="stylesheet" href="welcome.css">
+  </head>
+  <body>
+    <main class="ob">
+      <header class="ob-h">
+        <span class="ob-logo" aria-hidden="true">译</span>
+        <div>
+          <h1>欢迎使用千浩翻译</h1>
+          <p class="ld">约 1 分钟完成设置</p>
+        </div>
+      </header>
+
+      <ol class="steps" id="steps">
+        <li data-step="1" class="on"><span class="n" aria-hidden="true">1</span>选服务商</li>
+        <li data-step="2"><span class="n" aria-hidden="true">2</span>粘贴 Key</li>
+        <li data-step="3"><span class="n" aria-hidden="true">3</span>试翻一段</li>
+      </ol>
+
+      <div class="grid">
+        <section class="pnl" id="step-panel">
+          <!-- step 1 -->
+          <div class="step-view" id="step-1">
+            <h2>选择服务商</h2>
+            <p class="s">两家都按用量计费，可随时切换。</p>
+            <div class="pv" role="radiogroup" aria-label="服务商">
+              <button type="button" role="radio" aria-checked="true" data-provider="deepseek">
+                <span class="plogo d" aria-hidden="true">D</span>
+                <span class="pt"><b>DeepSeek</b><small>默认 · 快</small></span>
+              </button>
+              <button type="button" role="radio" aria-checked="false" data-provider="kimi">
+                <span class="plogo k" aria-hidden="true">K</span>
+                <span class="pt"><b>Kimi</b><small>128k 长文</small></span>
+              </button>
+            </div>
+            <button id="s1-next" class="btn bp" type="button">继续</button>
+            <button id="s1-skip" class="skip" type="button">跳过</button>
+          </div>
+
+          <!-- step 2 -->
+          <div class="step-view" id="step-2" hidden>
+            <h2 id="s2-title">连接 DeepSeek</h2>
+            <p class="s">没有 Key？先去控制台创建一个。</p>
+            <a id="s2-console" class="btn bs console-link" href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">打开 DeepSeek 控制台 ↗</a>
+            <div class="field" id="s2-field">
+              <input id="s2-key" type="password" placeholder="sk-…" autocomplete="off" spellcheck="false" aria-label="API Key">
+            </div>
+            <p class="msg" id="s2-msg" aria-live="polite">粘贴后立即自动保存并验证</p>
+            <p class="lock">🔒 Key 只存在本机，不上传。 · <a id="welcome-pricing-link" href="https://api-docs.deepseek.com/zh-cn/quick_start/pricing" target="_blank" rel="noreferrer">官方定价 ↗</a></p>
+            <div class="btn-row">
+              <button id="s2-back" class="btn bs" type="button">上一步</button>
+              <button id="s2-next" class="btn bp grow" type="button" disabled>继续：试翻一段</button>
+            </div>
+            <button id="s2-skip" class="skip" type="button">跳过</button>
+          </div>
+
+          <!-- step 3 -->
+          <div class="step-view" id="step-3" hidden>
+            <h2>试一下</h2>
+            <p class="s">示例文字，几乎不耗用量。</p>
+            <div class="demo">
+              <span class="demo-tag">示例</span>
+              <p class="demo-src" id="sample-src">Every winter, the rocky shoreline turns into a laboratory of survival. Small tide pools lose heat quickly, yet anemones and crabs remain active beneath thin ice. A pool only thirty centimetres deeper can hold enough heat through the longest nights.</p>
+              <p class="demo-kt" id="sample-result" hidden></p>
+            </div>
+            <p class="msg" id="s3-msg" aria-live="polite"></p>
+            <div class="btn-row">
+              <button id="s3-try" class="btn bs grow" type="button">试翻这段</button>
+              <button id="s3-done" class="btn bp grow" type="button">完成，去翻译网页</button>
+            </div>
+            <button id="s3-skip" class="skip" type="button">跳过</button>
+          </div>
+        </section>
+
+        <aside class="pnl">
+          <h2>之后怎么用</h2>
+          <p class="s">设置完成后，在任何网页上：</p>
+          <div class="tip">
+            <span class="i" id="tip-page-key" aria-hidden="true">⌥A</span>
+            <span><b>整页</b> · <span id="shortcut-page">Alt+A</span> 或点工具栏图标</span>
+          </div>
+          <div class="tip">
+            <span class="i" id="tip-selection-key" aria-hidden="true">⌥T</span>
+            <span><b>划词</b> · 选中后 <span id="shortcut-selection">Alt+T</span> 或右键「翻译选中文字」</span>
+          </div>
+          <div class="tip">
+            <span class="i" aria-hidden="true">⇄</span>
+            <span><b>切换</b> · 页面右下角：双语 / 译文 / 原文</span>
+          </div>
+          <div class="tip">
+            <span class="i" aria-hidden="true">📌</span>
+            <span><b>固定</b> · 点工具栏拼图图标，把千浩翻译固定到工具栏</span>
+          </div>
+        </aside>
+      </div>
+    </main>
+    <script src="shared.js"></script>
+    <script src="welcome.js"></script>
+  </body>
+</html>

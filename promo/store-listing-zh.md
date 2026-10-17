@@ -18,12 +18,13 @@ Kilocean 千浩翻译：用 DeepSeek API 渐进式翻译网页，并自动跟译
 • 支持 DeepSeek V4 Flash（更快）与 V4 Pro（更准）
 • 一键恢复原文；可保存 HTML / 打印 PDF
 • 自动跳过代码、输入框、链接形态文本和纯数字
-• API Key 仅保存在本机；仅在你主动点击后访问当前标签页
+• API Key 仅保存在本机；只在你点扩展图标、按快捷键（整页 Alt+A / 划词 Alt+T）或点右键菜单后访问当前标签页
+• 右键菜单「翻译选中文字」使用 contextMenus 权限（1.5.0 新增）：安装和更新都不会出现权限警告，菜单本身不读取网页内容
 
 怎么用
 1. 打开普通网页 → 点扩展图标
 2. 填入 DeepSeek API Key（https://platform.deepseek.com/api_keys）
-3. 选语言和模型 → 点「翻译当前网页」
+3. 选语言 → 点「翻译此页」（或按 Alt+A）；划词：选中后按 Alt+T 或右键「翻译选中文字」
 
 隐私：网页文本直达 DeepSeek 官方 API；开发者不收 Key 和内容。本扩展由 Kilocean / 千浩科技独立开发，与 DeepSeek 官方无隶属关系，API 费用按官方计费。
 如果好用，欢迎留下评分。

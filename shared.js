@@ -58,6 +58,20 @@
     "deepseek-v4-flash": "deepseek-flash"
   });
 
+  // Per-provider outbound links (console = create a key, pricing = official
+  // price page). The single source of truth for these URLs: popup.js and
+  // welcome.js read them from here, so no JS file duplicates the literals.
+  const PROVIDER_LINKS = Object.freeze({
+    deepseek: Object.freeze({
+      console: "https://platform.deepseek.com/api_keys",
+      pricing: "https://api-docs.deepseek.com/zh-cn/quick_start/pricing"
+    }),
+    kimi: Object.freeze({
+      console: "https://platform.moonshot.cn/console/api-keys",
+      pricing: "https://platform.moonshot.cn/docs/pricing/chat"
+    })
+  });
+
   // Whole-page translation keeps at most this many TRANSLATE_BATCH requests
   // in flight (content.js sends them sequentially, i.e. one at a time). The
   // cap exists so any future parallelism cannot stampede the provider into
@@ -370,6 +384,51 @@
     return `${leading}${String(translated).trim()}${trailing}`;
   }
 
+  // Visible-area-first ordering for the initial page run: segments whose rect
+  // intersects the viewport translate first (input order among them — callers
+  // pass DOM order), then segments starting within one viewport height below
+  // the fold, then everything else in input order. Items whose rect is
+  // unavailable (getRect returns null/throws) keep input order in the last
+  // tier — never dropped. Pure: returns a NEW array and reads getRect exactly
+  // once per item, so callers can pass getBoundingClientRect without repeated
+  // layout reads. Dynamic follow-up runs keep discovery order (callers simply
+  // do not reorder).
+  function orderSegmentsByViewport(items, getRect, viewportHeight) {
+    const list = Array.isArray(items) ? [...items] : [];
+    if (list.length <= 1) {
+      return list;
+    }
+    const height = Number(viewportHeight);
+    const fold = Number.isFinite(height) && height > 0 ? height : 0;
+    const visible = [];
+    const below = [];
+    const rest = [];
+    for (const item of list) {
+      let rect = null;
+      try {
+        rect = getRect ? getRect(item) : null;
+      } catch {
+        rect = null;
+      }
+      if (
+        !rect ||
+        !Number.isFinite(rect.top) ||
+        !Number.isFinite(rect.bottom)
+      ) {
+        rest.push(item);
+        continue;
+      }
+      if (rect.bottom > 0 && rect.top < fold) {
+        visible.push(item);
+      } else if (rect.top >= fold && rect.top < fold * 2) {
+        below.push(item);
+      } else {
+        rest.push(item);
+      }
+    }
+    return [...visible, ...below, ...rest];
+  }
+
   function chunkSegments(segments, maxCharacters = 5000, maxItems = 24) {
     const chunks = [];
     let current = [];
@@ -597,6 +656,206 @@
     return Math.round(base * jitter);
   }
 
+  // Failure codes worth a later retry: network trouble, timeouts, rate
+  // limiting and server-side 5xx say nothing about the KEY, so a verdict
+  // carrying one of them is transient and must never be cached (Codex PR #19
+  // P1). Auth/format failures (401/402/…) do describe the key and are cached.
+  const TRANSIENT_KEY_VERIFIER_CODES = new Set([
+    "NETWORK_ERROR",
+    "FETCH_TIMEOUT",
+    "TIMEOUT",
+    "API_429",
+    "HTTP_429",
+    "429"
+  ]);
+
+  // True when a failed verification result is transient (retryable) rather
+  // than a verdict about the key itself. `transient` wins when the caller set
+  // it explicitly (e.g. a save that failed mid-run); otherwise the code is
+  // matched against the known-transient set plus bare/API-prefixed 5xx.
+  function isTransientKeyVerdict(result) {
+    if (!result || result.ok) {
+      return false;
+    }
+    if (result.transient === true) {
+      return true;
+    }
+    if (result.transient === false) {
+      return false;
+    }
+    const code = String(result.code || "");
+    if (TRANSIENT_KEY_VERIFIER_CODES.has(code)) {
+      return true;
+    }
+    return /^(?:API_)?5\d\d$/.test(code);
+  }
+
+  // Per-provider key-verification status (Codex PR #19 P2): "verified" |
+  // "failed" | "unverified", stored per provider as <provider>KeyStatus. A
+  // status is only meaningful for the exact key it was computed on, so it is
+  // always written next to <provider>KeyStatusFor — a non-secret fingerprint
+  // (length + last 4 chars, only for key-shaped values; never the full key).
+  // A fingerprint mismatch (or a missing status — every 1.4.3 upgrade) reads
+  // back as "unverified".
+  function keyFingerprint(key) {
+    const value = String(key || "");
+    const tail = value.length >= 8 ? value.slice(-4) : "";
+    return tail ? `${value.length}:${tail}` : String(value.length);
+  }
+
+  // The storage-field patch that carries a provider's verification status for
+  // `key`: same-set() companions so a key value and its status can never land
+  // apart (a key write always resets the status to "unverified"; a test
+  // verdict then overwrites it with "verified"/"failed").
+  function keyStatusPatch(provider, status, key) {
+    return {
+      [`${provider}KeyStatus`]: status,
+      [`${provider}KeyStatusFor`]: keyFingerprint(key)
+    };
+  }
+
+  // One paste into a key field fires paste + input + change + blur, and each
+  // handler used to run its own TEST_CONNECTION — a single pasted key could
+  // bill up to four provider requests (Codex PR #19 P1). createKeyVerifier is
+  // the ONE verification entry point both surfaces (welcome page, popup) go
+  // through:
+  //   • identity is provider + "\0" + key (the key is never logged);
+  //   • the same identity in flight shares that promise — no new request;
+  //   • a completed verdict (ok OR auth/format failure) is answered from
+  //     cache for the "paste"/"input"/"change"/"blur" triggers; the explicit
+  //     测试 button ("click") may re-run, but only when not in flight;
+  //   • "input"/"change"/"blur" are debounced (debounceMs) and a newer value
+  //     cancels the pending run; "paste" runs immediately and also cancels a
+  //     pending debounced run;
+  //   • transient failures (network/timeout/429/5xx) are never cached, so a
+  //     later trigger may retry them.
+  // Pure and injectable (run + timers) so node tests drive it without a DOM.
+  // request() never rejects: a superseded debounced request resolves
+  // {ok:false, superseded:true} and callers skip rendering those.
+  function createKeyVerifier({
+    run,
+    debounceMs = 600,
+    setTimeout: schedule = (fn, ms) => globalThis.setTimeout(fn, ms),
+    clearTimeout: cancel = (id) => globalThis.clearTimeout(id)
+  } = {}) {
+    if (typeof run !== "function") {
+      throw new Error("createKeyVerifier: run(provider, key) is required");
+    }
+    const delay = Math.max(0, Number(debounceMs) || 0);
+    const identityOf = (provider, key) => `${provider}\u0000${key}`;
+    // identity → settled (non-transient) verdict; identity → in-flight promise.
+    const settled = new Map();
+    const inFlight = new Map();
+    let pendingTimer = null;
+    let pendingIdentity = null;
+    let pendingResolve = null;
+
+    // Resolve the pending debounced request (if any) as superseded and clear
+    // its timer. Every new request calls this first: the newest value always
+    // replaces a still-pending older one.
+    const supersedePending = () => {
+      const resolve = pendingResolve;
+      if (pendingTimer !== null) {
+        cancel(pendingTimer);
+        pendingTimer = null;
+      }
+      pendingIdentity = null;
+      pendingResolve = null;
+      if (resolve) {
+        resolve({ ok: false, superseded: true });
+      }
+    };
+
+    const startRun = (provider, key) => {
+      const identity = identityOf(provider, key);
+      const existing = inFlight.get(identity);
+      if (existing) {
+        return existing;
+      }
+      const promise = (async () => {
+        let result;
+        try {
+          result = await run(provider, key);
+        } catch (error) {
+          // run() failing (messaging/storage trouble) says nothing about the
+          // key: treat it as transient so a later trigger retries.
+          result = { ok: false, error: error?.message || String(error), transient: true };
+        }
+        inFlight.delete(identity);
+        const verdict = result && typeof result === "object" ? result : { ok: Boolean(result) };
+        if (isTransientKeyVerdict(verdict)) {
+          settled.delete(identity);
+        } else {
+          settled.set(identity, verdict);
+        }
+        return verdict;
+      })();
+      inFlight.set(identity, promise);
+      return promise;
+    };
+
+    return {
+      request(provider, key, { trigger = "input" } = {}) {
+        const identity = identityOf(provider, key);
+        supersedePending();
+        const cached = settled.get(identity);
+        if (trigger !== "click" && cached) {
+          return Promise.resolve(cached);
+        }
+        if (trigger === "click" || trigger === "paste") {
+          return startRun(provider, key);
+        }
+        const existing = inFlight.get(identity);
+        if (existing) {
+          return existing;
+        }
+        // Debounced: resolve with whatever run the timer eventually starts —
+        // a verdict cached in the meantime (a paste in between) joins too.
+        const promise = new Promise((resolve) => {
+          pendingResolve = resolve;
+        });
+        pendingIdentity = identity;
+        pendingTimer = schedule(() => {
+          pendingTimer = null;
+          const resolve = pendingResolve;
+          pendingIdentity = null;
+          pendingResolve = null;
+          const cachedNow = settled.get(identity);
+          (cachedNow ? Promise.resolve(cachedNow) : startRun(provider, key))
+            .then((verdict) => resolve && resolve(verdict));
+        }, delay);
+        return promise;
+      },
+
+      // Drop verdicts so a later trigger re-runs: with a key, only that
+      // provider+key pair; with only a provider, every verdict of that
+      // provider; with neither, everything (same as reset()).
+      forget(provider, key) {
+        if (provider === undefined || provider === null) {
+          this.reset();
+          return;
+        }
+        const matches = (identity) =>
+          key === undefined || key === null
+            ? identity.startsWith(`${provider}\u0000`)
+            : identity === identityOf(provider, key);
+        for (const identity of [...settled.keys()]) {
+          if (matches(identity)) {
+            settled.delete(identity);
+          }
+        }
+        if (pendingIdentity !== null && matches(pendingIdentity)) {
+          supersedePending();
+        }
+      },
+
+      reset() {
+        supersedePending();
+        settled.clear();
+      }
+    };
+  }
+
   // fetch() under an AbortController deadline. The signal guards the whole
   // request lifecycle, headers AND body: the returned wrapper keeps the timer
   // armed until text()/json() settles (cleared in finally), so a response
@@ -679,6 +938,7 @@
     FETCH_TIMEOUT_MESSAGE,
     DEEPSEEK_MODEL_IDS,
     DEEPSEEK_DEFAULT_MODEL,
+    PROVIDER_LINKS,
     MAX_INFLIGHT_TRANSLATE_BATCHES,
     migrateModelName,
     MAX_PROVIDER_RETRIES,
@@ -699,6 +959,7 @@
     isSkippableText,
     isXHost,
     preserveWhitespace,
+    orderSegmentsByViewport,
     chunkSegments,
     hasMultiParagraphSource,
     countSourceParagraphUnits,
@@ -707,6 +968,10 @@
     buildExportFilename,
     fetchWithTimeout,
     isTimeoutError,
-    createFetchTimeoutError
+    createFetchTimeoutError,
+    createKeyVerifier,
+    isTransientKeyVerdict,
+    keyFingerprint,
+    keyStatusPatch
   };
 });

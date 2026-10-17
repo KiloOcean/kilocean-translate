@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "千浩翻译 · Kilocean Translate",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArIygWnENUtp1qyX6r9ajCQOPbXefd4fVhOLFmy4wJiPLLxwXCJHlFyVtOhmmXDl1BVkiUAvPQooCr6vnvdPPWiDp8hZldLqMxYoQ9KGbZZwEoI5yz38WjiRpT7543senc0bNmJgYo/x3LkxtPtox7MHdPudcoRh0MFxkCik0Yp5tC5jUtKI/YYI6av1w296if92FFKMsEn9MOpRtUqBLQBCKdwSZ8uk1lJWCaDhLWm6ksWJtEeEQKqly39y9how4tGTzMb2X0egE/EsWuJ6QTYIEKrs5BrOVv8pRUOUMLq8WR7cW1XlFpSW9Wph+BQqLUKBSgV5XpBz5oF/JQEImAQIDAQAB",
   "description": "Kilocean 千浩翻译：DeepSeek / Kimi 自备 Key，双语对照整页翻译、划词翻译，自动跟译。权限极小，Key 只存在本机。无登录、无会员墙。",
   "minimum_chrome_version": "102",
   "permissions": [
     "activeTab",
     "scripting",
-    "storage"
+    "storage",
+    "contextMenus"
   ],
   "host_permissions": [
     "https://api.deepseek.com/*",
@@ -25,6 +26,22 @@
       "32": "icons/icon-32.png",
       "48": "icons/icon-48.png",
       "128": "icons/icon-128.png"
+    }
+  },
+  "commands": {
+    "translate-page": {
+      "suggested_key": {
+        "default": "Alt+A",
+        "mac": "Alt+A"
+      },
+      "description": "翻译此页"
+    },
+    "translate-selection": {
+      "suggested_key": {
+        "default": "Alt+T",
+        "mac": "Alt+T"
+      },
+      "description": "翻译选中文字"
     }
   },
   "icons": {

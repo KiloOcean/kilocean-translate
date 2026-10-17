@@ -7,159 +7,227 @@
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
-    <main class="app">
-      <header class="hero">
-        <div class="brand-mark" aria-hidden="true">译</div>
-        <div>
-          <h1>千浩翻译</h1>
-          <p>Kilocean · 双语对照整页翻译，划词即译</p>
-        </div>
-      </header>
-
-      <section class="panel" aria-labelledby="settings-title">
-        <div class="section-heading">
-          <h2 id="settings-title">连接设置</h2>
-          <a id="get-key-link" href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">获取 Key</a>
-        </div>
-
-        <div class="key-status" aria-live="polite">
-          <div class="key-status-row" id="key-status-deepseek">
-            <span class="key-status-label">DeepSeek</span>
-            <span class="key-status-value" id="key-status-deepseek-value">未配置</span>
-          </div>
-          <div class="key-status-row" id="key-status-kimi">
-            <span class="key-status-label">Kimi</span>
-            <span class="key-status-value" id="key-status-kimi-value">未配置</span>
-          </div>
-        </div>
-
-        <label class="field">
-          <span>服务商</span>
-          <select id="provider">
-            <option value="deepseek">DeepSeek</option>
-            <option value="kimi">Kimi（Moonshot）</option>
+    <main id="app" data-view="main">
+      <header class="app-header">
+        <span class="brand-mark" aria-hidden="true">译</span>
+        <h1 class="brand-name">千浩翻译</h1>
+        <label class="lang-pill">
+          <span>译为</span>
+          <select id="target-language" aria-label="目标语言">
+            <option value="zh-CN">简体中文</option>
+            <option value="zh-TW">繁體中文</option>
+            <option value="ja">日本語</option>
+            <option value="ko">한국어</option>
+            <option value="en">English</option>
           </select>
         </label>
+        <button id="back-main" type="button" aria-label="返回主页">← 返回</button>
+        <button id="open-settings" class="header-icon" type="button" aria-label="设置">⚙</button>
+      </header>
 
-        <label class="field key-field">
-          <span id="api-key-label">DeepSeek API Key</span>
-          <span class="password-wrap">
-            <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" spellcheck="false">
-            <button id="toggle-key" class="icon-button" type="button" aria-label="显示 API Key">显示</button>
-          </span>
-        </label>
+      <!-- ================= main view ================= -->
+      <section id="view-main" aria-label="翻译">
+        <button id="provider-status" class="provider-status" type="button">
+          <span id="provider-status-label">✓ DeepSeek 已连接</span>
+          <span id="provider-status-meta">Flash · ••</span>
+        </button>
 
-        <div id="key-guide" class="key-guide" hidden>
-          <p class="key-guide-title">翻译前需要先配置 API Key（二选一即可，Key 只保存在本机）：</p>
-          <div class="key-guide-links">
-            <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">DeepSeek · 创建 API Key</a>
-            <a href="https://platform.moonshot.cn/console/api-keys" target="_blank" rel="noreferrer">Kimi（Moonshot）· 创建 API Key</a>
-          </div>
-          <p class="key-guide-help">粘贴到上方输入框即可自动保存并验证。</p>
-          <p class="key-guide-help">如果你之前以「开发者模式 / 加载已解压」方式使用 1.4.2 及更早版本：1.4.3 起扩展 ID 已与商店统一，旧 ID 下的本机设置无法自动带过来，需要重新粘贴一次 Key，之后安装/更新都不再需要。商店安装的用户不受影响。</p>
+        <button id="translate" class="primary-button translate-button" type="button">
+          <span>翻译此页</span>
+          <kbd id="translate-shortcut">Alt+A</kbd>
+        </button>
+
+        <div id="status-wrap" hidden>
+          <section class="status-card" data-tone="idle" aria-live="polite">
+            <span id="status-dot" class="status-dot" aria-hidden="true"></span>
+            <div class="status-body">
+              <strong id="status-title">未开始</strong>
+              <p id="status-detail">点击「翻译此页」开始翻译</p>
+              <div class="progress"><i id="status-progress"></i></div>
+              <div class="status-actions">
+                <button id="retry-failed" class="primary-button" type="button" hidden>重试失败的段落</button>
+                <button id="restore" class="secondary-button" type="button">还原原文</button>
+              </div>
+            </div>
+          </section>
         </div>
 
-        <div class="field-grid">
+        <div class="mode-toggle" role="radiogroup" aria-label="显示模式">
+          <button id="mode-bilingual" class="mode-button active" type="button" role="radio" aria-checked="true" data-mode="bilingual">双语</button>
+          <button id="mode-translation" class="mode-button" type="button" role="radio" aria-checked="false" data-mode="translation-only">译文</button>
+          <button id="mode-original" class="mode-button" type="button" role="radio" aria-checked="false" data-mode="original">原文</button>
+        </div>
+
+        <p id="selection-hint" class="selection-hint">划词：选中后按 <kbd id="selection-shortcut">Alt+T</kbd>，或右键「翻译选中文字」</p>
+
+        <section id="selection-confirm-panel" class="selection-confirm-panel" hidden aria-labelledby="selection-confirm-title">
+          <div class="selection-confirm-head">
+            <h2 id="selection-confirm-title">划词待确认</h2>
+            <span class="hint">扩展内确认，不走网页按钮</span>
+          </div>
+          <p id="selection-confirm-text" class="selection-confirm-text"></p>
+          <div class="selection-confirm-actions">
+            <button id="selection-confirm-btn" class="primary-button" type="button">翻译选中文本</button>
+            <button id="selection-confirm-dismiss" class="secondary-button" type="button">取消</button>
+          </div>
+        </section>
+      </section>
+
+      <!-- ================= setup view ================= -->
+      <section id="view-setup" aria-label="初次配置">
+        <div class="setup-card">
+          <h2>两步连上翻译服务</h2>
+          <p class="setup-sub">用你自己的 Key，按用量付给服务商。无会员、无中转。</p>
+
+          <div class="provider-options" role="radiogroup" aria-label="服务商">
+            <button class="provider-option" type="button" role="radio" aria-checked="true" data-provider="deepseek">
+              <b>DeepSeek</b>
+              <span>默认 · 快</span>
+            </button>
+            <button class="provider-option" type="button" role="radio" aria-checked="false" data-provider="kimi">
+              <b>Kimi</b>
+              <span>128k 长文</span>
+            </button>
+          </div>
+
+          <div class="setup-step">
+            <span class="step-num" aria-hidden="true">1</span>
+            <div class="step-body">
+              <p class="step-label">创建 Key</p>
+              <a id="setup-console-link" class="primary-button" href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">打开 DeepSeek 控制台 ↗</a>
+            </div>
+          </div>
+
+          <div class="setup-step">
+            <span class="step-num" aria-hidden="true">2</span>
+            <div class="step-body">
+              <p class="step-label">粘贴到这里（自动验证）</p>
+              <div id="setup-key-slot"></div>
+              <p id="setup-feedback" class="setup-feedback" aria-live="polite">粘贴后立即验证</p>
+            </div>
+          </div>
+
+          <p class="setup-lock">🔒 Key 只存在本机 Chrome · <a id="setup-pricing-link" href="https://api-docs.deepseek.com/zh-cn/quick_start/pricing" target="_blank" rel="noreferrer">官方定价</a></p>
+        </div>
+      </section>
+
+      <!-- ================= settings view ================= -->
+      <section id="view-settings" aria-label="设置">
+        <section class="settings-section" aria-labelledby="settings-keys-title">
+          <h2 id="settings-keys-title">服务与 Key</h2>
+
+          <div class="key-status" aria-live="polite">
+            <div class="key-status-row" id="key-status-deepseek">
+              <span class="key-status-label">DeepSeek</span>
+              <span class="key-status-value" id="key-status-deepseek-value">未配置</span>
+            </div>
+            <div class="key-status-row" id="key-status-kimi">
+              <span class="key-status-label">Kimi</span>
+              <span class="key-status-value" id="key-status-kimi-value">未配置</span>
+            </div>
+          </div>
+
           <label class="field">
-            <span>翻译为</span>
-            <select id="target-language">
-              <option value="zh-CN">简体中文</option>
-              <option value="zh-TW">繁體中文</option>
-              <option value="ja">日本語</option>
-              <option value="ko">한국어</option>
-              <option value="en">English</option>
+            <span>服务商</span>
+            <select id="provider">
+              <option value="deepseek">DeepSeek</option>
+              <option value="kimi">Kimi（Moonshot）</option>
             </select>
           </label>
+
+          <div id="settings-key-slot">
+            <div id="key-entry">
+              <label class="field key-field">
+                <span id="api-key-label">DeepSeek API Key</span>
+                <span class="password-wrap">
+                  <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" spellcheck="false">
+                  <button id="toggle-key" class="icon-button" type="button" aria-label="显示 API Key">显示</button>
+                </span>
+              </label>
+
+              <div id="key-guide" class="key-guide" hidden>
+                <p class="key-guide-title">翻译前需要先配置 API Key（二选一即可，Key 只保存在本机）：</p>
+                <div class="key-guide-links">
+                  <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">DeepSeek · 创建 API Key ↗</a>
+                  <a href="https://platform.moonshot.cn/console/api-keys" target="_blank" rel="noreferrer">Kimi（Moonshot）· 创建 API Key ↗</a>
+                </div>
+                <p class="key-guide-help">粘贴到上方输入框即可自动保存并验证。</p>
+                <details class="key-guide-legacy">
+                  <summary>从旧版开发者模式升级？</summary>
+                  <p class="key-guide-help">如果你之前以「开发者模式 / 加载已解压」方式使用 1.4.2 及更早版本：1.4.3 起扩展 ID 已与商店统一，旧 ID 下的本机设置无法自动带过来，需要重新粘贴一次 Key，之后安装/更新都不再需要。商店安装的用户不受影响。</p>
+                </details>
+              </div>
+            </div>
+          </div>
 
           <label class="field">
             <span>模型</span>
             <select id="model">
-              <option value="deepseek-flash">DeepSeek Flash（默认，快速）</option>
-              <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
+              <option value="deepseek-flash">Flash · 快（默认）</option>
+              <option value="deepseek-v4-pro">V4 Pro</option>
             </select>
           </label>
-        </div>
 
-        <button id="test-connection" class="text-button" type="button">测试 API 连接</button>
+          <div class="settings-row-actions">
+            <button id="test-connection" class="text-button" type="button">测试 API 连接</button>
+            <a id="get-key-link" href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">获取 Key ↗</a>
+          </div>
+        </section>
+
+        <section class="settings-section" aria-labelledby="settings-shortcuts-title">
+          <h2 id="settings-shortcuts-title">快捷键</h2>
+          <ul id="shortcut-list" class="shortcut-list">
+            <li><span>翻译此页</span><kbd>Alt+A</kbd></li>
+            <li><span>翻译选中文字</span><kbd>Alt+T</kbd></li>
+          </ul>
+          <button id="open-shortcuts" class="secondary-button" type="button">修改快捷键</button>
+        </section>
+
+        <section class="settings-section" aria-labelledby="settings-backup-title">
+          <h2 id="settings-backup-title">备份</h2>
+          <label class="include-keys-toggle">
+            <input type="checkbox" id="export-include-keys">
+            <span>包含 API Key<span class="warn">（明文保存，勿分享）</span></span>
+          </label>
+          <div class="settings-io-actions">
+            <button id="export-settings" class="secondary-button" type="button">导出设置</button>
+            <button id="import-settings" class="secondary-button" type="button">导入设置</button>
+            <input id="import-file" type="file" accept="application/json,.json" hidden>
+          </div>
+          <p class="settings-io-help">导出为 JSON 文件（服务商、语言、模型、显示模式）。导入只覆盖文件中出现的字段；文件不含 Key 时保留本机已保存的 Key。</p>
+        </section>
+
+        <section class="settings-section" aria-labelledby="settings-privacy-title">
+          <h2 id="settings-privacy-title">隐私</h2>
+          <p class="privacy-note">API Key 仅保存在本机 Chrome 中。网页文本会发送至你选择的服务商（DeepSeek 或 Kimi）完成翻译。无登录、无会员墙。</p>
+        </section>
+
+        <section class="settings-section" aria-labelledby="settings-qa-title" aria-disabled="true">
+          <h2 id="settings-qa-title">本地化 QA <span class="soon-pill">即将推出</span></h2>
+          <p class="qa-note">检查术语一致性、价格 / 日期 / 单位、文字溢出、漏翻等问题。即将推出。</p>
+        </section>
+
+        <section class="settings-section" aria-labelledby="settings-about-title">
+          <h2 id="settings-about-title">关于</h2>
+          <p class="about-line">千浩翻译 <span id="app-version"></span></p>
+          <a id="open-welcome" href="welcome.html" target="_blank" rel="noreferrer">重新打开新手引导</a>
+        </section>
+
+        <p class="settings-feedback"><a href="mailto:qianhao1229@gmail.com?subject=%E5%8D%83%E6%B5%A9%E7%BF%BB%E8%AF%91%E5%8F%8D%E9%A6%88">反馈 / 联系</a></p>
       </section>
 
-      <section class="panel display-panel" aria-labelledby="display-title">
-        <div class="section-heading">
-          <h2 id="display-title">显示模式</h2>
-          <span class="hint">默认双语对照</span>
-        </div>
-        <div class="mode-toggle" role="radiogroup" aria-label="显示模式">
-          <button id="mode-bilingual" class="mode-button" type="button" role="radio" aria-checked="true" data-mode="bilingual">双语对照</button>
-          <button id="mode-translation" class="mode-button" type="button" role="radio" aria-checked="false" data-mode="translation-only">仅译文</button>
-          <button id="mode-original" class="mode-button" type="button" role="radio" aria-checked="false" data-mode="original">原文</button>
-        </div>
-        <p class="mode-help">双语对照 / 仅译文 / 原文可随时切换；“清除译文”会彻底还原并停止跟译。划词选中即可弹出译文。</p>
-      </section>
-
-      <section id="selection-confirm-panel" class="panel selection-confirm-panel" hidden aria-labelledby="selection-confirm-title">
-        <div class="section-heading">
-          <h2 id="selection-confirm-title">划词待确认</h2>
-          <span class="hint">扩展内确认，不走网页按钮</span>
-        </div>
-        <p id="selection-confirm-text" class="selection-confirm-text"></p>
-        <div class="selection-confirm-actions">
-          <button id="selection-confirm-btn" class="primary-button" type="button">
-            <span>翻译选中文本</span>
-            <span aria-hidden="true">→</span>
-          </button>
-          <button id="selection-confirm-dismiss" class="secondary-button" type="button">取消</button>
-        </div>
-      </section>
-
-      <section class="status-card" aria-live="polite">
-        <span id="status-dot" class="status-dot"></span>
-        <div>
-          <strong id="status-title">准备就绪</strong>
-          <p id="status-detail">点击下方按钮开始翻译当前网页</p>
-        </div>
-      </section>
-
-      <div class="actions">
-        <button id="translate" class="primary-button" type="button">
-          <span>翻译当前网页</span>
-          <span aria-hidden="true">→</span>
-        </button>
-        <button id="restore" class="secondary-button" type="button">清除译文</button>
-      </div>
-
-      <section class="export-panel" aria-labelledby="export-title">
-        <div class="export-heading">
-          <h2 id="export-title">保存与分享</h2>
-          <span>完成翻译后可用</span>
-        </div>
-        <div class="export-actions">
-          <button id="export-html" class="utility-button" type="button" disabled>保存 HTML</button>
-          <button id="print-pdf" class="utility-button" type="button" disabled>打印 / 保存 PDF</button>
-        </div>
-        <p>HTML 会保留当前译文和原页面样式；PDF 将打开 Chrome 打印窗口。</p>
-      </section>
-
-      <section class="panel settings-io-panel" aria-labelledby="settings-io-title">
-        <div class="section-heading">
-          <h2 id="settings-io-title">设置备份</h2>
-          <span class="hint">默认不含 API Key</span>
-        </div>
-        <label class="include-keys-toggle">
-          <input type="checkbox" id="export-include-keys">
-          <span>包含 API Key<span class="warn">（明文保存，勿分享）</span></span>
-        </label>
-        <div class="settings-io-actions">
-          <button id="export-settings" class="utility-button" type="button">导出设置</button>
-          <button id="import-settings" class="utility-button" type="button">导入设置</button>
-          <input id="import-file" type="file" accept="application/json,.json" hidden>
-        </div>
-        <p class="settings-io-help">导出为 JSON 文件（服务商、语言、模型、显示模式）。导入只覆盖文件中出现的字段；文件不含 Key 时保留本机已保存的 Key。</p>
-      </section>
-
-      <p class="privacy-note">API Key 仅保存在本机 Chrome 中。网页文本会发送至你选择的服务商（DeepSeek 或 Kimi）完成翻译。无登录、无会员墙。</p>
-
-      <footer class="popup-footer">
-        <a href="mailto:qianhao1229@gmail.com?subject=%E5%8D%83%E6%B5%A9%E7%BF%BB%E8%AF%91%E5%8F%8D%E9%A6%88">反馈 / 联系</a>
+      <!-- ================= footer (main view only) ================= -->
+      <footer class="app-footer">
+        <details id="more-menu" class="more-menu">
+          <summary>⋯ 更多</summary>
+          <div class="more-menu-list">
+            <button id="export-html" type="button" disabled>保存 HTML <span class="more-reason">翻译完成后可用</span></button>
+            <button id="print-pdf" type="button" disabled>打印 / 保存 PDF <span class="more-reason">翻译完成后可用</span></button>
+            <button id="more-settings" type="button">设置与备份</button>
+          </div>
+        </details>
+        <span class="footer-spacer"></span>
+        <a class="feedback-link" href="mailto:qianhao1229@gmail.com?subject=%E5%8D%83%E6%B5%A9%E7%BF%BB%E8%AF%91%E5%8F%8D%E9%A6%88">反馈</a>
       </footer>
     </main>
     <script src="shared.js"></script>
