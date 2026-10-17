@@ -4342,6 +4342,102 @@ async function checkKeyVerifierGate() {
     assertEqual(welcome.storage.deepseekKeyStatusFor, fingerprintOf(REPL), "welcome P2 replace: verified names the replacement");
   }
 
+  // ---- (c7) PR #19 P1-C (专业测试): a real paste of a valid key, then ONE
+  // click on 继续. The click blurs the key input first; that blur (and any
+  // change/input) on the UNCHANGED, already-verified value must not reset
+  // verified or disable 继续 — the first click must reach step 3.
+  {
+    const KEY = fakeKey("p1cOneClick", 24);
+    let testCount = 0;
+    const welcome = createWelcomeVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash", targetLanguage: "zh-CN" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            testCount += 1;
+            return { ok: true };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    welcome.fire(welcome.dom.get("s1-next"), "click");
+    const s2Key = welcome.dom.get("s2-key");
+    const s2Next = welcome.dom.get("s2-next");
+    s2Key.value = KEY;
+    welcome.fire(s2Key, "paste");
+    welcome.fire(s2Key, "input");
+    await settle(40);
+    assertTrue(String(welcome.dom.get("s2-msg").textContent).includes("已连接"), "welcome P1-C: the pasted key verifies");
+    assertFalse(s2Next.disabled, "welcome P1-C: 继续 is enabled after the paste verifies");
+    const writesBefore = welcome.writes.length;
+    // Clicking 继续 = blur of the key input, then (same task) the click.
+    welcome.fire(s2Key, "change");
+    welcome.fire(s2Key, "blur");
+    assertFalse(s2Next.disabled, "welcome P1-C: blur/change of the unchanged verified key never disables 继续");
+    assertTrue(String(welcome.dom.get("s2-msg").textContent).includes("已连接"), "welcome P1-C: blur keeps the connected message");
+    welcome.fire(s2Next, "click");
+    await settle(40);
+    assertFalse(welcome.dom.get("step-3").hidden, "welcome P1-C: ONE click on 继续 reaches step 3");
+    assertEqual(testCount, 1, "welcome P1-C: blur/change of the unchanged key bill no extra TEST_CONNECTION");
+    assertFalse(
+      welcome.writes.slice(writesBefore).some((write) => write.updates.deepseekKeyStatus === "unverified"),
+      "welcome P1-C: blur/change of the unchanged key do not re-save it as unverified"
+    );
+  }
+
+  // ---- (c8) Invariant (AGENTS.md, P1-C): blur/input handlers never
+  // synchronously disable 继续. A key TYPED over an accepted verified stored
+  // key, then a click on 继续 (blur first): the blur must leave the button
+  // enabled, and the click waits for the typed key's own verdict — success
+  // reaches step 3 with the typed key; it never proceeds on the old key.
+  for (const verdict of ["ok", "401"]) {
+    const STORED = fakeKey(`c8Stored${verdict}`, 22);
+    const TYPED = fakeKey(`c8Typed${verdict}`, 23);
+    const fingerprintOf = (key) => `${key.length}:${key.slice(-4)}`;
+    const welcome = createWelcomeVm(
+      {
+        provider: "deepseek",
+        deepseekApiKey: STORED,
+        kimiApiKey: "",
+        apiKey: STORED,
+        model: "deepseek-flash",
+        targetLanguage: "zh-CN",
+        deepseekKeyStatus: "verified",
+        deepseekKeyStatusFor: fingerprintOf(STORED)
+      },
+      {
+        runtimeMessageHandler: async (message) =>
+          message?.type === "TEST_CONNECTION"
+            ? (verdict === "ok" ? { ok: true } : { ok: false, code: "API_401", error: "Key 不正确" })
+            : { ok: false }
+      }
+    );
+    await settle(20);
+    welcome.fire(welcome.dom.get("s1-next"), "click");
+    const s2Key = welcome.dom.get("s2-key");
+    const s2Next = welcome.dom.get("s2-next");
+    assertFalse(s2Next.disabled, `welcome invariant (${verdict}): the verified stored key enables 继续`);
+    s2Key.value = TYPED;
+    welcome.fire(s2Key, "input");
+    welcome.fire(s2Key, "blur"); // mousedown on 继续
+    assertFalse(s2Next.disabled, `welcome invariant (${verdict}): blur/input never synchronously disable 继续`);
+    welcome.fire(s2Next, "click");
+    await settle(900); // blur/input verification is debounced (600ms)
+    if (verdict === "ok") {
+      assertFalse(welcome.dom.get("step-3").hidden, "welcome invariant (ok): the click waits for the typed key's verdict and reaches step 3");
+      assertEqual(welcome.storage.deepseekApiKey, TYPED, "welcome invariant (ok): step 3 runs on the typed key");
+      assertEqual(welcome.storage.deepseekKeyStatusFor, fingerprintOf(TYPED), "welcome invariant (ok): verified names the typed key");
+    } else {
+      assertTrue(welcome.dom.get("step-3").hidden, "welcome invariant (401): the click never proceeds on the old stored key");
+      assertTrue(s2Next.disabled, "welcome invariant (401): the failed verdict leaves 继续 disabled");
+      assertFalse(
+        welcome.writes.some((write) => write.updates.keyVerified === true),
+        "welcome invariant (401): nothing marked verified"
+      );
+    }
+  }
+
   // ---- (d) welcome.js without shared.js fails loudly, console-free ----
   {
     const welcome = createWelcomeVm(
@@ -8601,6 +8697,10 @@ async function checkTotalDeadlineBudget() {
       calls += 1;
       return (queue.length > 1 ? queue.shift() : queue[0])(url, options);
     };
+    // The watchdog is cleared once the race settles: a leftover timer would
+    // fire a false "no settlement" whenever later checks keep the process
+    // alive past 3s (it only stayed silent because ci-check used to exit first).
+    let watchdog = null;
     try {
       const result = await Promise.race([
         harness({ ...deepseekStorage }).translateBatch(
@@ -8611,15 +8711,18 @@ async function checkTotalDeadlineBudget() {
           timeoutMs,
           { sleep: async (ms) => { delays.push(ms); clock.now += ms; }, now: () => clock.now }
         ),
-        new Promise((resolve) => setTimeout(() => {
-          fail("deadline-budget functional test: no settlement within 3000ms");
-          resolve(undefined);
-        }, 3000))
+        new Promise((resolve) => {
+          watchdog = setTimeout(() => {
+            fail("deadline-budget functional test: no settlement within 3000ms");
+            resolve(undefined);
+          }, 3000);
+        })
       ]);
       return { ok: true, result, calls, delays };
     } catch (error) {
       return { ok: false, error, calls, delays };
     } finally {
+      clearTimeout(watchdog);
       globalThis.fetch = originalFetch;
     }
   };
@@ -8975,13 +9078,20 @@ async function checkTabConcurrencyAndNavigationCancel() {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
   };
-  const withTimeout = (promise, label, ms = 2000) => Promise.race([
-    promise,
-    new Promise((resolve) => setTimeout(() => {
-      fail(`tab-concurrency (${label}): no settlement within ${ms}ms`);
-      resolve(undefined);
-    }, ms))
-  ]);
+  // The watchdog is cleared once the race settles (see deadline-budget): a
+  // leftover timer would report a false failure if ci-check ran on past it.
+  const withTimeout = (promise, label, ms = 2000) => {
+    let watchdog = null;
+    return Promise.race([
+      promise,
+      new Promise((resolve) => {
+        watchdog = setTimeout(() => {
+          fail(`tab-concurrency (${label}): no settlement within ${ms}ms`);
+          resolve(undefined);
+        }, ms);
+      })
+    ]).finally(() => clearTimeout(watchdog));
+  };
 
   // (1) One tab, six batches (as if from two content-script instances):
   // at most MAX run concurrently; the rest queue and drain as slots free.

@@ -227,6 +227,25 @@
     els.s2Next.disabled = !ok;
   }
 
+  // Invariant (AGENTS.md, PR #19 P1-C): blur / input / change handlers never
+  // synchronously disable 继续 — the blur may be the first half of a click on
+  // it, and a button disabled between mousedown and click swallows the click.
+  // Those handlers only update the verification STATE (verified = false); the
+  // 继续 click handler waits for any in-flight check of the value in the box
+  // and decides there. Only a paste (never a click precursor) may disable the
+  // button right away (PR #19 P2: 继续 is disabled while a pasted replacement
+  // key is verified).
+  function resetVerifiedState(trigger) {
+    if (trigger === "paste") {
+      setVerified(false, null);
+      return;
+    }
+    verified = false;
+    verifiedKey = null;
+    storedKeyNeedsVerification = "";
+    els.s2Next.textContent = S2_NEXT_LABEL;
+  }
+
   // The stored key exists but is not proven (P1-A): 继续 stays clickable as
   // 验证并继续, which verifies the stored key for real before step 3.
   // verified stays false, so nothing on this path can persist "verified".
@@ -377,11 +396,21 @@
   async function handleKeyInput(trigger) {
     const keyProvider = provider;
     const key = els.s2Key.value.trim();
+    // PR #19 P1-C (专业测试): an event on an UNCHANGED value — above all the
+    // blur that clicking 继续 itself triggers, or a late change/input of the
+    // same paste — must never reset the verified state. Resetting it here (even
+    // just until the cached verdict re-applies) disabled 继续 mid-click and the
+    // first click was lost. Same provider + the exact key already verified in
+    // this step → nothing to do.
+    if (verified && verifiedKey !== null && key && key === verifiedKey && keyProvider === provider &&
+        keyVerification.provider === keyProvider && keyVerification.key === key) {
+      return;
+    }
     if (!key) {
       invalidateKeyVerification();
       els.s2Field.classList.remove("err");
       setKeyMessage("粘贴后立即自动保存并验证", "");
-      setVerified(false, null);
+      resetVerifiedState(trigger);
       return;
     }
     const formatError = validateKeyFormat(key);
@@ -391,7 +420,7 @@
       invalidateKeyVerification();
       els.s2Field.classList.add("err");
       setKeyMessage(`✕ ${formatError}`, "er");
-      setVerified(false, null);
+      resetVerifiedState(trigger);
       return;
     }
     els.s2Field.classList.remove("err");
@@ -401,7 +430,7 @@
     // is being verified, 继续 must not accept the previously verified/stored
     // key — disable it until this key's own verdict lands.
     storedKeyVerifying = false;
-    setVerified(false, null);
+    resetVerifiedState(trigger);
     const token = claimKeyVerification(keyProvider, key);
     const result = await keyVerifier.request(keyProvider, key, { trigger });
     if (result && result.superseded) {
@@ -436,12 +465,28 @@
     setKeyMessageFromResult(result, key);
   }
 
-  els.s2Key.addEventListener("paste", () => setTimeout(() => handleKeyInput("paste"), 0));
-  els.s2Key.addEventListener("input", () => handleKeyInput("input"));
-  els.s2Key.addEventListener("change", () => handleKeyInput("change"));
+  // The newest key-input handling run, so the 继续 click can wait for the
+  // check of the exact value in the box (typically started by the blur of
+  // that very click) instead of the blur disabling the button under it.
+  let keyInputRun = null;
+
+  function runKeyInput(trigger) {
+    const run = { provider, key: els.s2Key.value.trim(), promise: null };
+    keyInputRun = run;
+    run.promise = handleKeyInput(trigger).finally(() => {
+      if (keyInputRun === run) {
+        keyInputRun = null;
+      }
+    });
+    return run.promise;
+  }
+
+  els.s2Key.addEventListener("paste", () => setTimeout(() => runKeyInput("paste"), 0));
+  els.s2Key.addEventListener("input", () => runKeyInput("input"));
+  els.s2Key.addEventListener("change", () => runKeyInput("change"));
   els.s2Key.addEventListener("blur", () => {
     if (els.s2Key.value.trim()) {
-      handleKeyInput("blur");
+      runKeyInput("blur");
     }
   });
 
@@ -575,10 +620,24 @@
     if (storedKeyVerifying) {
       return;
     }
+    // A check of the value in the box is still running (e.g. this click's own
+    // blur started it): decide only after its verdict — never on the previous
+    // key's state, and never by letting the blur disable the button.
+    const pending = keyInputRun;
+    if (pending && pending.provider === provider && pending.key && pending.key === els.s2Key.value.trim()) {
+      await pending.promise;
+      if (provider !== pending.provider || els.s2Key.value.trim() !== pending.key) {
+        return;
+      }
+    }
     if (!verified) {
       if (storedKeyNeedsVerification && storedKeyNeedsVerification === provider) {
         await verifyStoredKeyAndContinue();
+        return;
       }
+      // Not verified (e.g. a typed key that failed or is malformed): the click
+      // handler — not blur/input — is where 继续 gets disabled.
+      els.s2Next.disabled = true;
       return;
     }
     // An already-stored key was accepted for the selected provider. Re-check
