@@ -2990,8 +2990,39 @@
     .marker button.retry:hover { background: #FEF2F2; }
   `;
 
+  // Codex PR #19 P2-3: where may a failed-segment marker live? HTML's content
+  // models forbid most direct children of table/list structures — a div can
+  // never sit under tr/tbody/ul/dl, and a stray wrapper there breaks layout
+  // or gets relocated by the parser. Blocks that ARE those restricted slots
+  // (cells, captions, list items, definition terms) and any block whose
+  // PARENT is a restricted container get the marker INSIDE the block (a span
+  // appended as its last child); every other block gets a sibling div after
+  // it, as before.
+  const MARKER_HOST_INSIDE_TAGS = new Set(["TD", "TH", "CAPTION", "LI", "DT", "DD"]);
+  const MARKER_SIBLING_FORBIDDEN_PARENTS = new Set([
+    "TR", "TABLE", "THEAD", "TBODY", "TFOOT", "UL", "OL", "DL",
+    "SELECT", "COLGROUP", "OPTGROUP", "DATALIST"
+  ]);
+
+  // Pure: given the failed block, return { parent, before, tag } describing
+  // the marker host's insertion — parent.insertBefore(host, before) (a null
+  // `before` appends). Deliberately free of Node.* constants so plain-object
+  // harnesses can drive it.
+  function resolveMarkerPlacement(block) {
+    const tagName = String(block?.tagName || "").toUpperCase();
+    const parentNode = block?.parentNode || null;
+    const parentElement = parentNode && parentNode.nodeType === 1 ? parentNode : null;
+    const parentTag = String(parentElement?.tagName || "").toUpperCase();
+    if (MARKER_HOST_INSIDE_TAGS.has(tagName) || MARKER_SIBLING_FORBIDDEN_PARENTS.has(parentTag)) {
+      return { parent: block, before: null, tag: "span" };
+    }
+    return { parent: parentElement || block, before: block.nextSibling, tag: "div" };
+  }
+
   // Small owned marker right after a failed block: "这段没翻译成功（原因）·
   // 重试". Closed shadow root; the retry only fires on a trusted click.
+  // Restricted-parent blocks (table cells, list items…) host the marker
+  // INSIDE themselves — see resolveMarkerPlacement above.
   function showFailedMarker(block, reason = "") {
     if (!block?.isConnected || !block.parentNode) {
       return;
@@ -2999,7 +3030,8 @@
     removeFailedMarker(block);
     const gen = beginApplyingDom();
     try {
-      const host = document.createElement(block.tagName === "LI" ? "li" : "div");
+      const placement = resolveMarkerPlacement(block);
+      const host = document.createElement(placement.tag);
       host.setAttribute("data-kilocean-failed-marker", "true");
       host.setAttribute("data-deepseek-translator-ui", "true");
       const shadow = host.attachShadow({ mode: "closed" });
@@ -3018,7 +3050,10 @@
       root.addEventListener("click", (event) => onFailedMarkerRetry(event, block));
       shadow.appendChild(style);
       shadow.appendChild(root);
-      block.parentNode.insertBefore(host, block.nextSibling);
+      // null `before` appends — for inside-placement hosts the marker becomes
+      // the block's last child; the data-deepseek-translator-ui ownership
+      // flags already keep it out of text collection and mutation handling.
+      placement.parent.insertBefore(host, placement.before);
       failedMarkers.set(block, { host, shadow });
       updateFailedMarkerText(shadow, reason);
     } finally {

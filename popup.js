@@ -6,7 +6,9 @@ const PROVIDER_META = {
   deepseek: {
     label: "DeepSeek",
     keyLabel: "DeepSeek API Key",
-    keyUrl: "https://platform.deepseek.com/api_keys",
+    // Per-provider URLs live in ONE place: Utils.PROVIDER_LINKS (shared.js).
+    keyUrl: Utils.PROVIDER_LINKS.deepseek.console,
+    pricingUrl: Utils.PROVIDER_LINKS.deepseek.pricing,
     keyField: "deepseekApiKey",
     // Keep values in sync with Utils.DEEPSEEK_MODEL_IDS in shared.js
     // (deepseek-v4-flash was renamed to deepseek-flash).
@@ -19,7 +21,8 @@ const PROVIDER_META = {
   kimi: {
     label: "Kimi",
     keyLabel: "Kimi API Key",
-    keyUrl: "https://platform.moonshot.cn/console/api-keys",
+    keyUrl: Utils.PROVIDER_LINKS.kimi.console,
+    pricingUrl: Utils.PROVIDER_LINKS.kimi.pricing,
     keyField: "kimiApiKey",
     models: [
       { value: "kimi-k2.6", label: "Kimi K2.6 · 推荐" },
@@ -335,6 +338,7 @@ const elements = {
   statusProgress: document.getElementById("status-progress"),
   retryFailed: document.getElementById("retry-failed"),
   setupConsoleLink: document.getElementById("setup-console-link"),
+  setupPricingLink: document.getElementById("setup-pricing-link"),
   setupKeySlot: document.getElementById("setup-key-slot"),
   settingsKeySlot: document.getElementById("settings-key-slot"),
   keyEntry: document.getElementById("key-entry"),
@@ -467,6 +471,15 @@ function reconcile(storageSnapshot) {
   if (activeKeyField in applied) {
     keyVerified[activeProvider()] = false;
     providerKeyInvalid = false;
+  }
+  // Any provider's key field arriving from storage invalidates that
+  // provider's cached verifier verdicts (Codex PR #19 P1): the welcome page
+  // or another popup surface may have re-written the credential, so a later
+  // paste/change of the same value re-verifies instead of trusting the cache.
+  for (const providerId of Object.keys(PROVIDER_META)) {
+    if (PROVIDER_META[providerId].keyField in applied) {
+      keyVerifier.forget(providerId);
+    }
   }
   // A key arriving from another surface (welcome page, settings tab) can
   // graduate the popup out of the embedded setup card.
@@ -722,8 +735,10 @@ elements.apiKey.addEventListener("input", () => {
   schedulePersistSettings();
   renderKeyStatus();
 });
-elements.apiKey.addEventListener("change", whenReady(handleApiKeyCommit));
-elements.apiKey.addEventListener("blur", whenReady(handleApiKeyCommit));
+// Codex PR #19 P1: change/blur auto-tests go through the shared verifier as
+// debounced "change"/"blur" triggers — one request per (provider, key).
+elements.apiKey.addEventListener("change", whenReady(() => handleApiKeyCommit("change")));
+elements.apiKey.addEventListener("blur", whenReady(() => handleApiKeyCommit("blur")));
 // Paste → auto-save + auto connection test. The pasted value lands after the
 // default paste action, so run on the next tick.
 elements.apiKey.addEventListener("paste", () => {
@@ -867,11 +882,12 @@ elements.testConnection.addEventListener("click", whenReady(async () => {
   }
 
   // Same tokenized path as paste validation: a newer test (manual or
-  // paste) or any other status supersedes an older completion.
+  // paste) or any other status supersedes an older completion. The manual
+  // click may re-run even when a settled verdict is cached (trigger "click").
   elements.testConnection.disabled = true;
   elements.testConnection.textContent = "正在测试…";
   try {
-    await runKeyConnectionTest();
+    await runKeyConnectionTest("click");
   } finally {
     elements.testConnection.disabled = false;
     elements.testConnection.textContent = "测试 API 连接";
@@ -1036,6 +1052,12 @@ async function initialize() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   currentTab = tabs[0];
 
+  // Restricted detection needs only the tab URL — settle it BEFORE the
+  // storage read and the setup-mode decision below (Codex PR #19 P2-2): a
+  // restricted page must open straight on the main view's cannot-translate
+  // notice, with no flash of the setup card that could stick.
+  pageRestricted = await detectRestrictedPage();
+
   changesDuringRead = {};
   // Read raw (get(null), no defaults): migrateSettings must tell a <=1.3.x
   // store (per-provider key fields absent) from a 1.4 store that merely holds
@@ -1083,8 +1105,8 @@ async function initialize() {
 
   // Restricted pages (chrome://, Web Store, about:, file: without access)
   // can never take the injection: say so up front instead of failing on the
-  // first click, and disable the actions that would only error.
-  pageRestricted = await detectRestrictedPage();
+  // first click, and disable the actions that would only error. Detection
+  // already settled above (before the setup decision); this only renders.
   if (pageRestricted) {
     renderRestrictedNotice();
   }
@@ -1169,13 +1191,19 @@ function applyProviderUi(providerId, { resetModel }) {
 
 // ---- 1.5.0 views: main / setup / settings ----
 
-// #app[data-view] drives which section CSS shows. The settings-tab mode
-// always renders settings (import needs the tab); otherwise an explicit user
-// navigation wins until 返回, and the setup card wins over main while the
-// active provider has no usable key.
+// #app[data-view] drives which section CSS shows. The ONE view decider
+// (Codex PR #19 P2-2): settings (user-opened / settings tab) wins as today,
+// then a RESTRICTED page beats the setup card — a chrome:// page can never
+// take the injection, so with no key it must still open on the MAIN view with
+// the cannot-translate notice and a disabled 翻译此页, never on a setup card
+// whose verification could never be used here. Otherwise setup wins over main
+// while the active provider has no usable key.
 function currentView() {
   if (IS_SETTINGS_TAB || viewState.userOpenedSettings) {
     return "settings";
+  }
+  if (pageRestricted) {
+    return "main";
   }
   return viewState.setupMode ? "setup" : "main";
 }
@@ -1232,16 +1260,23 @@ function renderSetupFeedback(text) {
   return true;
 }
 
-// The setup card's radios mirror the single provider control.
+// The setup card's radios mirror the single provider control. Console and
+// pricing links follow the provider switch (Codex PR #19 P2-4) — both URLs
+// come from the ONE PROVIDER_LINKS table in shared.js, never duplicated
+// literals. #setup-pricing-link is null-safe: the UI agent may not have
+// landed the popup.html edit yet.
 function renderSetupProviderChoice() {
   const provider = activeProvider();
   for (const option of elements.providerOptions) {
     option.setAttribute("aria-checked", option.dataset.provider === provider ? "true" : "false");
   }
+  const meta = PROVIDER_META[provider];
   if (elements.setupConsoleLink) {
-    const meta = PROVIDER_META[provider];
     elements.setupConsoleLink.href = meta.keyUrl;
     elements.setupConsoleLink.textContent = `打开 ${meta.label} 控制台 ↗`;
+  }
+  if (elements.setupPricingLink) {
+    elements.setupPricingLink.href = meta.pricingUrl;
   }
 }
 
@@ -1252,8 +1287,14 @@ function selectProvider(rawProvider) {
   const nextProvider = PROVIDER_META[rawProvider] ? rawProvider : "deepseek";
   // Any unsaved edit of the previous provider's key is already banked in
   // settingsModel.edits by its input events — switching neither loses nor
-  // mixes the two credentials. Drop any in-flight test for the old key.
+  // mixes the two credentials. Drop any in-flight test for the old key, and
+  // abandon the departed provider's verifier state: a still-pending
+  // debounced run for its value must not fire (and bill a stale
+  // TEST_CONNECTION) after the switch (Codex PR #19 P1).
   keyTestOp += 1;
+  if (nextProvider !== activeProvider()) {
+    keyVerifier.forget(activeProvider());
+  }
   if (elements.provider.value !== nextProvider) {
     elements.provider.value = nextProvider;
   }
@@ -1657,11 +1698,65 @@ function revealKeyEntry() {
 
 // ---- Paste → auto-save + auto connection test ----
 
+// The shared key-verification queue (Codex PR #19 P1): paste, change, blur
+// and the manual 测试 button all funnel through ONE gate per (provider, key),
+// so one paste — which fires paste+input+change+blur — bills exactly ONE
+// TEST_CONNECTION instead of up to four. run() keeps today's order: the
+// awaited STABLE save first, then TEST_CONNECTION, so the tested key is the
+// one storage hands the worker.
+const keyVerifier = Utils.createKeyVerifier({
+  run: async (provider, key) => {
+    let settings;
+    try {
+      settings = await saveSettings();
+    } catch (error) {
+      return {
+        ok: false,
+        code: "SAVE_FAILED",
+        error: toFriendlyPageError(error),
+        transient: true
+      };
+    }
+    // The stable save may settle a different key than the one this
+    // verification was asked about (a racing retype/switch): the message is
+    // still sent — the worker judges whatever storage now holds, exactly as
+    // before — but the verdict is marked transient so it is never cached
+    // under the REQUESTED key's identity. reconcile()'s storage echo clears
+    // any settled entry for a changed key anyway.
+    const mismatched = provider !== settings.provider ||
+      String(settings[PROVIDER_META[provider].keyField] || "").trim() !== key;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "TEST_CONNECTION",
+        provider: settings.provider,
+        targetLanguage: settings.targetLanguage,
+        model: settings.model
+      });
+      if (response?.ok) {
+        return mismatched ? { ok: true, transient: true } : { ok: true };
+      }
+      return {
+        ok: false,
+        code: String(response?.code || ""),
+        error: String(response?.error || ""),
+        ...(mismatched ? { transient: true } : {})
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        code: "NETWORK_ERROR",
+        error: toFriendlyPageError(error),
+        transient: true
+      };
+    }
+  }
+});
+
 // Change/blur commits the key edit (immediate persist through the queue).
 // Inside the embedded setup card a format-valid manual edit ALSO auto-runs
 // the connection test (review P2 #15: typed keys deserve the verification
 // pasted ones get); the awaited save happens inside that test.
-async function handleApiKeyCommit() {
+async function handleApiKeyCommit(trigger) {
   persistSettingsNow();
   if (!viewState.setupMode) {
     return;
@@ -1675,7 +1770,7 @@ async function handleApiKeyCommit() {
     renderSetupFeedback(`✗ ${formatReason}`);
     return;
   }
-  await runKeyConnectionTest();
+  await runKeyConnectionTest(trigger);
 }
 
 async function handleApiKeyPasted() {
@@ -1702,18 +1797,31 @@ async function handleApiKeyPasted() {
     }
     return;
   }
-  await runKeyConnectionTest();
+  await runKeyConnectionTest("paste");
 }
 
-async function runKeyConnectionTest() {
-  const label = PROVIDER_META[activeProvider()]?.label || "API";
+// All key-verification triggers (paste / change / blur / manual click) end up
+// here: tokenized status writes (keyTestOp/keyTestPendingOp semantics are
+// unchanged — a newer test, save or status still supersedes an older
+// completion), with the provider request itself deduped by the shared
+// verifier. `keyArg` defaults to the key input's current value.
+async function runKeyConnectionTest(trigger = "click", keyArg = null) {
+  const provider = activeProvider();
+  const key = keyArg !== null ? keyArg : elements.apiKey.value.trim();
+  const label = PROVIDER_META[provider]?.label || "API";
   const op = ++keyTestOp;
   keyTestPendingOp = op;
   if (!renderSetupFeedback(`正在验证 ${label} Key…`)) {
     renderStatus(`正在验证 ${label} Key`, "发送一条最小测试请求", "loading");
   }
   try {
-    await runKeyConnectionTestInner(op, label);
+    const result = await keyVerifier.request(provider, key, { trigger });
+    // A superseded request (a newer value replaced it) or a stale op (a newer
+    // test/status arrived) renders nothing — the newest flow owns the UI.
+    if (result?.superseded || op !== keyTestOp) {
+      return;
+    }
+    renderKeyTestResult(result, provider, key, label);
   } finally {
     if (keyTestPendingOp === op) {
       keyTestPendingOp = 0;
@@ -1724,68 +1832,37 @@ async function runKeyConnectionTest() {
   }
 }
 
-async function runKeyConnectionTestInner(op, label) {
-  let settings;
-  try {
-    // Stable save (all follow-up writes committed) before the network call:
-    // the tested key is the one storage will hand the worker.
-    settings = await saveSettings();
-  } catch (error) {
-    if (op !== keyTestOp) {
-      return;
+function renderKeyTestResult(result, provider, key, label) {
+  if (result?.ok) {
+    keyVerified[provider] = true;
+    providerKeyInvalid = false;
+    setupRejectedKey = "";
+    const wasSetup = viewState.setupMode;
+    // Say it inside the setup card while the setup view still owns the
+    // popup, then graduate — the main view the user lands on answers with
+    // its provider status line ("✓ DeepSeek 已连接").
+    if (!renderSetupFeedback("✓ 已连接")) {
+      renderStatus("Key 有效", `${label} 连接成功，可以开始翻译`, "success");
     }
-    if (!renderSetupFeedback(`✗ 保存设置失败：${toFriendlyPageError(error)}`)) {
-      renderStatus("保存设置失败", toFriendlyPageError(error), "error");
+    if (wasSetup) {
+      viewState.setupMode = false;
+      renderView();
     }
+    renderProviderStatus();
     return;
   }
-  const testedKey = String(settings[PROVIDER_META[settings.provider]?.keyField] || "");
-  try {
-    const response = await chrome.runtime.sendMessage({
-      type: "TEST_CONNECTION",
-      provider: settings.provider,
-      targetLanguage: settings.targetLanguage,
-      model: settings.model
-    });
-    if (op !== keyTestOp) {
-      return;
-    }
-    if (response?.ok) {
-      keyVerified[settings.provider] = true;
-      providerKeyInvalid = false;
-      setupRejectedKey = "";
-      const wasSetup = viewState.setupMode;
-      // Say it inside the setup card while the setup view still owns the
-      // popup, then graduate — the main view the user lands on answers with
-      // its provider status line ("✓ DeepSeek 已连接").
-      if (!renderSetupFeedback("✓ 已连接")) {
-        renderStatus("Key 有效", `${label} 连接成功，可以开始翻译`, "success");
-      }
-      if (wasSetup) {
-        viewState.setupMode = false;
-        renderView();
-      }
-      renderProviderStatus();
-      return;
-    }
-    setupRejectedKey = testedKey;
-    const [title, detail] = friendlyKeyTestFailure(response, label);
-    if (!renderSetupFeedback(`✗ ${title}：${detail}`)) {
-      renderStatus(title, detail, "error");
-    }
-  } catch (error) {
-    if (op !== keyTestOp) {
-      return;
-    }
-    setupRejectedKey = testedKey;
-    if (!renderSetupFeedback(`✗ 网络错误：${toFriendlyPageError(error)}`)) {
-      renderStatus("网络错误", toFriendlyPageError(error), "error");
-    }
+  setupRejectedKey = key;
+  const [title, detail] = friendlyKeyTestFailure(result, label);
+  if (!renderSetupFeedback(`✗ ${title}：${detail}`)) {
+    renderStatus(title, detail, "error");
   }
 }
 
 function friendlyKeyTestFailure(response, label) {
   const code = String(response?.code || "");
+  if (code === "SAVE_FAILED") {
+    return ["保存设置失败", response?.error || "写入本机存储失败，请重试"];
+  }
   if (code === "API_401") {
     return ["Key 无效", `${label} 返回 401：Key 不正确或已失效，请重新复制粘贴`];
   }

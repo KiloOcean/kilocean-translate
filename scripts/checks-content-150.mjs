@@ -390,6 +390,122 @@ return {
     fail("content.js: failure markers must carry data-kilocean-failed-marker");
   }
 
+  // ------------------------------------------------------------------
+  // (P2-3) Failed-marker placement: a marker host may never land where the
+  // HTML content model forbids it (a div directly under tr/tbody/ul/dl…).
+  // resolveMarkerPlacement is the ONE pure decider showFailedMarker uses.
+  // ------------------------------------------------------------------
+  {
+    const markerSrc = extract("showFailedMarker") || "";
+    if (!/resolveMarkerPlacement\(/.test(markerSrc)) {
+      fail("content.js: showFailedMarker must place its marker host through resolveMarkerPlacement()");
+    }
+    if (/block\.parentNode\.insertBefore\(\s*host/.test(markerSrc)) {
+      fail("content.js: showFailedMarker must not insert the marker host as a raw sibling of the block (restricted parents break)");
+    }
+    const setOf = (name) => {
+      const match = contentRaw.match(new RegExp(`const ${name} = new Set\\([\\s\\S]*?\\]\\);`));
+      return match ? match[0] : null;
+    };
+    const insideSetSrc = setOf("MARKER_HOST_INSIDE_TAGS");
+    const forbiddenSetSrc = setOf("MARKER_SIBLING_FORBIDDEN_PARENTS");
+    const placementSrc = extract("resolveMarkerPlacement");
+    if (!insideSetSrc || !forbiddenSetSrc || !placementSrc) {
+      fail("content.js: cannot extract MARKER_HOST_INSIDE_TAGS/MARKER_SIBLING_FORBIDDEN_PARENTS/resolveMarkerPlacement for placement test");
+    } else {
+      // The restricted slots and containers the decider must know about.
+      for (const tag of ["TD", "TH", "CAPTION", "LI", "DT", "DD"]) {
+        if (!insideSetSrc.includes(`"${tag}"`)) {
+          fail(`content.js: MARKER_HOST_INSIDE_TAGS must contain ${tag} (a marker sibling is invalid there)`);
+        }
+      }
+      for (const tag of ["TR", "TABLE", "THEAD", "TBODY", "TFOOT", "UL", "OL", "DL", "SELECT", "COLGROUP"]) {
+        if (!forbiddenSetSrc.includes(`"${tag}"`)) {
+          fail(`content.js: MARKER_SIBLING_FORBIDDEN_PARENTS must contain ${tag} (no marker div may sit directly under it)`);
+        }
+      }
+      // Drive the REAL extracted decider with plain-object blocks.
+      let placement;
+      try {
+        placement = new Function(
+          `${insideSetSrc}\n${forbiddenSetSrc}\n${placementSrc}\nreturn resolveMarkerPlacement;`
+        )();
+      } catch (error) {
+        fail(`content.js: resolveMarkerPlacement is not runnable standalone: ${error.message}`);
+      }
+      if (typeof placement === "function") {
+        const fakeParent = (tag) => ({ nodeType: 1, tagName: tag });
+        const afterSibling = {};
+        const cases = [
+          {
+            label: "TD under TR hosts the marker inside the cell",
+            block: { tagName: "TD", parentNode: fakeParent("TR"), nextSibling: afterSibling },
+            expected: { parent: "block", before: null, tag: "span" }
+          },
+          {
+            label: "TH under TR hosts the marker inside the cell",
+            block: { tagName: "TH", parentNode: fakeParent("TR"), nextSibling: afterSibling },
+            expected: { parent: "block", before: null, tag: "span" }
+          },
+          {
+            label: "LI under UL hosts the marker inside the item",
+            block: { tagName: "LI", parentNode: fakeParent("UL"), nextSibling: afterSibling },
+            expected: { parent: "block", before: null, tag: "span" }
+          },
+          {
+            label: "DT under DL hosts the marker inside the term",
+            block: { tagName: "DT", parentNode: fakeParent("DL"), nextSibling: afterSibling },
+            expected: { parent: "block", before: null, tag: "span" }
+          },
+          {
+            label: "CAPTION under TABLE hosts the marker inside",
+            block: { tagName: "CAPTION", parentNode: fakeParent("TABLE"), nextSibling: afterSibling },
+            expected: { parent: "block", before: null, tag: "span" }
+          },
+          {
+            label: "a block whose parent is TR goes inside even when the block itself is unrestricted",
+            block: { tagName: "DIV", parentNode: fakeParent("TR"), nextSibling: afterSibling },
+            expected: { parent: "block", before: null, tag: "span" }
+          },
+          {
+            label: "a block whose parent is TBODY goes inside",
+            block: { tagName: "P", parentNode: fakeParent("TBODY"), nextSibling: afterSibling },
+            expected: { parent: "block", before: null, tag: "span" }
+          },
+          {
+            label: "a block whose parent is UL goes inside",
+            block: { tagName: "P", parentNode: fakeParent("UL"), nextSibling: afterSibling },
+            expected: { parent: "block", before: null, tag: "span" }
+          },
+          {
+            label: "P under DIV keeps the sibling div after the block",
+            block: { tagName: "P", parentNode: fakeParent("DIV"), nextSibling: afterSibling },
+            expected: { parent: "parentNode", before: afterSibling, tag: "div" }
+          }
+        ];
+        for (const { label, block, expected } of cases) {
+          const got = placement(block);
+          const parentKey = got.parent === block
+            ? "block"
+            : got.parent === block.parentNode ? "parentNode" : "other";
+          const okShape = parentKey === expected.parent &&
+            got.before === expected.before &&
+            got.tag === expected.tag;
+          if (!okShape) {
+            fail(`content.js: marker placement — ${label}: expected ${JSON.stringify({ parent: expected.parent, before: expected.before, tag: expected.tag })}, got ${JSON.stringify({ parent: parentKey, before: got.before, tag: got.tag })}`);
+          }
+        }
+        // A last-child block (nextSibling null) still appends as a sibling
+        // after it — insertBefore(host, null) appends.
+        const lastP = { tagName: "P", parentNode: fakeParent("SECTION"), nextSibling: null };
+        const gotLast = placement(lastP);
+        if (gotLast.parent !== lastP.parentNode || gotLast.before !== null || gotLast.tag !== "div") {
+          fail("content.js: marker placement — a last-child block appends the div sibling after itself");
+        }
+      }
+    }
+  }
+
   // Progress pill reads the REAL counters.
   const renderPillSrc = extract("renderProgressPill");
   const updatePillSrc = extract("updateProgressPill");

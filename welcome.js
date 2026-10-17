@@ -1,19 +1,44 @@
 /* 千浩翻译 1.5.0 — welcome / onboarding page logic.
  * Talks to background only through chrome.runtime.sendMessage;
- * writes only the key-related storage fields (never logs keys). */
+ * writes only the key-related storage fields (never logs keys).
+ * Requires shared.js (loaded first by welcome.html): the shared key
+ * verifier dedupes TEST_CONNECTION so one paste bills exactly one request. */
 (function () {
   "use strict";
+
+  const Utils = globalThis.DeepSeekTranslatorUtils;
+
+  const $ = (selector) => document.querySelector(selector);
+
+  // welcome.html loads shared.js before welcome.js; if it is missing the page
+  // must fail loudly in the DOM (never silently, and without console) — every
+  // verification path below depends on it.
+  if (!Utils || typeof Utils.createKeyVerifier !== "function" || !Utils.PROVIDER_LINKS) {
+    const reasons = [
+      [$("#s2-msg"), "扩展文件加载不完整（shared.js 未加载），请回到 chrome://extensions 重新加载扩展后重开本页"],
+      [$("#s3-msg"), "扩展文件加载不完整，无法试翻。请重新加载扩展后重开本页"]
+    ];
+    for (const [el, text] of reasons) {
+      if (el) {
+        el.textContent = text;
+        el.className = "msg er";
+      }
+    }
+    return;
+  }
 
   const PROVIDERS = {
     deepseek: {
       name: "DeepSeek",
-      consoleUrl: "https://platform.deepseek.com/api_keys",
+      consoleUrl: Utils.PROVIDER_LINKS.deepseek.console,
+      pricingUrl: Utils.PROVIDER_LINKS.deepseek.pricing,
       model: "deepseek-flash",
       keyField: "deepseekApiKey"
     },
     kimi: {
       name: "Kimi",
-      consoleUrl: "https://platform.moonshot.cn/console/api-keys",
+      consoleUrl: Utils.PROVIDER_LINKS.kimi.console,
+      pricingUrl: Utils.PROVIDER_LINKS.kimi.pricing,
       model: "kimi-k2.6",
       keyField: "kimiApiKey"
     }
@@ -24,8 +49,6 @@
     "Small tide pools lose heat quickly, yet anemones and crabs remain active beneath thin ice. " +
     "A pool only thirty centimetres deeper can hold enough heat through the longest nights.";
 
-  const $ = (selector) => document.querySelector(selector);
-
   const els = {
     steps: [...document.querySelectorAll("#steps li")],
     views: [$("#step-1"), $("#step-2"), $("#step-3")],
@@ -34,6 +57,7 @@
     s1Skip: $("#s1-skip"),
     s2Title: $("#s2-title"),
     s2Console: $("#s2-console"),
+    s2Pricing: $("#welcome-pricing-link"),
     s2Field: $("#s2-field"),
     s2Key: $("#s2-key"),
     s2Msg: $("#s2-msg"),
@@ -57,7 +81,11 @@
 
   let provider = "deepseek";
   let verified = false;
-  let verifyToken = 0;
+  // The key this step-2 "verified" state came from: the pasted key itself, or
+  // null when an already-stored key was accepted (P2-1: only a NEWLY pasted
+  // key is rewritten on persist; an accepted stored key only flips the
+  // provider/model/mirror).
+  let verifiedKey = null;
 
   /* ---------- step tracker ---------- */
   function showStep(step) {
@@ -104,6 +132,12 @@
 
   /* ---------- step 1: provider ---------- */
   function selectProvider(next) {
+    if (provider !== next) {
+      // Abandon the departed provider's verification state entirely: a
+      // still-pending debounced run for its value must not fire (and bill a
+      // stale TEST_CONNECTION) after the switch.
+      keyVerifier.forget(provider);
+    }
     provider = next in PROVIDERS ? next : "deepseek";
     els.providerButtons.forEach((button) => {
       button.setAttribute("aria-checked", button.dataset.provider === provider ? "true" : "false");
@@ -112,10 +146,13 @@
     els.s2Title.textContent = `连接 ${meta.name}`;
     els.s2Console.textContent = `打开 ${meta.name} 控制台 ↗`;
     els.s2Console.href = meta.consoleUrl;
+    if (els.s2Pricing) {
+      els.s2Pricing.href = meta.pricingUrl;
+    }
     els.s2Key.value = "";
     els.s2Field.classList.remove("err");
     setKeyMessage("", "");
-    setVerified(false);
+    setVerified(false, null);
     checkExistingKey();
   }
 
@@ -133,8 +170,9 @@
     els.s2Msg.className = tone ? `msg ${tone}` : "msg";
   }
 
-  function setVerified(ok) {
+  function setVerified(ok, key) {
     verified = ok;
+    verifiedKey = ok ? key : null;
     els.s2Next.disabled = !ok;
   }
 
@@ -163,84 +201,157 @@
     }
   }
 
-  async function verifyKey(key) {
-    const token = ++verifyToken;
-    const meta = PROVIDERS[provider];
+  async function readStoredKey(keyProvider) {
+    if (!canStore) {
+      return "";
+    }
+    const meta = PROVIDERS[keyProvider];
+    try {
+      const stored = await chrome.storage.local.get(meta.keyField);
+      const value = stored && stored[meta.keyField];
+      return typeof value === "string" ? value.trim() : "";
+    } catch {
+      return "";
+    }
+  }
 
-    els.s2Field.classList.remove("err");
-    setKeyMessage("验证中…", "");
-    els.s2Msg.innerHTML = '<span class="spin" aria-hidden="true"></span> 正在保存并验证…';
+  /* P2-1: ONE function persists a verified provider choice in ONE
+   * chrome.storage.local.set — provider, that provider's default model, the
+   * key (+ legacy apiKey mirror) when it was newly pasted, and a verified
+   * flag. Atomically, so background loadSettings (the sample translation) and
+   * the popup both see the chosen provider with a matching model + key. */
+  async function persistVerifiedProvider(chosenProvider, newlyPastedKey = null) {
+    if (!canStore) {
+      return;
+    }
+    const meta = PROVIDERS[chosenProvider];
+    const storedKey = newlyPastedKey || (await readStoredKey(chosenProvider));
+    const patch = {
+      provider: chosenProvider,
+      model: meta.model,
+      keyVerified: true,
+      apiKey: storedKey
+    };
+    if (newlyPastedKey) {
+      patch[meta.keyField] = newlyPastedKey;
+    }
+    await chrome.storage.local.set(patch);
+  }
 
+  /* The shared verifier's run(): save the key first (TEST_CONNECTION bills
+   * the key from storage), then ask the background to verify it. Returns the
+   * verdict object; never throws. */
+  async function runKeyVerification(keyProvider, key) {
+    const meta = PROVIDERS[keyProvider];
     if (canStore) {
       try {
         await chrome.storage.local.set({
-          provider,
+          provider: keyProvider,
           model: meta.model,
           [meta.keyField]: key,
           apiKey: key
         });
       } catch {
-        if (token !== verifyToken) return;
-        setKeyMessage("保存失败，请重试", "er");
-        return;
+        return { ok: false, code: "WELCOME_SAVE_FAILED", error: "保存失败，请重试", transient: true };
       }
     }
-
     if (!canMessage) {
-      if (token !== verifyToken) return;
-      setKeyMessage("已保存（当前环境无法验证，请在扩展弹窗里测试连接）", "");
-      setVerified(true);
-      return;
+      return { ok: true, environmentSkipped: true };
     }
-
     try {
       const targetLanguage = await readTargetLanguage();
       const response = await chrome.runtime.sendMessage({
         type: "TEST_CONNECTION",
-        provider,
+        provider: keyProvider,
         model: meta.model,
         targetLanguage
       });
-      if (token !== verifyToken) return;
       if (response && response.ok) {
-        setKeyMessage(`✓ 已连接 · 尾号 ${key.slice(-4)} · 已保存`, "ok");
-        setVerified(true);
-      } else {
-        const reason = (response && response.error) || "连接失败，请稍后重试";
-        setKeyMessage(`✕ ${reason}`, "er");
-        setVerified(false);
+        return { ok: true };
       }
+      return {
+        ok: false,
+        code: String((response && response.code) || ""),
+        error: String((response && response.error) || "连接失败，请稍后重试")
+      };
     } catch (error) {
-      if (token !== verifyToken) return;
-      setKeyMessage(`✕ ${error && error.message ? error.message : "网络错误，请稍后重试"}`, "er");
-      setVerified(false);
+      return {
+        ok: false,
+        code: "NETWORK_ERROR",
+        error: (error && error.message) || "网络错误，请稍后重试",
+        transient: true
+      };
     }
   }
 
-  function handleKeyInput() {
+  // Codex PR #19 P1: every key check goes through the shared verifier, so the
+  // paste+input+change+blur burst one paste produces bills exactly ONE
+  // TEST_CONNECTION, and rapid typing collapses into one debounced run.
+  const keyVerifier = Utils.createKeyVerifier({
+    run: runKeyVerification,
+    debounceMs: 600
+  });
+
+  function setKeyMessageFromResult(result, key) {
+    if (result && result.ok) {
+      if (result.environmentSkipped) {
+        setKeyMessage("已保存（当前环境无法验证，请在扩展弹窗里测试连接）", "");
+      } else {
+        setKeyMessage(`✓ 已连接 · 尾号 ${key.slice(-4)} · 已保存`, "ok");
+      }
+      setVerified(true, key);
+    } else {
+      const reason = (result && result.error) || "连接失败，请稍后重试";
+      setKeyMessage(`✕ ${reason}`, "er");
+      setVerified(false, null);
+    }
+  }
+
+  async function handleKeyInput(trigger) {
+    const keyProvider = provider;
     const key = els.s2Key.value.trim();
     if (!key) {
       els.s2Field.classList.remove("err");
       setKeyMessage("粘贴后立即自动保存并验证", "");
-      setVerified(false);
+      setVerified(false, null);
       return;
     }
     const formatError = validateKeyFormat(key);
     if (formatError) {
-      verifyToken += 1;
+      // Format errors stay local: no storage write, no network request.
       els.s2Field.classList.add("err");
       setKeyMessage(`✕ ${formatError}`, "er");
-      setVerified(false);
+      setVerified(false, null);
       return;
     }
-    verifyKey(key);
+    els.s2Field.classList.remove("err");
+    els.s2Msg.className = "msg";
+    els.s2Msg.innerHTML = '<span class="spin" aria-hidden="true"></span> 正在保存并验证…';
+    const result = await keyVerifier.request(keyProvider, key, { trigger });
+    if (result && result.superseded) {
+      return;
+    }
+    if (provider !== keyProvider) {
+      // The user switched provider while this verification was in flight —
+      // the verdict describes the departed provider; selectProvider already
+      // reset the field and the verified state. Never persist another
+      // provider's key under the new choice.
+      return;
+    }
+    if (result && result.ok && !result.environmentSkipped) {
+      // Verified: persist the chosen provider atomically (P2-1) before the
+      // confirmation message lands.
+      await persistVerifiedProvider(keyProvider, key);
+    }
+    setKeyMessageFromResult(result, key);
   }
 
-  els.s2Key.addEventListener("paste", () => setTimeout(handleKeyInput, 0));
-  els.s2Key.addEventListener("change", handleKeyInput);
+  els.s2Key.addEventListener("paste", () => setTimeout(() => handleKeyInput("paste"), 0));
+  els.s2Key.addEventListener("input", () => handleKeyInput("input"));
+  els.s2Key.addEventListener("change", () => handleKeyInput("change"));
   els.s2Key.addEventListener("blur", () => {
     if (els.s2Key.value.trim()) {
-      handleKeyInput();
+      handleKeyInput("blur");
     }
   });
 
@@ -252,19 +363,35 @@
     try {
       const stored = await chrome.storage.local.get(meta.keyField);
       const existing = stored && stored[meta.keyField];
-      if (existing && typeof existing === "string" && existing.length >= 4) {
+      // A value in the input means the user is already pasting/typing their
+      // own key — never let a slow storage read overwrite their in-flight
+      // verification with the stored-key shortcut.
+      if (existing && typeof existing === "string" && existing.length >= 4 && !els.s2Key.value.trim()) {
         setKeyMessage(`已配置 · 尾号 ${existing.slice(-4)}（可直接继续，或粘贴新 Key 替换）`, "ok");
-        setVerified(true);
+        setVerified(true, null);
       }
     } catch {
       // Ignore — the user can still paste a key.
     }
   }
 
-  els.s2Next.addEventListener("click", () => {
-    if (verified) {
-      showStep(3);
+  els.s2Next.addEventListener("click", async () => {
+    if (!verified) {
+      return;
     }
+    // An already-stored key was accepted for the selected provider: persist
+    // the provider switch (provider + default model + mirror + verified flag)
+    // in ONE write before step 3 samples it (a pasted key already persisted
+    // at verification time — nothing to repeat).
+    if (verifiedKey === null) {
+      try {
+        await persistVerifiedProvider(provider, null);
+      } catch {
+        setKeyMessage("保存失败，请重试", "er");
+        return;
+      }
+    }
+    showStep(3);
   });
   els.s2Skip.addEventListener("click", () => showStep(3));
 
