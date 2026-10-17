@@ -690,6 +690,30 @@
     return /^(?:API_)?5\d\d$/.test(code);
   }
 
+  // Per-provider key-verification status (Codex PR #19 P2): "verified" |
+  // "failed" | "unverified", stored per provider as <provider>KeyStatus. A
+  // status is only meaningful for the exact key it was computed on, so it is
+  // always written next to <provider>KeyStatusFor — a non-secret fingerprint
+  // (length + last 4 chars, only for key-shaped values; never the full key).
+  // A fingerprint mismatch (or a missing status — every 1.4.3 upgrade) reads
+  // back as "unverified".
+  function keyFingerprint(key) {
+    const value = String(key || "");
+    const tail = value.length >= 8 ? value.slice(-4) : "";
+    return tail ? `${value.length}:${tail}` : String(value.length);
+  }
+
+  // The storage-field patch that carries a provider's verification status for
+  // `key`: same-set() companions so a key value and its status can never land
+  // apart (a key write always resets the status to "unverified"; a test
+  // verdict then overwrites it with "verified"/"failed").
+  function keyStatusPatch(provider, status, key) {
+    return {
+      [`${provider}KeyStatus`]: status,
+      [`${provider}KeyStatusFor`]: keyFingerprint(key)
+    };
+  }
+
   // One paste into a key field fires paste + input + change + blur, and each
   // handler used to run its own TEST_CONNECTION — a single pasted key could
   // bill up to four provider requests (Codex PR #19 P1). createKeyVerifier is
@@ -946,6 +970,8 @@
     isTimeoutError,
     createFetchTimeoutError,
     createKeyVerifier,
-    isTransientKeyVerdict
+    isTransientKeyVerdict,
+    keyFingerprint,
+    keyStatusPatch
   };
 });

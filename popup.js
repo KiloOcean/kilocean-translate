@@ -188,15 +188,24 @@ function parseImportedSettings(parsed) {
 
 // ---- Settings/key state model (pure core, DOM-free) ----
 
-// Storage fields the settings controls map to. The legacy apiKey mirror is
-// derived (the active provider's key) and never reconciled into a control.
+// Storage fields the settings state tracks. The key-status rows map to the
+// per-provider verification fields (<provider>KeyStatus / <provider>KeyStatusFor,
+// Codex PR #19 P2): they reconcile into the snapshot like every other field
+// but map to no editable control and never enter model.edits, so no save
+// ever writes them (the queue's verdict write owns them). The legacy apiKey
+// mirror is derived (the active provider's key) and never reconciled into a
+// control.
 const SETTINGS_FIELDS = [
   "provider",
   "deepseekApiKey",
   "kimiApiKey",
   "model",
   "targetLanguage",
-  "displayMode"
+  "displayMode",
+  "deepseekKeyStatus",
+  "deepseekKeyStatusFor",
+  "kimiKeyStatus",
+  "kimiKeyStatusFor"
 ];
 
 // Pure core of reconcile(): merge a storage view (a fresh full read or an
@@ -234,6 +243,10 @@ function reconcileModel(model, storageSnapshot) {
 // mirror follows the active provider's key whenever a provider/key field is
 // written — including a write to "" (clearing the last key must clear the
 // mirror too, or the next load would resurrect the key as a legacy apiKey).
+// A written key value always carries its provider's verification status
+// reset to "unverified" in the SAME patch (Codex PR #19 P2): the new key has
+// not been judged yet, and the fingerprint keeps an older verdict from
+// attaching to it.
 function collectDirtyPatch(model, controlValues) {
   const patch = {};
   const fields = [];
@@ -253,6 +266,11 @@ function collectDirtyPatch(model, controlValues) {
   // legacy mirror.
   if ("provider" in patch || "deepseekApiKey" in patch || "kimiApiKey" in patch) {
     patch.apiKey = controlValues[PROVIDER_META[provider].keyField] ?? model.snapshot[PROVIDER_META[provider].keyField];
+  }
+  for (const [providerId, meta] of Object.entries(PROVIDER_META)) {
+    if (meta.keyField in patch) {
+      Object.assign(patch, Utils.keyStatusPatch(providerId, "unverified", patch[meta.keyField]));
+    }
   }
   return { patch, fields, savedValues };
 }
@@ -369,12 +387,17 @@ let pendingSelection = null;
 // one stays open. userOpenedSettings keeps the settings view up until
 // #back-main returns to whatever view was underneath.
 const viewState = { setupMode: false, userOpenedSettings: false };
-// Per-provider "verified this session" flag for the provider status line
-// (已配置 → 已连接 after a successful connection test).
+// Per-provider "verified this session" flag: a successful connection test in
+// THIS popup renders the connected state immediately (the persisted verdict
+// lands in the per-provider <provider>KeyStatus fields via the write queue).
 const keyVerified = { deepseek: false, kimi: false };
 // A page translation error that looks like a key problem (401 / Key 无效)
 // flips the provider status line into its actionable error state.
 let providerKeyInvalid = false;
+// What clicking the provider status line does for its CURRENT rendering:
+// "settings" opens the settings view at the key input, "test" (the
+// unverified/failed states, Codex PR #19 P2) re-runs the connection test.
+let providerStatusAction = "settings";
 // The key whose connection test FAILED while setup owned the popup. Leaving
 // setup requires a key that is format-valid AND not this one — an external
 // arrival of a DIFFERENT key may still graduate the popup.
@@ -414,6 +437,35 @@ function providerKeyValue(provider) {
   return field in settingsModel.edits
     ? String(settingsModel.edits[field] || "").trim()
     : String(settingsModel.snapshot[field] || "").trim();
+}
+
+// Effective verification status of a provider's CURRENT key value (Codex PR
+// #19 P2): "missing" with no key; "verified" when a connection test succeeded
+// for it this session or the persisted status says so; "failed" only when the
+// persisted "failed" was computed on this exact key; "unverified" otherwise —
+// a pending edit, a missing status field (every 1.4.3 upgrade) and any
+// fingerprint mismatch all read back as "unverified", because a status is
+// only valid for the key it was computed on.
+function keyVerificationStatus(provider) {
+  const meta = PROVIDER_META[provider];
+  const key = providerKeyValue(provider);
+  if (!key) {
+    return "missing";
+  }
+  if (keyVerified[provider]) {
+    return "verified";
+  }
+  if (meta.keyField in settingsModel.edits) {
+    return "unverified";
+  }
+  const status = settingsModel.snapshot[`${provider}KeyStatus`];
+  if (
+    (status === "verified" || status === "failed") &&
+    settingsModel.snapshot[`${provider}KeyStatusFor`] === Utils.keyFingerprint(key)
+  ) {
+    return status;
+  }
+  return "unverified";
 }
 
 // One value per tracked field, read from the controls. The single key input
@@ -671,16 +723,50 @@ if (elements.backMain) {
   });
 }
 if (elements.providerStatus) {
-  // The one-line provider status doubles as the error state's 更新 Key action:
-  // clicking it opens the settings view with the key input focused.
-  elements.providerStatus.addEventListener("click", () => {
-    openSettingsView({ focusKey: true });
-  });
+  // The one-line provider status doubles as an action line: in its error
+  // state (Key 无效) clicking it opens the settings view with the key input
+  // focused, and in its unverified state it re-runs the connection test in
+  // place (Codex PR #19 P2). The test reads settings and writes the verdict
+  // status, so the whole handler runs behind the init gate — never against
+  // the pre-init DEFAULT_SETTINGS snapshot.
+  elements.providerStatus.addEventListener("click", whenReady(async () => {
+    if (providerStatusAction !== "test") {
+      openSettingsView({ focusKey: true });
+      return;
+    }
+    const key = elements.apiKey.value.trim();
+    if (!key || key !== providerKeyValue(activeProvider())) {
+      openSettingsView({ focusKey: true });
+      return;
+    }
+    elements.providerStatus.disabled = true;
+    try {
+      await runKeyConnectionTest("click");
+    } finally {
+      elements.providerStatus.disabled = false;
+    }
+  }));
 }
 if (elements.openShortcuts) {
   elements.openShortcuts.addEventListener("click", () => {
     void chrome.tabs.create({ url: "chrome://extensions/shortcuts" });
   });
+}
+if (elements.setupFeedback) {
+  // The setup card's 上次验证失败 message doubles as the re-test link
+  // (Codex PR #19 P2): clicking it re-runs the connection test for the key
+  // input's current value. Gated on init — the test reads settings and writes
+  // the verdict status through the queue.
+  elements.setupFeedback.addEventListener("click", whenReady(async () => {
+    if (currentView() !== "setup" || elements.setupFeedback.dataset.retest !== "true") {
+      return;
+    }
+    const key = elements.apiKey.value.trim();
+    if (!key || apiKeyFormatReason(key)) {
+      return;
+    }
+    await runKeyConnectionTest("click");
+  }));
 }
 
 // Persist settings as the user edits so selection translate reads fresh storage
@@ -726,14 +812,22 @@ function persistSettingsInBackground() {
 
 // Not whenReady-gated (allowlisted): banking the edit pre-init is exactly
 // what must happen — a dirty field survives init's reconcile, and
-// initialize() flushes banked edits at its end. Only the SAVE is gated
-// (change/blur/paste below).
+// initialize() flushes banked edits at its end. Only the SAVE and the
+// verification request are gated (change/blur/paste below).
 elements.apiKey.addEventListener("input", () => {
   // Any edit invalidates an in-flight connection test for the old value.
   keyTestOp += 1;
   markKeyEdit();
   schedulePersistSettings();
   renderKeyStatus();
+  // PR #19 follow-up: typing a format-valid value asks for its (debounced)
+  // verification — the request itself waits for init inside; the synchronous
+  // banking above is unchanged and is what pre-init edits rely on.
+  void whenReady(() => {
+    if (!apiKeyFormatReason(elements.apiKey.value)) {
+      runKeyConnectionTest("input");
+    }
+  })();
 });
 // Codex PR #19 P1: change/blur auto-tests go through the shared verifier as
 // debounced "change"/"blur" triggers — one request per (provider, key).
@@ -1093,11 +1187,19 @@ async function initialize() {
 
   // 1.5.0 embedded setup: without a key for the ACTIVE provider the popup
   // opens as the two-step setup card — no translate button to click into an
-  // error, and no idle status line. With a key it opens as the main view.
-  viewState.setupMode = !providerKeyValue(activeProvider());
+  // error, and no idle status line. So does a key whose LAST persisted
+  // verification failed (Codex PR #19 P2): translate must stay unreachable
+  // until the key is replaced or re-verified. With a (mere) unverified key it
+  // opens as the main view, whose provider line offers a one-click re-test.
+  viewState.setupMode =
+    !providerKeyValue(activeProvider()) ||
+    keyVerificationStatus(activeProvider()) === "failed";
   setupRejectedKey = "";
   renderView();
   renderStaticInfo();
+  if (viewState.setupMode && keyVerificationStatus(activeProvider()) === "failed") {
+    renderStoredKeyFailure();
+  }
 
   if (!currentTab?.id) {
     throw new Error("找不到当前标签页");
@@ -1113,22 +1215,37 @@ async function initialize() {
 
   try {
     await ensureContentScript(currentTab.id);
-    const response = await chrome.tabs.sendMessage(currentTab.id, { type: "GET_STATUS" });
-    if (response?.ok) {
-      // Prefer chrome.storage (already loaded above). Fresh injects answer GET_STATUS
-      // before their storage callback, so adopting content's default would clobber
-      // the user's saved displayMode. Only sync from content when translation is active.
-      if (response.status.active && response.status.displayMode) {
-        currentDisplayMode = Utils.normalizeDisplayMode(response.status.displayMode);
-        renderDisplayMode();
-      }
-      renderTranslationStatus(response.status);
-      if (response.status.active) {
-        startStatusPolling();
-      }
-    }
   } catch {
-    // Restricted pages cannot be injected.
+    // Injection refused: without the tabs permission the popup could not read
+    // the URL, so a chrome:// / store / file: page may have passed the URL
+    // probe above — but executeScript (and the PING before it) refusing is
+    // definitive. Mark the page restricted from behavior: the cannot-translate
+    // notice renders in the MAIN view and 翻译此页 disables, and restricted
+    // keeps winning over setup in currentView(), so a no-key popup shows the
+    // notice instead of a setup card whose verification could never be used.
+    pageRestricted = true;
+    renderView();
+    renderRestrictedNotice();
+  }
+  if (!pageRestricted) {
+    try {
+      const response = await chrome.tabs.sendMessage(currentTab.id, { type: "GET_STATUS" });
+      if (response?.ok) {
+        // Prefer chrome.storage (already loaded above). Fresh injects answer GET_STATUS
+        // before their storage callback, so adopting content's default would clobber
+        // the user's saved displayMode. Only sync from content when translation is active.
+        if (response.status.active && response.status.displayMode) {
+          currentDisplayMode = Utils.normalizeDisplayMode(response.status.displayMode);
+          renderDisplayMode();
+        }
+        renderTranslationStatus(response.status);
+        if (response.status.active) {
+          startStatusPolling();
+        }
+      }
+    } catch {
+      // PING answered, so the page is not restricted; GET_STATUS trouble is inert.
+    }
   }
 
   await refreshPendingSelection();
@@ -1245,6 +1362,13 @@ function evaluateSetupExit() {
   if (!key || apiKeyFormatReason(key) || key === setupRejectedKey) {
     return;
   }
+  // A stored "failed" verdict for this exact key keeps the setup card up
+  // (Codex PR #19 P2): the key was proven bad and the translate button must
+  // stay unreachable until the key is replaced or re-verified.
+  if (keyVerificationStatus(activeProvider()) === "failed") {
+    renderStoredKeyFailure();
+    return;
+  }
   viewState.setupMode = false;
   renderView();
 }
@@ -1257,7 +1381,21 @@ function renderSetupFeedback(text) {
     return false;
   }
   elements.setupFeedback.textContent = text;
+  // Any newer message replaces the stored-failure re-test affordance (its
+  // click handler keys off data-retest).
+  delete elements.setupFeedback.dataset.retest;
   return true;
+}
+
+// The setup card's message for a key whose LAST persisted verification failed
+// (Codex PR #19 P2): the popup reopened straight into setup for it, with the
+// message itself as the one-click re-test link.
+function renderStoredKeyFailure() {
+  if (currentView() !== "setup" || !elements.setupFeedback) {
+    return;
+  }
+  elements.setupFeedback.textContent = "上次验证失败：请重新粘贴或重新测试";
+  elements.setupFeedback.dataset.retest = "true";
 }
 
 // The setup card's radios mirror the single provider control. Console and
@@ -1333,12 +1471,29 @@ function renderProviderStatus() {
   const meta = PROVIDER_META[provider];
   const key = providerKeyValue(provider);
   if (providerKeyInvalid) {
+    providerStatusAction = "settings";
     elements.providerStatus.dataset.tone = "error";
     elements.providerStatusLabel.textContent = `${meta.label} Key 无效 · 点此更新`;
   } else if (key) {
-    elements.providerStatus.dataset.tone = "ok";
-    elements.providerStatusLabel.textContent = `✓ ${meta.label} ${keyVerified[provider] ? "已连接" : "已配置"}`;
+    const status = keyVerificationStatus(provider);
+    if (status === "verified") {
+      providerStatusAction = "settings";
+      elements.providerStatus.dataset.tone = "ok";
+      elements.providerStatusLabel.textContent = `✓ ${meta.label} 已连接`;
+    } else {
+      // Unverified (no test yet — including every 1.4.3 upgrade with no
+      // status field) or a stored failed verdict: the key was never (or not
+      // currently) proven, so the line offers the re-test instead of a
+      // configured-ok claim (Codex PR #19 P2).
+      providerStatusAction = "test";
+      elements.providerStatus.dataset.tone = "warn";
+      elements.providerStatusLabel.textContent =
+        status === "failed"
+          ? `${meta.label} Key 验证失败 · 点此重新测试`
+          : `${meta.label} Key 未验证 · 点此重新测试`;
+    }
   } else {
+    providerStatusAction = "settings";
     elements.providerStatus.dataset.tone = "missing";
     elements.providerStatusLabel.textContent = `${meta.label} 未配置 · 点此填写`;
   }
@@ -1670,13 +1825,24 @@ function renderKeyStatus() {
     }
     const key = providerKeyValue(id);
     row.dataset.active = id === provider ? "true" : "false";
-    if (key) {
-      const tail = keyTail(key);
-      value.textContent = tail ? `已配置 · 尾号 ${tail}` : "已配置";
-      row.dataset.tone = "ok";
-    } else {
+    if (!key) {
       value.textContent = "未配置";
       row.dataset.tone = "missing";
+      continue;
+    }
+    const tail = keyTail(key);
+    const status = keyVerificationStatus(id);
+    if (status === "verified") {
+      value.textContent = tail ? `已连接 · 尾号 ${tail}` : "已连接";
+      row.dataset.tone = "ok";
+    } else if (status === "failed") {
+      value.textContent = tail ? `验证失败 · 尾号 ${tail}` : "验证失败";
+      row.dataset.tone = "error";
+    } else {
+      // No successful test on record for this exact key — including every
+      // 1.4.3 upgrade store with no status field (Codex PR #19 P2).
+      value.textContent = tail ? `未验证 · 尾号 ${tail}` : "未验证";
+      row.dataset.tone = "warn";
     }
   }
   const activeKey = providerKeyValue(provider);
@@ -1718,13 +1884,17 @@ const keyVerifier = Utils.createKeyVerifier({
       };
     }
     // The stable save may settle a different key than the one this
-    // verification was asked about (a racing retype/switch): the message is
-    // still sent — the worker judges whatever storage now holds, exactly as
-    // before — but the verdict is marked transient so it is never cached
-    // under the REQUESTED key's identity. reconcile()'s storage echo clears
-    // any settled entry for a changed key anyway.
+    // verification was asked about (a racing retype/switch). PR #19 follow-up:
+    // the save and the test must describe the SAME value, so the run stops
+    // here — testing whatever storage now holds would bill a request whose
+    // verdict describes no live identity, and the newer value runs (and is
+    // tested) on its own trigger. This transient non-verdict is never cached,
+    // and the caller's staleness checks discard it.
     const mismatched = provider !== settings.provider ||
       String(settings[PROVIDER_META[provider].keyField] || "").trim() !== key;
+    if (mismatched) {
+      return { ok: false, code: "KEY_SUPERSEDED", error: "Key 已修改，正在验证新值", transient: true };
+    }
     try {
       const response = await chrome.runtime.sendMessage({
         type: "TEST_CONNECTION",
@@ -1733,13 +1903,12 @@ const keyVerifier = Utils.createKeyVerifier({
         model: settings.model
       });
       if (response?.ok) {
-        return mismatched ? { ok: true, transient: true } : { ok: true };
+        return { ok: true };
       }
       return {
         ok: false,
         code: String(response?.code || ""),
-        error: String(response?.error || ""),
-        ...(mismatched ? { transient: true } : {})
+        error: String(response?.error || "")
       };
     } catch (error) {
       return {
@@ -1752,27 +1921,40 @@ const keyVerifier = Utils.createKeyVerifier({
   }
 });
 
-// Change/blur commits the key edit (immediate persist through the queue).
-// Inside the embedded setup card a format-valid manual edit ALSO auto-runs
-// the connection test (review P2 #15: typed keys deserve the verification
-// pasted ones get); the awaited save happens inside that test.
+// Change/blur commits the key edit (immediate persist through the queue) and
+// asks for its verification — in the embedded setup card AND the settings
+// key field (PR #19 follow-up: a typed key deserves the verification a
+// pasted one gets; the verifier dedupes blur/change against the burst that
+// came before). Format errors stay local; inside setup they still explain
+// themselves on the card. An UNTOUCHED field never bills a surprise test:
+// blur of a value identical to the last-known stored key requests nothing —
+// any real edit already queued its own (debounced) verification.
 async function handleApiKeyCommit(trigger) {
   persistSettingsNow();
-  if (!viewState.setupMode) {
-    return;
-  }
-  const key = elements.apiKey.value.trim();
+  const raw = elements.apiKey.value;
+  const key = raw.trim();
   if (!key) {
     return;
   }
-  const formatReason = apiKeyFormatReason(elements.apiKey.value);
+  const formatReason = apiKeyFormatReason(raw);
   if (formatReason) {
-    renderSetupFeedback(`✗ ${formatReason}`);
+    if (viewState.setupMode) {
+      renderSetupFeedback(`✗ ${formatReason}`);
+    }
+    return;
+  }
+  const storedKey = String(
+    settingsModel.snapshot[PROVIDER_META[activeProvider()].keyField] || ""
+  ).trim();
+  if (key === storedKey) {
     return;
   }
   await runKeyConnectionTest(trigger);
 }
 
+// Paste → the auto connection test runs through the shared verifier, which
+// joins the paste+input+change+blur burst into ONE TEST_CONNECTION for the
+// pasted value (PR #19 P1) and always saves before testing.
 async function handleApiKeyPasted() {
   const label = PROVIDER_META[activeProvider()]?.label || "API";
   // A paste is a user edit: bank it before the auto-save below.
@@ -1800,6 +1982,26 @@ async function handleApiKeyPasted() {
   await runKeyConnectionTest("paste");
 }
 
+// Persist a (non-stale) connection-test verdict as the provider's verification
+// status through the ONE serialized write queue (Codex PR #19 P2): "verified"
+// on success, "failed" for definitive failures. Transient failures
+// (network/timeout/429/5xx) say nothing about the key and leave the
+// "unverified" the key's own save wrote. A failed write must not hide the
+// verdict itself — the status just stays "unverified".
+async function persistKeyVerdict(provider, key, result) {
+  const status = result?.ok
+    ? "verified"
+    : Utils.isTransientKeyVerdict(result) ? null : "failed";
+  if (!status) {
+    return;
+  }
+  try {
+    await enqueueSettingsWrite(Utils.keyStatusPatch(provider, status, key));
+  } catch {
+    // The verdict still renders; the status stays "unverified".
+  }
+}
+
 // All key-verification triggers (paste / change / blur / manual click) end up
 // here: tokenized status writes (keyTestOp/keyTestPendingOp semantics are
 // unchanged — a newer test, save or status still supersedes an older
@@ -1819,6 +2021,23 @@ async function runKeyConnectionTest(trigger = "click", keyArg = null) {
     // A superseded request (a newer value replaced it) or a stale op (a newer
     // test/status arrived) renders nothing — the newest flow owns the UI.
     if (result?.superseded || op !== keyTestOp) {
+      return;
+    }
+    // Codex PR #19 P2 (stale verification): the verdict describes only the
+    // provider+key it was requested for. Apply it — the per-provider status
+    // write included — only while this popup still sits on that provider and
+    // the key input still holds that exact value; a result for a value the
+    // user already replaced flips nothing.
+    if (provider !== activeProvider() || elements.apiKey.value.trim() !== key) {
+      return;
+    }
+    await persistKeyVerdict(provider, key, result);
+    // The status write itself took time (it may have queued behind other
+    // writes) — re-check before applying the verdict to the UI, or a success
+    // for A would flip keyVerified/graduate/render after the user had already
+    // moved the input on to B. The persisted verdict stays harmless: its
+    // fingerprint names A, so under B it reads back as 未验证.
+    if (provider !== activeProvider() || elements.apiKey.value.trim() !== key) {
       return;
     }
     renderKeyTestResult(result, provider, key, label);
@@ -1849,6 +2068,7 @@ function renderKeyTestResult(result, provider, key, label) {
       renderView();
     }
     renderProviderStatus();
+    renderKeyStatus();
     return;
   }
   setupRejectedKey = key;
@@ -1856,6 +2076,7 @@ function renderKeyTestResult(result, provider, key, label) {
   if (!renderSetupFeedback(`✗ ${title}：${detail}`)) {
     renderStatus(title, detail, "error");
   }
+  renderKeyStatus();
 }
 
 function friendlyKeyTestFailure(response, label) {

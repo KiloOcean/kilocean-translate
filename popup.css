@@ -306,6 +306,10 @@ kbd {
   color: var(--err);
 }
 
+.provider-status[data-tone="warn"] #provider-status-label {
+  color: var(--warn);
+}
+
 #provider-status-meta {
   margin-left: auto;
   color: var(--muted);
@@ -756,6 +760,14 @@ kbd {
   color: var(--err);
 }
 
+/* The stored-failure message doubles as the re-test link (its click handler
+ * keys off data-retest). */
+.setup-feedback[data-retest="true"] {
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .setup-lock {
   margin-top: 6px;
   color: var(--muted);
@@ -822,6 +834,14 @@ kbd {
 
 .key-status-row[data-tone="ok"] .key-status-value {
   color: var(--ok);
+}
+
+.key-status-row[data-tone="error"] .key-status-value {
+  color: var(--err);
+}
+
+.key-status-row[data-tone="warn"] .key-status-value {
+  color: var(--warn);
 }
 
 .key-status-row[data-tone="missing"] .key-status-value {

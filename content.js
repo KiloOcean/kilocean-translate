@@ -240,8 +240,20 @@
         // Nothing selected here (or the selection lives in a frame we cannot
         // read — message.selectionText is then stale/unverifiable text the
         // user cannot see, so it is never billed): non-billable hint state.
-        showSelectionHintPanel();
-        sendResponse({ ok: false, error: "先选中要翻译的文字，再按 Alt+T 或右键「翻译选中文字」" });
+        // A selection INSIDE a textarea / text-like input is a special case
+        // (PR #19 follow-up): the user did select text, but input-field text
+        // is not page content this extension can annotate — say so instead
+        // of the generic 先选中 hint. Still never billed.
+        const inputSelection = activeElementHasTextSelection();
+        showSelectionHintPanel(
+          inputSelection ? "暂不支持翻译输入框内的文字" : "先选中要翻译的文字，再按 Alt+T 或右键「翻译选中文字」"
+        );
+        sendResponse({
+          ok: false,
+          error: inputSelection
+            ? "暂不支持翻译输入框内的文字"
+            : "先选中要翻译的文字，再按 Alt+T 或右键「翻译选中文字」"
+        });
         return false;
       }
       // The live selection wins over message.selectionText: the context-menu
@@ -2740,7 +2752,11 @@
     .pill .tx b { font-size: 12.5px; font-weight: 600; white-space: nowrap; }
     .pill.error .tx b { color: #C62828; }
     .pill .tx span { font-size: 11px; color: #6B7280; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .pill .ring { width: 16px; height: 16px; flex: 0 0 auto; border-radius: 50%; border: 2px solid #EEF1FF; border-top-color: #3D5AFE; animation: pill-spin 0.9s linear infinite; }
+    .pill .ring { width: 16px; height: 16px; flex: 0 0 auto; border-radius: 50%; border: 2px solid #EEF1FF; border-top-color: #3D5AFE; }
+    /* The spin animation exists ONLY in the translating state (PR #19
+       follow-up): error / partial / done must never animate — a terminal
+       state showing a spinner reads as work still in flight. */
+    .pill.translating .ring { animation: pill-spin 0.9s linear infinite; }
     .pill .ringp { position: relative; width: 16px; height: 16px; flex: 0 0 auto; border-radius: 50%; }
     .pill .ringp::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: #fff; }
     .pill .cb {
@@ -2760,7 +2776,7 @@
     .pill[data-collapsed="true"] .count { display: none; }
     @keyframes pill-spin { to { transform: rotate(360deg); } }
     @media (prefers-reduced-motion: reduce) {
-      .pill .ring { animation: none; }
+      .pill.translating .ring { animation: none; }
     }
   `;
 
@@ -3280,6 +3296,54 @@
    * @returns {{ text: string, rangeId: string } | null} null unless the user
    *   genuinely holds a non-collapsed selection of billable length.
    */
+  // ---- input-field selection detection (COMMAND_SELECTION_TRANSLATE hint) ----
+
+  // Input types whose value the user can select with the caret (and that
+  // expose selectionStart/selectionEnd). Checkbox/radio/file/… never carry a
+  // text selection; <select> is not an editable field at all.
+  const TEXT_SELECTION_INPUT_TYPES = new Set(["text", "search", "url", "tel", "password", "email"]);
+
+  // The deepest focused element, walking into OPEN shadow roots (a closed
+  // root is unreachable by design — it reads as its host and cannot be a
+  // textarea anyway). Pure over (activeElement, shadowRoot) so tests can
+  // drive it with a fake tree.
+  function deepActiveElement(root) {
+    let element = (root || document).activeElement;
+    let guard = 0;
+    while (element && element.shadowRoot && guard < 64) {
+      element = element.shadowRoot.activeElement;
+      guard += 1;
+    }
+    return element || null;
+  }
+
+  // True when focus sits in a textarea / text-like input with a REAL
+  // selection (selectionStart !== selectionEnd) — text the user selected,
+  // but inside a field this extension cannot annotate in place (PR #19
+  // follow-up: the no-gesture hint must explain that, not claim nothing is
+  // selected).
+  function activeElementHasTextSelection(root) {
+    const element = deepActiveElement(root);
+    if (!element) {
+      return false;
+    }
+    const tag = element.tagName;
+    const isField =
+      tag === "TEXTAREA" ||
+      (tag === "INPUT" && TEXT_SELECTION_INPUT_TYPES.has(String(element.type || "text").toLowerCase()));
+    if (!isField) {
+      return false;
+    }
+    try {
+      const start = element.selectionStart;
+      const end = element.selectionEnd;
+      return typeof start === "number" && typeof end === "number" && start !== end;
+    } catch {
+      // Some input types throw on selectionStart access — no selection then.
+      return false;
+    }
+  }
+
   function captureSelectionGesture() {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
@@ -3838,11 +3902,16 @@
   }
 
   // Non-billable hint bubble: Alt+T / context menu arrived with nothing (or
-  // only frame-inaccessible text) selected. Pure guidance — no request.
-  function showSelectionHintPanel() {
+  // only frame-inaccessible text) selected. Pure guidance — no request. The
+  // optional message overrides the generic copy (the input-field case).
+  function showSelectionHintPanel(message) {
     const panel = ensureSelectionPanel();
     positionSelectionPanelTopRight(panel);
-    setSelectionPanelState(panel, "hint", "先选中要翻译的文字，再按 Alt+T 或右键「翻译选中文字」");
+    setSelectionPanelState(
+      panel,
+      "hint",
+      message || "先选中要翻译的文字，再按 Alt+T 或右键「翻译选中文字」"
+    );
   }
 
   function setSelectionPanelState(host, tone, message, sourceText, options = {}) {

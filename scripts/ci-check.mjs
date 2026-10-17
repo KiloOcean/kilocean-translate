@@ -2017,7 +2017,13 @@ function createBackgroundVm(storageData, fetchImpl, { pingOk = false } = {}) {
 function createPopupVm(
   storageData,
   {
-    runtimeMessageHandler = async () => ({ ok: false }),
+    // The default answers TEST_CONNECTION with a TRANSIENT failure: input /
+    // change / blur now request (debounced) verification, so a test that
+    // fires key events without installing its own handler must never see a
+    // stray definitive verdict (a "failed" status write) land afterwards.
+    runtimeMessageHandler = async (message) => (message?.type === "TEST_CONNECTION"
+      ? { ok: false, code: "NETWORK_ERROR", error: "vm: no TEST_CONNECTION handler", transient: true }
+      : { ok: false }),
     // chrome.commands.getAll payload (shortcut labels); [] keeps the markup
     // fallbacks, mirroring a browser without the commands API.
     commands = [],
@@ -2026,7 +2032,15 @@ function createPopupVm(
     activeTab = {},
     // window.location.search for the popup document ("?view=settings" opens
     // the popup.html?view=settings settings tab).
-    locationSearch = ""
+    locationSearch = "",
+    // chrome.tabs.sendMessage impl — tests swap it to model a page that
+    // refuses the PING (restricted-by-behavior detection). Every send is
+    // recorded in tabMessages by the sandbox wrapper below, so the impl
+    // itself never needs to.
+    tabsSendMessage = async () => ({ ok: true, status: { active: false } }),
+    // chrome.scripting.executeScript impl — rejecting models injection
+    // refusal (chrome:// pages without a readable URL).
+    executeScript = async () => {}
   } = {}
 ) {
   const storageListeners = [];
@@ -2267,7 +2281,7 @@ function createPopupVm(
         query: async () => [{ id: 42, ...activeTab }],
         sendMessage: async (tabId, message) => {
           tabMessages.push({ tabId, message });
-          return { ok: true, status: { active: false } };
+          return tabsSendMessage(tabId, message);
         },
         create: async (details) => {
           tabCreates.push(details);
@@ -2275,7 +2289,7 @@ function createPopupVm(
         }
       },
       commands: { getAll: async () => commands },
-      scripting: { executeScript: async () => {} }
+      scripting: { executeScript }
     }
   };
   sandbox.window = sandbox;
@@ -2707,8 +2721,8 @@ async function checkKeyMigrationGate() {
     assertEqual(popup1.dom.get("api-key").value, LEGACY_KEY, "popup load 1.3.x: key input shows the migrated key");
     assertEqual(
       popup1.dom.get("key-status-deepseek-value").textContent,
-      `已配置 · 尾号 ${LEGACY_KEY.slice(-4)}`,
-      "popup key status: DeepSeek row shows 已配置 with the key tail"
+      `未验证 · 尾号 ${LEGACY_KEY.slice(-4)}`,
+      "popup key status: a migrated 1.3.x key has no verdict yet and shows 未验证 (never 已配置)"
     );
     assertEqual(
       popup1.dom.get("key-status-kimi-value").textContent,
@@ -2729,8 +2743,8 @@ async function checkKeyMigrationGate() {
     assertEqual(String(kimiPopupStorage.deepseekApiKey || ""), "", "popup load 1.4.x kimi: no phantom DeepSeek key appears");
     assertEqual(
       popup3.dom.get("key-status-kimi-value").textContent,
-      `已配置 · 尾号 ${KIMI_KEY.slice(-4)}`,
-      "popup key status: Kimi row shows 已配置 with the key tail"
+      `未验证 · 尾号 ${KIMI_KEY.slice(-4)}`,
+      "popup key status: a stored 1.4.x key without a verdict shows 未验证 with the key tail"
     );
 
     // Paste flow: format gate before network, auto-save, then connection test.
@@ -2778,8 +2792,8 @@ async function checkKeyMigrationGate() {
     assertEqual(pastePopup.storage.kimiApiKey, KIMI_KEY, "paste flow: auto-save keeps the inactive provider's key");
     assertEqual(
       pasteDom.get("key-status-deepseek-value").textContent,
-      `已配置 · 尾号 ${DEEPSEEK_KEY.slice(-4)}`,
-      "paste flow: key status refreshes after save"
+      `已连接 · 尾号 ${DEEPSEEK_KEY.slice(-4)}`,
+      "paste flow: key status refreshes to 已连接 after the verified verdict"
     );
   }
 
@@ -2972,6 +2986,14 @@ async function checkKeyMigrationGate() {
       if (withKeys.deepseekApiKey !== DEEPSEEK_KEY || withKeys.kimiApiKey !== KIMI_KEY) {
         fail("export: opt-in must include both stored provider keys");
       }
+      // Codex PR #19 P2: verification statuses (and their fingerprints) are
+      // DERIVED state — recomputed only by a real connection test on this
+      // machine — so they never travel through a backup file.
+      for (const field of ["deepseekKeyStatus", "deepseekKeyStatusFor", "kimiKeyStatus", "kimiKeyStatusFor"]) {
+        if (field in noKeys || field in withKeys) {
+          fail(`export: the derived field ${field} must never be exported`);
+        }
+      }
       const roundTrip = popup.hooks.parseImportedSettings(popup.hooks.buildExportPayload(base, true));
       if (roundTrip.deepseekApiKey !== DEEPSEEK_KEY || roundTrip.kimiApiKey !== KIMI_KEY) {
         fail("export→import round trip must preserve opted-in keys");
@@ -3036,6 +3058,13 @@ async function checkKeyMigrationGate() {
       "无法识别的字段",
       "import parse: unknown field"
     );
+    // Codex PR #19 P2: derived verification statuses are not importable — a
+    // hand-crafted file claiming "verified" must be rejected, never trusted.
+    rejectsWith(
+      { format: "kilocean-translate-settings", version: 1, settings: { deepseekKeyStatus: "verified" } },
+      "无法识别的字段",
+      "import parse: a key-status field is rejected as derived state"
+    );
     rejectsWith(
       { format: "kilocean-translate-settings", version: 1, settings: { provider: 7 } },
       "字符串",
@@ -3096,8 +3125,16 @@ async function checkKeyMigrationGate() {
     );
     assertEqual(
       popup.dom.get("key-status-kimi-value").textContent,
-      `已配置 · 尾号 ${NEW_KIMI.slice(-4)}`,
-      "import apply: key status re-renders"
+      `未验证 · 尾号 ${NEW_KIMI.slice(-4)}`,
+      "import apply: key status re-renders (an imported key is unverified)"
+    );
+    // Imported keys must land WITHOUT any verification verdict: the status is
+    // derived state, recomputed only by a real connection test on this machine.
+    assertEqual(popup.storage.kimiKeyStatus, "unverified", "import apply: an imported key writes a fresh unverified status");
+    assertEqual(
+      popup.storage.kimiKeyStatusFor,
+      `${NEW_KIMI.length}:${NEW_KIMI.slice(-4)}`,
+      "import apply: the unverified status is fingerprinted to the imported key"
     );
 
     // importSettingsFile: an oversized file is rejected BEFORE it is read or
@@ -3793,6 +3830,205 @@ async function checkKeyVerifierGate() {
     assertEqual(welcome.storage.deepseekApiKey, WELCOME_KEY2, "welcome burst: the newer key is stored");
   }
 
+  // ---- (b2) Codex PR #19 P2 — a stale success must never apply: key A is
+  // still verifying when the user pastes key B; A's LATE ok verdict must not
+  // persist A, enable 继续, or mark anything verified. B's verdict applies.
+  {
+    const KEY_A = fakeKey("staleA", 22);
+    const KEY_B = fakeKey("staleB", 22);
+    const fingerprintOf = (key) => `${key.length}:${key.slice(-4)}`;
+    let resolveA;
+    let resolveB;
+    const gateA = new Promise((resolve) => { resolveA = resolve; });
+    const gateB = new Promise((resolve) => { resolveB = resolve; });
+    let testCount = 0;
+    const welcome = createWelcomeVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash", targetLanguage: "zh-CN" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            testCount += 1;
+            return testCount === 1 ? gateA : gateB;
+          }
+          return { ok: false };
+        }
+      }
+    );
+    welcome.fire(welcome.dom.get("s1-next"), "click");
+    const s2Key = welcome.dom.get("s2-key");
+    const s2Next = welcome.dom.get("s2-next");
+
+    // Paste A → its TEST_CONNECTION parks. Then paste B → a second, separate
+    // TEST_CONNECTION parks too (different identity: no dedupe).
+    s2Key.value = KEY_A;
+    welcome.fire(s2Key, "paste");
+    await settle(20);
+    s2Key.value = KEY_B;
+    welcome.fire(s2Key, "paste");
+    await settle(20);
+    assertEqual(testCount, 2, "welcome stale: A and B each bill their own TEST_CONNECTION");
+    assertEqual(welcome.storage.deepseekApiKey, KEY_B, "welcome stale: B's run() saved B (the newest input) before any verdict");
+
+    // A's ok lands LAST, after B had replaced it in the input.
+    resolveA({ ok: true });
+    await settle(40);
+    assertTrue(s2Next.disabled, "welcome stale: A's late success does NOT enable 继续");
+    assertFalse(
+      String(welcome.dom.get("s2-msg").textContent).includes("已连接"),
+      "welcome stale: A's late success renders nothing"
+    );
+    assertEqual(
+      welcome.writes.filter((write) => write.updates.keyVerified === true).length,
+      0,
+      "welcome stale: A's late success persists no provider switch / verified flag"
+    );
+    assertEqual(
+      welcome.storage.deepseekKeyStatus,
+      "unverified",
+      "welcome stale: A's late success writes no verified status"
+    );
+    assertFalse(
+      welcome.writes.some((write) => write.updates.deepseekKeyStatus === "verified"),
+      "welcome stale: no verified-status write at all before B's verdict"
+    );
+
+    // B's ok then applies normally.
+    resolveB({ ok: true });
+    await settle(40);
+    assertFalse(s2Next.disabled, "welcome stale: B's own success enables 继续");
+    assertTrue(
+      String(welcome.dom.get("s2-msg").textContent).includes(`尾号 ${KEY_B.slice(-4)}`),
+      "welcome stale: B's verdict renders B's tail"
+    );
+    const bPersists = welcome.writes.filter((write) => write.updates.keyVerified === true);
+    assertEqual(bPersists.length, 1, "welcome stale: exactly ONE verified persist, for B");
+    assertEqual(bPersists[0].updates.deepseekKeyStatus, "verified", "welcome stale: B's persist carries the verified status");
+    assertEqual(bPersists[0].updates.deepseekKeyStatusFor, fingerprintOf(KEY_B), "welcome stale: B's persist is fingerprinted to B, never A");
+    assertEqual(welcome.storage.deepseekApiKey, KEY_B, "welcome stale: storage ends at B");
+  }
+
+  // ---- (b3) PR #19 follow-up — the OTHER interleaving: B's 401 APPLIES
+  // first (B is the current key), then A's slow 200 arrives. The page keeps
+  // B's invalid verdict; nothing persists A, keyVerified or a verified
+  // status for A. (welcome.js: the stale token guard must hold here too.)
+  {
+    const KEY_A = fakeKey("slow200A", 22);
+    const KEY_B = fakeKey("fast401B", 22);
+    const fingerprintOf = (key) => `${key.length}:${key.slice(-4)}`;
+    let resolveA;
+    const gateA = new Promise((resolve) => { resolveA = resolve; });
+    let testCount = 0;
+    const welcome = createWelcomeVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash", targetLanguage: "zh-CN" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            testCount += 1;
+            return testCount === 1 ? gateA : { ok: false, code: "API_401", error: "Key 不正确" };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    welcome.fire(welcome.dom.get("s1-next"), "click");
+    const s2Key = welcome.dom.get("s2-key");
+    const s2Next = welcome.dom.get("s2-next");
+    s2Key.value = KEY_A;
+    welcome.fire(s2Key, "paste"); // A's 200 parks
+    await settle(20);
+    s2Key.value = KEY_B;
+    welcome.fire(s2Key, "paste"); // B's 401 answers immediately
+    await settle(40);
+    assertEqual(testCount, 2, "welcome slow-200: A and B each bill their own TEST_CONNECTION");
+    assertTrue(
+      String(welcome.dom.get("s2-msg").textContent).includes("✕"),
+      "welcome slow-200: B's 401 renders the failure message"
+    );
+    assertTrue(s2Next.disabled, "welcome slow-200: B's 401 keeps 继续 disabled");
+    assertEqual(
+      welcome.storage.deepseekKeyStatus,
+      "failed",
+      "welcome slow-200: B's definitive failure persists failed for B"
+    );
+    assertEqual(welcome.storage.deepseekKeyStatusFor, fingerprintOf(KEY_B), "welcome slow-200: the failed status is fingerprinted to B");
+    // NOW A's slow 200 lands, after B already failed as the current key.
+    resolveA({ ok: true });
+    await settle(40);
+    assertEqual(testCount, 2, "welcome slow-200: A's late 200 bills nothing new");
+    assertTrue(s2Next.disabled, "welcome slow-200: A's late 200 does NOT enable 继续");
+    assertFalse(
+      String(welcome.dom.get("s2-msg").textContent).includes("已连接"),
+      "welcome slow-200: A's late 200 renders no connected message over B's failure"
+    );
+    assertFalse(
+      welcome.writes.some((write) => write.updates.keyVerified === true),
+      "welcome slow-200: A's late 200 persists no verified flag"
+    );
+    assertFalse(
+      welcome.writes.some((write) => write.updates.deepseekApiKey === KEY_A && write.updates.deepseekKeyStatus === "verified"),
+      "welcome slow-200: no verified status ever lands for A"
+    );
+    assertEqual(welcome.storage.deepseekApiKey, KEY_B, "welcome slow-200: storage keeps B");
+    assertEqual(welcome.storage.deepseekKeyStatus, "failed", "welcome slow-200: B's failed verdict survives A's late 200");
+  }
+
+  // ---- (b4) The reverse: B's 200 applies (B valid, 继续 enabled), then A's
+  // slow 401 arrives. A LATE FAILURE for a replaced key must not mark the
+  // CURRENT valid B invalid — no failed write, no disabled 继续, B's message
+  // and fingerprints untouched.
+  {
+    const KEY_A = fakeKey("slow401A", 22);
+    const KEY_B = fakeKey("fast200B", 22);
+    const fingerprintOf = (key) => `${key.length}:${key.slice(-4)}`;
+    let resolveA;
+    const gateA = new Promise((resolve) => { resolveA = resolve; });
+    let testCount = 0;
+    const welcome = createWelcomeVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash", targetLanguage: "zh-CN" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            testCount += 1;
+            return testCount === 1 ? gateA : { ok: true };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    welcome.fire(welcome.dom.get("s1-next"), "click");
+    const s2Key = welcome.dom.get("s2-key");
+    const s2Next = welcome.dom.get("s2-next");
+    s2Key.value = KEY_A;
+    welcome.fire(s2Key, "paste"); // A's 401 parks
+    await settle(20);
+    s2Key.value = KEY_B;
+    welcome.fire(s2Key, "paste"); // B's 200 answers immediately
+    await settle(40);
+    assertEqual(testCount, 2, "welcome slow-401: A and B each bill their own TEST_CONNECTION");
+    assertFalse(s2Next.disabled, "welcome slow-401: B's 200 enables 继续");
+    assertTrue(
+      String(welcome.dom.get("s2-msg").textContent).includes(`尾号 ${KEY_B.slice(-4)}`),
+      "welcome slow-401: B's verdict renders B's tail"
+    );
+    assertEqual(welcome.storage.deepseekKeyStatus, "verified", "welcome slow-401: B's verdict persists verified for B");
+    // NOW A's slow 401 lands, after B already verified as the current key.
+    resolveA({ ok: false, code: "API_401", error: "Key 不正确" });
+    await settle(40);
+    assertEqual(testCount, 2, "welcome slow-401: A's late 401 bills nothing new");
+    assertFalse(s2Next.disabled, "welcome slow-401: A's late 401 does NOT disable 继续");
+    assertTrue(
+      String(welcome.dom.get("s2-msg").textContent).includes(`尾号 ${KEY_B.slice(-4)}`),
+      "welcome slow-401: B's connected message survives A's late 401"
+    );
+    assertFalse(
+      welcome.writes.some((write) => write.updates.deepseekKeyStatus === "failed"),
+      "welcome slow-401: A's late 401 persists no failed status"
+    );
+    assertEqual(welcome.storage.deepseekApiKey, KEY_B, "welcome slow-401: storage keeps B");
+    assertEqual(welcome.storage.deepseekKeyStatus, "verified", "welcome slow-401: B's verified verdict survives A's late 401");
+    assertEqual(welcome.storage.deepseekKeyStatusFor, fingerprintOf(KEY_B), "welcome slow-401: the surviving fingerprint names B");
+  }
+
   // ---- (c) P2-1: choosing Kimi with an existing Kimi key (storage provider
   // deepseek) flips provider+model+mirror+flag in ONE write, BEFORE the
   // sample-translation message leaves.
@@ -3834,8 +4070,15 @@ async function checkKeyVerifierGate() {
     assertEqual(persistWrites.length, 1, "welcome persist: exactly ONE verified-persist write");
     assertEqual(
       persistWrites[0].updates,
-      { provider: "kimi", model: "kimi-k2.6", keyVerified: true, apiKey: KIMI_STORED },
-      "welcome persist: provider + default model + legacy mirror + verified flag land atomically"
+      {
+        provider: "kimi",
+        model: "kimi-k2.6",
+        keyVerified: true,
+        apiKey: KIMI_STORED,
+        kimiKeyStatus: "verified",
+        kimiKeyStatusFor: `${KIMI_STORED.length}:${KIMI_STORED.slice(-4)}`
+      },
+      "welcome persist: provider + default model + legacy mirror + verified flag + verified status land atomically"
     );
     assertFalse("kimiApiKey" in persistWrites[0].updates, "welcome persist: an already-stored key is not rewritten");
     assertFalse(welcome.dom.get("step-3").hidden, "welcome persist: step 3 opens after the persist");
@@ -4019,8 +4262,15 @@ async function checkSettingsStateModel() {
     const { patch, fields } = pure.collectDirtyPatch(model, controlValues);
     assertEqual(
       patch,
-      { deepseekApiKey: "sk-typed", apiKey: "sk-typed" },
-      "collectDirtyPatch: only changed dirty fields (+ the mirror) are written"
+      {
+        deepseekApiKey: "sk-typed",
+        apiKey: "sk-typed",
+        // A key write always resets that provider's verification verdict to
+        // "unverified" in the SAME set (fingerprinted to the new key).
+        deepseekKeyStatus: "unverified",
+        deepseekKeyStatusFor: "8:yped"
+      },
+      "collectDirtyPatch: only changed dirty fields (+ the mirror + the reset key status) are written"
     );
     assertEqual(
       fields,
@@ -4041,8 +4291,8 @@ async function checkSettingsStateModel() {
         { snapshot: { ...model.snapshot }, edits: { deepseekApiKey: "" } },
         { ...controlValues, deepseekApiKey: "" }
       ).patch,
-      { deepseekApiKey: "", apiKey: "" },
-      "collectDirtyPatch: clearing the last key clears the legacy apiKey mirror"
+      { deepseekApiKey: "", apiKey: "", deepseekKeyStatus: "unverified", deepseekKeyStatusFor: "0" },
+      "collectDirtyPatch: clearing the last key clears the legacy apiKey mirror (and resets the status)"
     );
   }
 
@@ -4193,8 +4443,13 @@ async function checkSettingsStateModel() {
     await new Promise((resolve) => setTimeout(resolve, 0));
     assertEqual(
       setCalls,
-      [{ deepseekApiKey: PENDING_EDIT, apiKey: PENDING_EDIT }],
-      "init pending edits: initialization flushes the banked edit through the serialized queue"
+      [{
+        deepseekApiKey: PENDING_EDIT,
+        apiKey: PENDING_EDIT,
+        deepseekKeyStatus: "unverified",
+        deepseekKeyStatusFor: `${PENDING_EDIT.length}:${PENDING_EDIT.slice(-4)}`
+      }],
+      "init pending edits: initialization flushes the banked edit (+ its unverified status) through the serialized queue"
     );
     assertEqual(popup.storage.deepseekApiKey, PENDING_EDIT, "init pending edits: the edit lands in storage once init resolves");
     assertEqual(popup.hooks.getSettingsModel().edits, {}, "init pending edits: the flushed edit settles");
@@ -4221,7 +4476,16 @@ async function checkSettingsStateModel() {
     // The user's edit is still saved (over the external value) once saved.
     const setCalls = recordSets(popup);
     await popup.hooks.saveSettings();
-    assertEqual(setCalls, [{ deepseekApiKey: EDITED, apiKey: EDITED }], "dirty key: saving flushes the user's edit");
+    assertEqual(
+      setCalls,
+      [{
+        deepseekApiKey: EDITED,
+        apiKey: EDITED,
+        deepseekKeyStatus: "unverified",
+        deepseekKeyStatusFor: `${EDITED.length}:${EDITED.slice(-4)}`
+      }],
+      "dirty key: saving flushes the user's edit (+ its unverified status)"
+    );
   }
 
   // (3) External changes while nothing is being edited: controls update —
@@ -4250,7 +4514,11 @@ async function checkSettingsStateModel() {
     keyInput.value = EDITED;
     fire(keyInput, "input");
     await popup.hooks.saveSettings();
-    assertEqual(setCalls, [{ deepseekApiKey: EDITED, apiKey: EDITED }], "save: only the dirty key field (+ the mirror) is written");
+    assertEqual(
+      setCalls,
+      [{ deepseekApiKey: EDITED, apiKey: EDITED, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${EDITED.length}:${EDITED.slice(-4)}` }],
+      "save: only the dirty key field (+ the mirror + its reset status) is written"
+    );
     assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "save: the inactive provider's stored key is untouched");
     assertEqual(popup.storage.model, "deepseek-flash", "save: non-dirty fields are never written");
     assertEqual(popup.hooks.getSettingsModel().edits, {}, "save: dirty flags clear after the write");
@@ -4366,7 +4634,11 @@ async function checkSettingsStateModel() {
     keyInput.value = EDITED;
     fire(keyInput, "input");
     const saving = popup.hooks.saveSettings();
-    assertEqual(setCalls, [{ deepseekApiKey: EDITED, apiKey: EDITED }], "pending edit: the in-flight save writes edit A");
+    assertEqual(
+      setCalls,
+      [{ deepseekApiKey: EDITED, apiKey: EDITED, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${EDITED.length}:${EDITED.slice(-4)}` }],
+      "pending edit: the in-flight save writes edit A"
+    );
     keyInput.value = NEWER;
     fire(keyInput, "input");
     // The storage.onChanged echo of our own write of A must not clobber B.
@@ -4379,7 +4651,11 @@ async function checkSettingsStateModel() {
     writeReleases[0]();
     await new Promise((resolve) => setTimeout(resolve, 0));
     assertEqual(setCalls.length, 2, "pending edit: exactly one follow-up round runs");
-    assertEqual(setCalls[1], { deepseekApiKey: NEWER, apiKey: NEWER }, "pending edit: the follow-up round writes B");
+    assertEqual(
+      setCalls[1],
+      { deepseekApiKey: NEWER, apiKey: NEWER, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${NEWER.length}:${NEWER.slice(-4)}` },
+      "pending edit: the follow-up round writes B"
+    );
     assertEqual(keyInput.value, NEWER, "pending edit: the control still shows B while its write is in flight");
     assertEqual(popup.hooks.getSettingsModel().edits.deepseekApiKey, NEWER, "pending edit: B is still dirty while its write is in flight");
     let resolved = false;
@@ -4420,7 +4696,11 @@ async function checkSettingsStateModel() {
     assertTrue(secondResult === thirdResult, "coalesced saves: queued callers share one follow-up result");
     await new Promise((resolve) => setTimeout(resolve, 0));
     assertEqual(setCalls.length, 2, "coalesced saves: exactly one follow-up write follows the in-flight one");
-    assertEqual(setCalls[1], { deepseekApiKey: NEWER, apiKey: NEWER }, "coalesced saves: the follow-up writes the newest edit");
+    assertEqual(
+      setCalls[1],
+      { deepseekApiKey: NEWER, apiKey: NEWER, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${NEWER.length}:${NEWER.slice(-4)}` },
+      "coalesced saves: the follow-up writes the newest edit"
+    );
     assertEqual(popup.hooks.getSettingsModel().edits, {}, "coalesced saves: the follow-up clears the dirty flag");
     assertEqual(popup.storage.deepseekApiKey, NEWER, "coalesced saves: storage ends at the newest edit");
   }
@@ -4442,7 +4722,14 @@ async function checkSettingsStateModel() {
     assertEqual(keyInput.value, KIMI_KEY, "provider switch: input swaps to the new provider's stored key");
     assertEqual(
       setCalls[0],
-      { deepseekApiKey: EDITED, provider: "kimi", model: "kimi-k2.6", apiKey: KIMI_KEY },
+      {
+        deepseekApiKey: EDITED,
+        provider: "kimi",
+        model: "kimi-k2.6",
+        apiKey: KIMI_KEY,
+        deepseekKeyStatus: "unverified",
+        deepseekKeyStatusFor: `${EDITED.length}:${EDITED.slice(-4)}`
+      },
       "provider switch: the banked edit saves under its own provider and the mirror follows the switch"
     );
     providerSelect.value = "deepseek";
@@ -4513,8 +4800,13 @@ async function checkSettingsStateModel() {
     await new Promise((resolve) => setTimeout(resolve, 0));
     assertEqual(
       setCalls,
-      [{ deepseekApiKey: FLUSHED_KEY, apiKey: FLUSHED_KEY }],
-      "hide flush: only the pending dirty key (+ the legacy mirror) is written"
+      [{
+        deepseekApiKey: FLUSHED_KEY,
+        apiKey: FLUSHED_KEY,
+        deepseekKeyStatus: "unverified",
+        deepseekKeyStatusFor: `${FLUSHED_KEY.length}:${FLUSHED_KEY.slice(-4)}`
+      }],
+      "hide flush: only the pending dirty key (+ the legacy mirror + its reset status) is written"
     );
     assertEqual(popup.storage.kimiApiKey, ROTATED_KIMI, "hide flush: the other provider's newer key is never overwritten with the stale one");
     assertEqual(popup.storage.targetLanguage, "zh-CN", "hide flush: untouched fields are never written");
@@ -4714,7 +5006,7 @@ async function checkSettingsWriteQueueConcurrency() {
     fire(keyInput, "change");
     assertEqual(
       gate.writes[0].updates,
-      { deepseekApiKey: "", apiKey: "" },
+      { deepseekApiKey: "", apiKey: "", deepseekKeyStatus: "unverified", deepseekKeyStatusFor: "0" },
       "key delete: clearing the last key writes the empty value and clears the mirror"
     );
     // A new key typed while the deletion's write is parked.
@@ -4726,8 +5018,13 @@ async function checkSettingsWriteQueueConcurrency() {
     assertEqual(gate.writes.length, 2, "key delete: the new key gets exactly one follow-up write");
     assertEqual(
       gate.writes[1].updates,
-      { deepseekApiKey: RETYPED_KEY, apiKey: RETYPED_KEY },
-      "key delete: the follow-up writes the new key and keeps the mirror consistent"
+      {
+        deepseekApiKey: RETYPED_KEY,
+        apiKey: RETYPED_KEY,
+        deepseekKeyStatus: "unverified",
+        deepseekKeyStatusFor: `${RETYPED_KEY.length}:${RETYPED_KEY.slice(-4)}`
+      },
+      "key delete: the follow-up writes the new key (with a fresh unverified status) and keeps the mirror consistent"
     );
     gate.writes[1].release();
     await tick();
@@ -4928,7 +5225,7 @@ async function checkSettingsWriteQueueConcurrency() {
     assertEqual(gate.writes.length, 1, "translate follow-up: the typed key's save parks as the only write");
     assertEqual(
       gate.writes[0].updates,
-      { deepseekApiKey: TYPED_KEY, apiKey: TYPED_KEY },
+      { deepseekApiKey: TYPED_KEY, apiKey: TYPED_KEY, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${TYPED_KEY.length}:${TYPED_KEY.slice(-4)}` },
       "translate follow-up: the pending write carries the typed key"
     );
     // The user retypes the key while that write is parked.
@@ -4940,7 +5237,7 @@ async function checkSettingsWriteQueueConcurrency() {
     assertEqual(gate.writes.length, 2, "translate follow-up: the retype gets exactly one follow-up write");
     assertEqual(
       gate.writes[1].updates,
-      { deepseekApiKey: RETYPED_KEY, apiKey: RETYPED_KEY },
+      { deepseekApiKey: RETYPED_KEY, apiKey: RETYPED_KEY, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${RETYPED_KEY.length}:${RETYPED_KEY.slice(-4)}` },
       "translate follow-up: the follow-up write carries the retyped key"
     );
     assertEqual(
@@ -4995,20 +5292,39 @@ async function checkSettingsWriteQueueConcurrency() {
     assertEqual(testFired.length, 0, "key test follow-up: no TEST_CONNECTION before the follow-up write committed");
     gate.writes[1].release();
     await clicked;
-    assertEqual(testFired.length, 1, "key test follow-up: the connection test fires once, after the follow-up write committed");
+    // PR #19 follow-up (same-value save+test): the click asked about
+    // TYPED_KEY while its stable save settled at RETYPED_KEY, so the run
+    // bills NOTHING — the old behavior tested the newer key under the stale
+    // request. The retyped key's own change-triggered verification (below)
+    // is the one that tests it.
     assertEqual(
-      testFired[0].storage.deepseekApiKey,
-      RETYPED_KEY,
-      "key test follow-up: storage holds the NEW key when the worker is asked to test it"
+      testFired.length,
+      0,
+      "key test follow-up: a superseded run never bills a TEST_CONNECTION for the value that replaced it"
     );
-    // The mid-write retype invalidated the run (keyTestOp bumped by its input
-    // event), so the result is dropped by design — only the button returns.
     assertEqual(
       popup.dom.get("status-title").textContent,
       "正在验证 DeepSeek Key",
       "key test follow-up: the retyped key invalidates the in-flight run's status write (documented popup behavior)"
     );
     assertEqual(popup.dom.get("test-connection").disabled, false, "key test follow-up: the button re-enables after the stable save");
+    // The change-triggered debounce fires ~600 ms after the commit: exactly
+    // one TEST_CONNECTION, and it reads exactly the key the save committed.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assertEqual(
+      testFired.length,
+      1,
+      "key test follow-up: the retyped key's own verification fires once, after its committed save"
+    );
+    assertEqual(
+      testFired[0].storage.deepseekApiKey,
+      RETYPED_KEY,
+      "key test follow-up: the worker is asked to test exactly the key the save committed (never the superseded one)"
+    );
+    if (gate.writes[2]) {
+      gate.writes[2].release();
+      await tick();
+    }
     assertTrue(gate.maxInFlight === 1, "key test follow-up: at most one write in flight at a time");
   }
 
@@ -5205,6 +5521,21 @@ async function checkPopupActionInitGate() {
     }
   };
   const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  // Fire a DOM event synchronously (listeners that only bank edits and park
+  // their save behind the init gate return nothing to await).
+  const fire = (el, type) => {
+    for (const fn of el.listeners[type] || []) {
+      fn();
+    }
+  };
+  const waitFor = async (probe, label) => {
+    for (let i = 0; i < 400 && !probe(); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    if (!probe()) {
+      fail(`popup action init gate: timed out waiting for ${label}`);
+    }
+  };
   // Fire a DOM event and return a promise that settles once every listener's
   // return value (the whenReady wrapper's promise) has settled.
   const fireAction = (el, type) =>
@@ -5480,8 +5811,8 @@ async function checkPopupActionInitGate() {
     await tick();
     assertEqual(
       writes,
-      [{ deepseekApiKey: TYPED_KEY, apiKey: TYPED_KEY }],
-      "key edit gate: after init, one write lands the typed key with its mirror"
+      [{ deepseekApiKey: TYPED_KEY, apiKey: TYPED_KEY, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${TYPED_KEY.length}:${TYPED_KEY.slice(-4)}` }],
+      "key edit gate: after init, one write lands the typed key with its mirror (+ its reset status)"
     );
     assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "key edit gate: the other provider's stored key is untouched");
   }
@@ -5504,13 +5835,57 @@ async function checkPopupActionInitGate() {
     await popup.hooks.initializePromise;
     await tick();
     await tick();
-    assertEqual(writes, [{ deepseekApiKey: PASTED_KEY, apiKey: PASTED_KEY }], "paste gate: after init, the pasted key is saved exactly once");
+    assertEqual(
+      writes,
+      [
+        { deepseekApiKey: PASTED_KEY, apiKey: PASTED_KEY, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${PASTED_KEY.length}:${PASTED_KEY.slice(-4)}` },
+        // The ok verdict then lands as its own queued write.
+        { deepseekKeyStatus: "verified", deepseekKeyStatusFor: `${PASTED_KEY.length}:${PASTED_KEY.slice(-4)}` }
+      ],
+      "paste gate: after init, the pasted key is saved once, then the ok verdict is persisted through the same queue"
+    );
     assertEqual(
       messagesOfType(options.runtimeMessages, "TEST_CONNECTION"),
       [{ type: "TEST_CONNECTION", provider: "deepseek", targetLanguage: "ko", model: "deepseek-v4-pro" }],
       "paste gate: the auto test runs against the STORED provider/model/language, never defaults"
     );
     assertEqual(popup.dom.get("status-title").textContent, "Key 有效", "paste gate: the auto test completes after init");
+  }
+
+  // (9b) PR #19 follow-up: the INPUT-triggered auto-verification is
+  // init-gated too (held first storage read): typing a format-valid key
+  // while init is pending banks the edit and bills/writes nothing; once init
+  // settles, the parked request saves the key through the queue and runs
+  // exactly one TEST_CONNECTION for it.
+  {
+    let tests = 0;
+    const { popup, writes, release } = createGatedPopup(seededStorage(), {
+      onRuntimeMessage: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          tests += 1;
+          return { ok: true };
+        }
+        return { ok: false };
+      }
+    });
+    await tick();
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = TYPED_KEY;
+    fire(keyInput, "input");
+    await tick();
+    assertEqual(tests, 0, "input verification gate: no TEST_CONNECTION while init is pending");
+    assertEqual(writes.length, 0, "input verification gate: no storage write while init is pending");
+    await release();
+    await new Promise((resolve) => setTimeout(resolve, 700)); // init settle + the 600 ms debounce
+    await waitFor(() => tests === 1 && popup.storage.deepseekKeyStatus === "verified", "input verification gate: the parked request tests and persists its verdict");
+    assertEqual(
+      writes,
+      [
+        { deepseekApiKey: TYPED_KEY, apiKey: TYPED_KEY, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${TYPED_KEY.length}:${TYPED_KEY.slice(-4)}` },
+        { deepseekKeyStatus: "verified", deepseekKeyStatusFor: `${TYPED_KEY.length}:${TYPED_KEY.slice(-4)}` }
+      ],
+      "input verification gate: after init, the typed key saves once and the verdict persists behind it, through the same queue"
+    );
   }
 
   // (10) Init FAILED (the first storage read rejects): the init-ready promise
@@ -5626,7 +6001,7 @@ async function checkPopupActionInitGate() {
   const ALLOWED_UNGATED = new Map([
     ["elements.toggleKey|click", { reason: "pure key-visibility toggle, no settings access", gatedInside: false }],
     ["elements.selectionConfirmDismiss|click", { reason: "clears worker/page selection state only, no settings access", gatedInside: false }],
-    ["elements.apiKey|input", { reason: "banks the edit only; the debounced save no-ops before init and initialize() flushes banked edits", gatedInside: false }],
+    ["elements.apiKey|input", { reason: "banks the edit synchronously (pre-init banking is the designed behavior); the debounced save no-ops before init, and the input-triggered verification request goes through whenReady inside", gatedInside: true }],
     ["elements.apiKey|paste", { reason: "banks the pasted value in the deferred tick; the save + auto test go through whenReady inside", gatedInside: true }],
     ["elements.provider|change", { reason: "banks provider/model edits synchronously; the save goes through whenReady inside", gatedInside: true }],
     ["elements.targetLanguage|change", { reason: "banks the language edit synchronously; the save goes through whenReady inside", gatedInside: true }],
@@ -5642,7 +6017,6 @@ async function checkPopupActionInitGate() {
     ["elements.openSettings|click", { reason: "pure view navigation to settings, no settings access", gatedInside: false }],
     ["elements.moreSettings|click", { reason: "pure view navigation to settings, no settings access", gatedInside: false }],
     ["elements.backMain|click", { reason: "pure view navigation back to main, no settings access", gatedInside: false }],
-    ["elements.providerStatus|click", { reason: "pure view navigation (opens settings with the key focused), no settings access", gatedInside: false }],
     ["elements.openShortcuts|click", { reason: "opens chrome://extensions/shortcuts in a new tab only, no settings access", gatedInside: false }],
     // 1.5.0 partial-retry action: messages the page only (like restore/export).
     ["elements.retryFailed|click", { reason: "RETRY_FAILED page message only, no settings read or write", gatedInside: false }],
@@ -5656,6 +6030,10 @@ async function checkPopupActionInitGate() {
     "elements.translate|click",
     "elements.exportSettings|click",
     "elements.importFile|change",
+    // Codex PR #19 P2: both status-line actions run a connection test, which
+    // reads settings and writes the verdict status through the queue.
+    "elements.providerStatus|click",
+    "elements.setupFeedback|click",
     "button|click" // display-mode buttons
   ];
 
@@ -5877,9 +6255,11 @@ async function checkPopupViews150() {
     assertEqual(popup.hooks.getAppView(), "setup", "setup view: back from more-settings returns to setup");
   }
 
-  // (2) Seeded DeepSeek store: main view, no idle card while the page is
-  // inactive, and the provider status line shows 已配置 (never 已连接 before
-  // a test this session) with the short model name and key tail only.
+  // (2) Seeded DeepSeek store WITHOUT any verdict: main view (an unverified
+  // key still opens as main — translate works, the line just says so), no
+  // idle card while the page is inactive, and the provider status line reads
+  // 未验证 in a warn tone (never 已配置) with the short model name and key
+  // tail only.
   {
     const popup = createPopupVm(seededMain());
     await popup.hooks.initializePromise;
@@ -5887,8 +6267,8 @@ async function checkPopupViews150() {
     assertTrue(popup.dom.get("status-wrap").hidden, "main view: an inactive page collapses the status area (no idle card)");
     assertEqual(
       popup.dom.get("provider-status-label").textContent,
-      "✓ DeepSeek 已配置",
-      "provider status: configured-but-unverified shows 已配置"
+      "DeepSeek Key 未验证 · 点此重新测试",
+      "provider status: configured-but-unverified shows 未验证 and a re-test affordance"
     );
     assertEqual(
       popup.dom.get("provider-status-meta").textContent,
@@ -5899,13 +6279,15 @@ async function checkPopupViews150() {
       String(popup.dom.get("provider-status-meta").textContent).includes(DEEPSEEK_KEY),
       "provider status: the meta line never carries the full key"
     );
-    assertEqual(popup.dom.get("provider-status").dataset.tone, "ok", "provider status: tone ok with a key present");
+    assertEqual(popup.dom.get("provider-status").dataset.tone, "warn", "provider status: tone warn while the key is unverified");
     assertSameDom(popup.dom.get("key-entry").parentNode, popup.dom.get("settings-key-slot"), "main view: #key-entry stays in the settings slot");
 
-    // (2b) A successful connection test flips the line to 已连接.
+    // (2b) A successful connection test flips the line to 已连接 — and the
+    // verdict itself is persisted (verified + fingerprint) through the queue.
     const tested = createPopupVm(seededMain(), {
       runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? { ok: true } : { ok: false })
     });
+    const testedWrites = recordWrites(tested);
     await tested.hooks.initializePromise;
     await tested.hooks.runKeyConnectionTest();
     assertEqual(
@@ -5914,6 +6296,11 @@ async function checkPopupViews150() {
       "provider status: a successful test this session shows 已连接"
     );
     assertEqual(tested.dom.get("status-title").textContent, "Key 有效", "provider status: the test result still lands on the status card in main view");
+    assertEqual(
+      testedWrites,
+      [{ deepseekKeyStatus: "verified", deepseekKeyStatusFor: `${DEEPSEEK_KEY.length}:${DEEPSEEK_KEY.slice(-4)}` }],
+      "provider status: the ok verdict is the only write, and it persists verified for this exact key"
+    );
   }
 
   // (3) Setup graduation through the REAL paste listener: bank → gated save
@@ -5940,11 +6327,16 @@ async function checkPopupViews150() {
     await waitFor(() => popup.hooks.getAppView() === "main", "paste ok: graduation to main");
     assertEqual(testRequests.length, 1, "paste ok: exactly one connection test");
     assertEqual(testRequests[0].type, "TEST_CONNECTION", "paste ok: verification goes through the background message path");
-    assertEqual(writes.length, 1, "paste ok: the key lands through exactly one queued write");
+    assertEqual(writes.length, 2, "paste ok: the key save + the ok verdict are exactly two queued writes");
     assertEqual(
       writes[0],
-      { deepseekApiKey: PASTED_KEY, apiKey: PASTED_KEY },
-      "paste ok: the write carries the key and its selection-gate mirror"
+      { deepseekApiKey: PASTED_KEY, apiKey: PASTED_KEY, deepseekKeyStatus: "unverified", deepseekKeyStatusFor: `${PASTED_KEY.length}:${PASTED_KEY.slice(-4)}` },
+      "paste ok: the key write carries the key, its selection-gate mirror and a fresh unverified status"
+    );
+    assertEqual(
+      writes[1],
+      { deepseekKeyStatus: "verified", deepseekKeyStatusFor: `${PASTED_KEY.length}:${PASTED_KEY.slice(-4)}` },
+      "paste ok: the ok verdict persists verified for the pasted key"
     );
     assertEqual(popup.storage.deepseekApiKey, PASTED_KEY, "paste ok: the pasted key is stored");
     assertEqual(popup.dom.get("setup-feedback").textContent, "✓ 已连接", "paste ok: the setup card's own feedback confirms the connection");
@@ -5986,6 +6378,37 @@ async function checkPopupViews150() {
     popup.emitStorageChange({ deepseekApiKey: { oldValue: "not-a-key", newValue: EXTERNAL_KEY } });
     assertEqual(popup.hooks.getAppView(), "main", "setup exit: a different valid key arriving via onChanged graduates to main");
     assertEqual(popup.dom.get("api-key").value, EXTERNAL_KEY, "setup exit: the input shows the externally arrived key");
+  }
+
+  // (3b2) Codex PR #19 P2: a stored "failed" verdict arriving WITH its key
+  // (another surface tested it and failed) keeps the setup card open with the
+  // stored-failure notice — only a DIFFERENT, unfailed key graduates.
+  {
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: KIMI_KEY, apiKey: "", model: "deepseek-flash" },
+      { runtimeMessageHandler: async () => ({ ok: false }) }
+    );
+    await popup.hooks.initializePromise;
+    popup.emitStorageChange({
+      deepseekApiKey: { oldValue: "", newValue: PASTED_KEY },
+      deepseekKeyStatus: { oldValue: null, newValue: "failed" },
+      deepseekKeyStatusFor: { oldValue: null, newValue: `${PASTED_KEY.length}:${PASTED_KEY.slice(-4)}` }
+    });
+    assertEqual(popup.hooks.getAppView(), "setup", "setup exit: a failed verdict's key arriving via onChanged keeps setup open");
+    assertTrue(
+      String(popup.dom.get("setup-feedback").textContent).includes("验证失败"),
+      "setup exit: the stored-failure notice renders for the externally arrived failed key"
+    );
+    // A different valid key without a matching failed verdict graduates.
+    popup.emitStorageChange({
+      deepseekApiKey: { oldValue: PASTED_KEY, newValue: EXTERNAL_KEY },
+      deepseekKeyStatus: { oldValue: "failed", newValue: "unverified" },
+      deepseekKeyStatusFor: {
+        oldValue: `${PASTED_KEY.length}:${PASTED_KEY.slice(-4)}`,
+        newValue: `${EXTERNAL_KEY.length}:${EXTERNAL_KEY.slice(-4)}`
+      }
+    });
+    assertEqual(popup.hooks.getAppView(), "main", "setup exit: a fresh unfailed key graduates to main");
   }
 
   // (3c) Format-gate a malformed paste: no network, reason in the feedback.
@@ -6375,13 +6798,564 @@ async function checkPopupViews150() {
     assertEqual(popup.hooks.getAppView(), "settings", "settings tab: ← back cannot leave the settings tab");
   }
 
-  // (10) Retired copy never ships: the idle title is gone from the popup.
+  // (10) Retired copy never ships: the idle title is gone from the popup, and
+  // (Codex PR #19 P2) the popup never claims a key is 已配置 — a key is either
+  // 已连接 (verified), 未验证 or 验证失败, never merely present. Raw source
+  // (comments included): popup.js/popup.html must carry zero 已配置 bytes.
   {
     for (const rel of ["popup.js", "popup.html"]) {
       const source = fs.readFileSync(path.join(ROOT, rel), "utf8");
       assertFalse(source.includes("准备就绪"), `static copy (${rel}): the retired idle title 准备就绪 must not ship`);
       assertFalse(source.includes("划词选中即可弹出译文"), `static copy (${rel}): the retired selection hint must not ship`);
+      assertFalse(source.includes("已配置"), `static copy (${rel}): the retired 已配置 status must not ship (verified keys say 已连接, everything else 未验证/验证失败)`);
     }
+  }
+
+  // (11) Codex PR #19 P2 — a stored "failed" verdict for the stored key: the
+  // popup reopens on the setup card (translate stays unreachable), the
+  // settings row reads 验证失败, and the setup card's message doubles as the
+  // one-click re-test link.
+  {
+    let tests = 0;
+    const FAILED_KEY = fakeKey("storedfailed", 21);
+    const popup = createPopupVm(
+      seededMain({
+        deepseekApiKey: FAILED_KEY,
+        apiKey: FAILED_KEY,
+        deepseekKeyStatus: "failed",
+        deepseekKeyStatusFor: `${FAILED_KEY.length}:${FAILED_KEY.slice(-4)}`
+      }),
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            tests += 1;
+            return { ok: true };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    const writes = recordWrites(popup);
+    await popup.hooks.initializePromise;
+    assertEqual(popup.hooks.getAppView(), "setup", "stored failed: the popup reopens on the setup card");
+    assertTrue(
+      String(popup.dom.get("setup-feedback").textContent).includes("验证失败"),
+      "stored failed: the setup feedback names the failed verification"
+    );
+    assertEqual(popup.dom.get("setup-feedback").dataset.retest, "true", "stored failed: the feedback carries the re-test affordance");
+    assertEqual(
+      popup.dom.get("key-status-deepseek-value").textContent,
+      `验证失败 · 尾号 ${FAILED_KEY.slice(-4)}`,
+      "stored failed: the settings row reads 验证失败 with the key tail"
+    );
+    assertEqual(popup.dom.get("key-status-deepseek").dataset.tone, "error", "stored failed: the settings row tone is error");
+    // The re-test link re-runs the test in place; ok graduates to main.
+    await fireAction(popup.dom.get("setup-feedback"), "click");
+    assertEqual(tests, 1, "stored failed: the re-test link bills exactly one TEST_CONNECTION");
+    assertEqual(popup.hooks.getAppView(), "main", "stored failed: a passing re-test graduates to main");
+    assertEqual(popup.dom.get("setup-feedback").textContent, "✓ 已连接", "stored failed: the re-test result lands on the setup card");
+    assertEqual(
+      writes,
+      [{ deepseekKeyStatus: "verified", deepseekKeyStatusFor: `${FAILED_KEY.length}:${FAILED_KEY.slice(-4)}` }],
+      "stored failed: the re-test verdict persists verified through the one queue"
+    );
+  }
+
+  // (12) The unverified provider line's click runs the connection test in
+  // place — the 1.4.3 upgrade path (a key with NO stored verdict, main view).
+  {
+    let tests = 0;
+    const popup = createPopupVm(seededMain(), {
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          tests += 1;
+          return { ok: true };
+        }
+        return { ok: false };
+      }
+    });
+    const writes = recordWrites(popup);
+    await popup.hooks.initializePromise;
+    assertEqual(
+      popup.dom.get("provider-status-label").textContent,
+      "DeepSeek Key 未验证 · 点此重新测试",
+      "retest line: the unverified label offers the re-test"
+    );
+    await fireAction(popup.dom.get("provider-status"), "click");
+    assertEqual(tests, 1, "retest line: the click bills exactly one TEST_CONNECTION");
+    assertEqual(
+      popup.dom.get("provider-status-label").textContent,
+      "✓ DeepSeek 已连接",
+      "retest line: an ok verdict flips the line to 已连接"
+    );
+    assertEqual(
+      writes,
+      [{ deepseekKeyStatus: "verified", deepseekKeyStatusFor: `${DEEPSEEK_KEY.length}:${DEEPSEEK_KEY.slice(-4)}` }],
+      "retest line: the verdict persists verified through the one queue"
+    );
+    assertEqual(popup.storage.deepseekKeyStatus, "verified", "retest line: storage carries the verified status");
+    assertFalse(popup.dom.get("provider-status").disabled, "retest line: the button re-enables after the test");
+  }
+
+  // (13) A verdict is only trusted for the exact key it was computed on: a
+  // stored status whose fingerprint does not match the stored key reads back
+  // as 未验证 — never verified (green line), never failed (setup trap).
+  {
+    const verifiedMismatch = createPopupVm(seededMain({
+      deepseekKeyStatus: "verified",
+      deepseekKeyStatusFor: "99:zzzz"
+    }));
+    await verifiedMismatch.hooks.initializePromise;
+    assertEqual(verifiedMismatch.dom.get("provider-status").dataset.tone, "warn", "status fingerprint: a mismatched verified status reads warn");
+    assertTrue(
+      String(verifiedMismatch.dom.get("provider-status-label").textContent).includes("未验证"),
+      "status fingerprint: a mismatched verified status shows 未验证"
+    );
+    const failedMismatch = createPopupVm(seededMain({
+      deepseekKeyStatus: "failed",
+      deepseekKeyStatusFor: "99:zzzz"
+    }));
+    await failedMismatch.hooks.initializePromise;
+    assertEqual(failedMismatch.hooks.getAppView(), "main", "status fingerprint: a mismatched failed status never traps the popup in setup");
+    assertEqual(
+      failedMismatch.dom.get("key-status-deepseek-value").textContent,
+      `未验证 · 尾号 ${DEEPSEEK_KEY.slice(-4)}`,
+      "status fingerprint: a mismatched failed status reads 未验证 in the rows"
+    );
+  }
+
+  // (14) A definitive failure persists "failed" for that exact key; a FRESH
+  // popup on that storage reopens on the setup card with the notice.
+  {
+    const BAD_KEY = fakeKey("definitivelybad", 21);
+    let tests = 0;
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: KIMI_KEY, apiKey: "", model: "deepseek-flash" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            tests += 1;
+            return { ok: false, code: "API_401", error: "Key 不正确" };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    const writes = recordWrites(popup);
+    await popup.hooks.initializePromise;
+    popup.dom.get("api-key").value = BAD_KEY;
+    fire(popup.dom.get("api-key"), "paste");
+    await waitFor(() => writes.length >= 2, "failed persist: the key save and the failed verdict both land");
+    assertEqual(tests, 1, "failed persist: the pasted bad key bills exactly one TEST_CONNECTION");
+    assertEqual(
+      writes[1],
+      { deepseekKeyStatus: "failed", deepseekKeyStatusFor: `${BAD_KEY.length}:${BAD_KEY.slice(-4)}` },
+      "failed persist: a 401 verdict writes the failed status for that exact key"
+    );
+    assertEqual(popup.hooks.getAppView(), "setup", "failed persist: the rejected key stays on the setup card");
+    // A FRESH popup on the persisted storage reopens in setup with the notice.
+    const reopened = createPopupVm({
+      provider: "deepseek",
+      deepseekApiKey: BAD_KEY,
+      kimiApiKey: KIMI_KEY,
+      apiKey: BAD_KEY,
+      model: "deepseek-flash",
+      deepseekKeyStatus: "failed",
+      deepseekKeyStatusFor: `${BAD_KEY.length}:${BAD_KEY.slice(-4)}`
+    });
+    await reopened.hooks.initializePromise;
+    assertEqual(reopened.hooks.getAppView(), "setup", "failed reopen: a fresh popup on a failed key opens as setup");
+    assertTrue(
+      String(reopened.dom.get("setup-feedback").textContent).includes("验证失败"),
+      "failed reopen: the fresh popup names the stored failure"
+    );
+    assertEqual(
+      reopened.dom.get("key-status-deepseek-value").textContent,
+      `验证失败 · 尾号 ${BAD_KEY.slice(-4)}`,
+      "failed reopen: the settings row reads 验证失败 with the rejected key's tail (never 已配置)"
+    );
+  }
+
+  // (14b) Transient failures say nothing about the key: no failed write, the
+  // status stays at the unverified the key's own save wrote.
+  {
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash" },
+      {
+        runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION"
+          ? { ok: false, code: "NETWORK_ERROR", error: "网络错误", transient: true }
+          : { ok: false })
+      }
+    );
+    const writes = recordWrites(popup);
+    await popup.hooks.initializePromise;
+    popup.dom.get("api-key").value = TYPED_KEY;
+    fire(popup.dom.get("api-key"), "paste");
+    await waitFor(() => writes.length === 1, "transient verdict: only the key's own unverified write lands");
+    assertEqual(writes[0].deepseekKeyStatus, "unverified", "transient verdict: the key save reset the status to unverified");
+    assertFalse(
+      writes.some((write) => write.deepseekKeyStatus === "failed"),
+      "transient verdict: a network failure never persists failed"
+    );
+  }
+
+  // (15) Codex PR #19 P2 (stale verification, popup side): a success for a
+  // value the user already replaced flips nothing — no graduation, no verdict
+  // message, no verified write. (The input event retires the in-flight op AND
+  // the apply site re-checks provider+value; this asserts the outcome.)
+  {
+    let tests = 0;
+    let resolveTest;
+    const gate = new Promise((resolve) => { resolveTest = resolve; });
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            tests += 1;
+            return gate;
+          }
+          return { ok: false };
+        }
+      }
+    );
+    const writes = recordWrites(popup);
+    await popup.hooks.initializePromise;
+    popup.dom.get("api-key").value = TYPED_KEY;
+    fire(popup.dom.get("api-key"), "paste"); // the pasted key's test parks
+    await waitFor(() => tests === 1, "popup stale: the pasted key's test is in flight");
+    // The user replaces the value with a format-INVALID one via input only —
+    // no second test fires; the verdict below still describes the OLD value.
+    popup.dom.get("api-key").value = "not-a-key";
+    fire(popup.dom.get("api-key"), "input");
+    await new Promise((resolve) => setTimeout(resolve, 260)); // the 200 ms debounce saves it
+    resolveTest({ ok: true }); // the OLD key's verdict arrives late
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assertEqual(popup.hooks.getAppView(), "setup", "popup stale: the late ok does not graduate setup");
+    assertFalse(
+      String(popup.dom.get("setup-feedback").textContent).includes("已连接"),
+      "popup stale: the late ok renders nothing"
+    );
+    assertFalse(
+      writes.some((write) => write.deepseekKeyStatus === "verified"),
+      "popup stale: the late ok writes no verified status"
+    );
+    assertEqual(popup.storage.deepseekApiKey, "not-a-key", "popup stale: the newer input is what got saved");
+  }
+
+  // (16) The provider-status re-test action is init-gated (held first storage
+  // read): a click before init completes bills nothing and writes nothing;
+  // once init settles, the parked click runs exactly one test.
+  {
+    let tests = 0;
+    const { popup, writes, release } = createHeldPopup(seededMain(), {
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          tests += 1;
+          return { ok: true };
+        }
+        return { ok: false };
+      }
+    });
+    await tick();
+    const clicked = fireAction(popup.dom.get("provider-status"), "click");
+    await tick();
+    assertEqual(tests, 0, "provider status gate: no TEST_CONNECTION while init is pending");
+    assertEqual(writes.length, 0, "provider status gate: no storage write while init is pending");
+    await release();
+    await clicked;
+    assertEqual(tests, 1, "provider status gate: the parked click runs exactly one test after init");
+    assertEqual(
+      writes,
+      [{ deepseekKeyStatus: "verified", deepseekKeyStatusFor: `${DEEPSEEK_KEY.length}:${DEEPSEEK_KEY.slice(-4)}` }],
+      "provider status gate: the verdict write lands after init, through the queue"
+    );
+    assertEqual(
+      popup.dom.get("provider-status-label").textContent,
+      "✓ DeepSeek 已连接",
+      "provider status gate: the line flips to 已连接"
+    );
+  }
+
+  // (16b) The setup card's re-test link is init-gated too (held first read):
+  // the pre-init popup has not even rendered the stored-failure notice yet —
+  // the parked click may only run once init resolves and the notice exists.
+  {
+    let tests = 0;
+    const FAILED_KEY = fakeKey("heldfailed", 21);
+    const { popup, writes, release } = createHeldPopup(
+      {
+        provider: "deepseek",
+        deepseekApiKey: FAILED_KEY,
+        kimiApiKey: KIMI_KEY,
+        apiKey: FAILED_KEY,
+        model: "deepseek-flash",
+        deepseekKeyStatus: "failed",
+        deepseekKeyStatusFor: `${FAILED_KEY.length}:${FAILED_KEY.slice(-4)}`
+      },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            tests += 1;
+            return { ok: true };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    await tick();
+    const clicked = fireAction(popup.dom.get("setup-feedback"), "click");
+    await tick();
+    assertEqual(tests, 0, "retest link gate: no TEST_CONNECTION while init is pending");
+    assertEqual(writes.length, 0, "retest link gate: no storage write while init is pending");
+    await release();
+    await clicked;
+    assertEqual(tests, 1, "retest link gate: the parked click runs exactly one test after init");
+    assertEqual(
+      writes,
+      [{ deepseekKeyStatus: "verified", deepseekKeyStatusFor: `${FAILED_KEY.length}:${FAILED_KEY.slice(-4)}` }],
+      "retest link gate: the verdict write lands after init, through the queue"
+    );
+    assertEqual(popup.hooks.getAppView(), "main", "retest link gate: the ok verdict graduates to main");
+  }
+
+  // (17) The verdict status write serializes through the ONE queue
+  // (controlled storage): while the verified-for-A write parks, a newer key B
+  // saves strictly behind it; the surviving status belongs to B's save, and
+  // the stale verified verdict reads back as 未验证 (fingerprint mismatch).
+  {
+    const popup = createPopupVm(seededMain(), {
+      runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? { ok: true } : { ok: false })
+    });
+    await popup.hooks.initializePromise;
+    const gate = gateStorage(popup);
+    const keyInput = popup.dom.get("api-key");
+    const tested = fireAction(popup.dom.get("test-connection"), "click");
+    await waitFor(() => gate.writes.length === 1, "verdict queue: the verified write parks");
+    assertEqual(
+      gate.writes[0].updates,
+      { deepseekKeyStatus: "verified", deepseekKeyStatusFor: `${DEEPSEEK_KEY.length}:${DEEPSEEK_KEY.slice(-4)}` },
+      "verdict queue: the verdict write carries only the status fields"
+    );
+    // While it is in flight the user types a NEW key (its change commit also
+    // schedules the debounced auto-verification — that run happens 600 ms
+    // later, after this test block has asserted; only the SAVE races here).
+    // The save enqueues strictly BEHIND the parked verdict write — no second
+    // set() until the first commits.
+    const NEW_KEY = fakeKey("verdictnewer", 22);
+    keyInput.value = NEW_KEY;
+    fire(keyInput, "input");
+    fire(keyInput, "change");
+    await tick();
+    assertEqual(gate.writes.length, 1, "verdict queue: the newer key's save waits behind the parked verdict write");
+    gate.writes[0].release();
+    await waitFor(() => gate.writes.length === 2, "verdict queue: the follow-up save starts once the verdict write commits");
+    assertEqual(
+      gate.writes[1].updates,
+      {
+        deepseekApiKey: NEW_KEY,
+        apiKey: NEW_KEY,
+        deepseekKeyStatus: "unverified",
+        deepseekKeyStatusFor: `${NEW_KEY.length}:${NEW_KEY.slice(-4)}`
+      },
+      "verdict queue: the follow-up save carries the newer key with a fresh unverified status"
+    );
+    gate.writes[1].release();
+    await tick();
+    await tested;
+    assertEqual(gate.maxInFlight, 1, "verdict queue: at most one write in flight at a time");
+    assertEqual(popup.storage.deepseekApiKey, NEW_KEY, "verdict queue: the newer key ends in storage");
+    assertEqual(
+      popup.storage.deepseekKeyStatusFor,
+      `${NEW_KEY.length}:${NEW_KEY.slice(-4)}`,
+      "verdict queue: the surviving fingerprint belongs to the newer key's save"
+    );
+    // The follow-up save's completion re-renders the line: the verified
+    // verdict described the replaced key, so it must read back as 未验证.
+    await waitFor(
+      () => popup.dom.get("provider-status-label").textContent === "DeepSeek Key 未验证 · 点此重新测试",
+      "verdict queue: the line re-renders after the follow-up save settles"
+    );
+  }
+
+  // (18) PR #19 follow-up (typing verification, setup card): building a key
+  // char-by-char and blurring bills EXACTLY ONE TEST_CONNECTION — for the
+  // FINAL value. The half-typed (format-invalid) prefixes request nothing,
+  // the verifier collapses the keystroke burst, and the blur's commit saves
+  // before the debounced run tests storage.
+  {
+    const seen = [];
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            seen.push({ provider: message.provider, storedKey: popup.storage.deepseekApiKey });
+            return { ok: true };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    const writes = recordWrites(popup);
+    await popup.hooks.initializePromise;
+    const keyInput = popup.dom.get("api-key");
+    for (let length = 1; length <= TYPED_KEY.length; length += 1) {
+      keyInput.value = TYPED_KEY.slice(0, length);
+      fire(keyInput, "input");
+      await tick();
+    }
+    assertEqual(seen.length, 0, "typing setup: no TEST_CONNECTION fires while typing (format-invalid prefixes ask nothing; the debounce owns the burst)");
+    fire(keyInput, "blur");
+    await new Promise((resolve) => setTimeout(resolve, 700)); // the input/blur debounce
+    assertEqual(seen.length, 1, "typing setup: exactly one TEST_CONNECTION after the burst settles");
+    assertEqual(
+      seen[0],
+      { provider: "deepseek", storedKey: TYPED_KEY },
+      "typing setup: the one test reads the FINAL saved value from storage (the blur committed the save first)"
+    );
+    assertEqual(popup.storage.deepseekApiKey, TYPED_KEY, "typing setup: the typed key is what storage holds");
+    await waitFor(
+      () => popup.storage.deepseekKeyStatus === "verified",
+      "typing setup: the verdict persists verified for the typed key"
+    );
+    assertEqual(
+      popup.storage.deepseekKeyStatusFor,
+      `${TYPED_KEY.length}:${TYPED_KEY.slice(-4)}`,
+      "typing setup: the verdict's fingerprint names the typed key"
+    );
+    assertEqual(popup.hooks.getAppView(), "main", "typing setup: the ok verdict graduates the setup card");
+    assertTrue(
+      writes.every((write) => write.deepseekKeyStatusFor !== `${PASTED_KEY.length}:${PASTED_KEY.slice(-4)}`),
+      "typing setup: no write ever carries another key's fingerprint"
+    );
+  }
+
+  // (18b) The same typing session in the SETTINGS key field: one test for the
+  // final value, the replaced stored key swapped, the other provider intact.
+  {
+    const NEW_KEY = fakeKey("settingstyped", 24);
+    const seen = [];
+    const popup = createPopupVm(seededMain(), {
+      locationSearch: "?view=settings",
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          seen.push({ provider: message.provider, storedKey: popup.storage.deepseekApiKey });
+          return { ok: true };
+        }
+        return { ok: false };
+      }
+    });
+    await popup.hooks.initializePromise;
+    const keyInput = popup.dom.get("api-key");
+    for (let length = 1; length <= NEW_KEY.length; length += 1) {
+      keyInput.value = NEW_KEY.slice(0, length);
+      fire(keyInput, "input");
+      await tick();
+    }
+    fire(keyInput, "blur");
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assertEqual(seen.length, 1, "typing settings: exactly one TEST_CONNECTION for the retyped key");
+    assertEqual(seen[0], { provider: "deepseek", storedKey: NEW_KEY }, "typing settings: the test reads the final value from storage");
+    assertEqual(popup.storage.deepseekApiKey, NEW_KEY, "typing settings: the retyped key replaces the stored one");
+    assertEqual(popup.storage.kimiApiKey, KIMI_KEY, "typing settings: the other provider's key is untouched");
+    assertEqual(popup.hooks.getAppView(), "settings", "typing settings: the settings view is where the session stayed");
+  }
+
+  // (19) PR #19 follow-up (paste A, replace with B before A resolves): the
+  // saved key, the tested key and the persisted verdict all describe B; A's
+  // late ok applies nothing (its op is retired by B's edit), and B bills
+  // exactly one TEST_CONNECTION of its own.
+  {
+    const A_KEY = fakeKey("pastedA", 24);
+    const B_KEY = fakeKey("editedB", 25);
+    const held = [];
+    const popup = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            return new Promise((resolve) => {
+              held.push(resolve);
+            });
+          }
+          return { ok: false };
+        }
+      }
+    );
+    const writes = recordWrites(popup);
+    await popup.hooks.initializePromise;
+    const keyInput = popup.dom.get("api-key");
+    keyInput.value = A_KEY;
+    fire(keyInput, "paste");
+    await waitFor(() => held.length === 1, "paste-then-edit: A's test is in flight");
+    // Replace A with B (input + change, no blur needed) BEFORE A resolves.
+    keyInput.value = B_KEY;
+    fire(keyInput, "input");
+    fire(keyInput, "change");
+    // A's slow ok arrives late: it must flip nothing.
+    held[0]({ ok: true });
+    await tick();
+    assertEqual(popup.hooks.getAppView(), "setup", "paste-then-edit: A's late ok does not graduate the setup card");
+    assertFalse(
+      writes.some((write) => write.deepseekKeyStatus === "verified"),
+      "paste-then-edit: no verdict lands while B is still pending"
+    );
+    // B's own (debounced) verification fires once and tests the saved B.
+    // (The debounce is a real 600 ms timer — wait it out explicitly, the
+    // 1 ms waitFor loop below cannot cover it.)
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assertEqual(held.length, 2, "paste-then-edit: B's own verification fires exactly once");
+    assertEqual(popup.storage.deepseekApiKey, B_KEY, "paste-then-edit: storage holds B, never A");
+    held[1]({ ok: true });
+    await waitFor(
+      () => popup.storage.deepseekKeyStatus === "verified",
+      "paste-then-edit: B's verdict persists verified"
+    );
+    assertEqual(popup.storage.deepseekKeyStatusFor, `${B_KEY.length}:${B_KEY.slice(-4)}`, "paste-then-edit: the surviving fingerprint names B");
+    assertFalse(
+      writes.some((write) => write.deepseekKeyStatus === "verified" && write.deepseekKeyStatusFor === `${A_KEY.length}:${A_KEY.slice(-4)}`),
+      "paste-then-edit: A's late ok never persists a verified verdict for A"
+    );
+    assertEqual(popup.hooks.getAppView(), "main", "paste-then-edit: B's ok verdict is what graduates the setup card");
+  }
+
+  // (20) PR #19 follow-up (restricted by behavior): without the tabs
+  // permission the popup cannot read the URL, so a chrome:// page passes the
+  // URL probe — the injection itself refusing (PING and executeScript both
+  // reject) must mark the page restricted: the cannot-translate notice
+  // renders in the MAIN view, 翻译此页 disables, and (no-key store) the
+  // setup card never wins over the notice. No new permissions are asked for.
+  {
+    const rejecting = {
+      activeTab: {},
+      tabsSendMessage: async () => {
+        throw new Error("vm: cannot access tab");
+      },
+      executeScript: async () => {
+        throw new Error("vm: cannot inject");
+      }
+    };
+    const popup = createPopupVm(seededMain(), rejecting);
+    await popup.hooks.initializePromise;
+    assertEqual(popup.hooks.getAppView(), "main", "restricted by behavior: an unreadable URL that refuses injection opens on main");
+    assertEqual(popup.dom.get("status-title").textContent, "这个页面不能翻译", "restricted by behavior: the cannot-translate notice is visible");
+    assertTrue(
+      String(popup.dom.get("status-detail").textContent).includes("不允许扩展注入"),
+      "restricted by behavior: the notice explains the injection ban"
+    );
+    assertTrue(popup.dom.get("translate").disabled, "restricted by behavior: 翻译此页 is disabled");
+    assertTrue(popup.dom.get("restore").disabled, "restricted by behavior: 还原原文 is disabled");
+    assertFalse(popup.dom.get("status-wrap").hidden, "restricted by behavior: the notice card is visible");
+    // No key + injection refused: the notice still wins over the setup card.
+    const noKey = createPopupVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash" },
+      rejecting
+    );
+    await noKey.hooks.initializePromise;
+    assertEqual(noKey.hooks.getAppView(), "main", "restricted by behavior (no key): the view is main, not setup");
+    assertEqual(noKey.dom.get("status-title").textContent, "这个页面不能翻译", "restricted by behavior (no key): the notice is visible");
+    assertTrue(noKey.dom.get("translate").disabled, "restricted by behavior (no key): 翻译此页 is disabled");
   }
 }
 

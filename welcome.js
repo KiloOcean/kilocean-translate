@@ -86,6 +86,40 @@
   // key is rewritten on persist; an accepted stored key only flips the
   // provider/model/mirror).
   let verifiedKey = null;
+  // Codex PR #19 P2 (stale verification): the verification that currently owns
+  // step 2's UI, as {token, provider, key}. Every verification captures its
+  // token; a verdict is applied ONLY when its token is still current, the
+  // provider is still selected and the input still holds the exact key — a
+  // late success for a value the user already replaced must never persist,
+  // enable 继续 or mark verified. The same identity re-claiming (one paste
+  // fires paste+input+change+blur) keeps its token, so the deduped burst still
+  // renders its one verdict.
+  const keyVerification = { token: 0, provider: "", key: "" };
+
+  function claimKeyVerification(keyProvider, key) {
+    if (keyVerification.provider !== keyProvider || keyVerification.key !== key) {
+      keyVerification.token += 1;
+      keyVerification.provider = keyProvider;
+      keyVerification.key = key;
+    }
+    return keyVerification.token;
+  }
+
+  function invalidateKeyVerification() {
+    keyVerification.token += 1;
+    keyVerification.provider = "";
+    keyVerification.key = "";
+  }
+
+  function isCurrentKeyVerification(token, keyProvider, key) {
+    return (
+      keyVerification.token === token &&
+      keyVerification.provider === keyProvider &&
+      keyVerification.key === key &&
+      provider === keyProvider &&
+      els.s2Key.value.trim() === key
+    );
+  }
 
   /* ---------- step tracker ---------- */
   function showStep(step) {
@@ -137,6 +171,7 @@
       // still-pending debounced run for its value must not fire (and bill a
       // stale TEST_CONNECTION) after the switch.
       keyVerifier.forget(provider);
+      invalidateKeyVerification();
     }
     provider = next in PROVIDERS ? next : "deepseek";
     els.providerButtons.forEach((button) => {
@@ -217,9 +252,11 @@
 
   /* P2-1: ONE function persists a verified provider choice in ONE
    * chrome.storage.local.set — provider, that provider's default model, the
-   * key (+ legacy apiKey mirror) when it was newly pasted, and a verified
-   * flag. Atomically, so background loadSettings (the sample translation) and
-   * the popup both see the chosen provider with a matching model + key. */
+   * key (+ legacy apiKey mirror) when it was newly pasted, a verified flag,
+   * and the per-provider verification status + fingerprint (P2: the popup
+   * reads the status, the keyVerified flag stays for compatibility).
+   * Atomically, so background loadSettings (the sample translation) and the
+   * popup both see the chosen provider with a matching model + key. */
   async function persistVerifiedProvider(chosenProvider, newlyPastedKey = null) {
     if (!canStore) {
       return;
@@ -230,7 +267,8 @@
       provider: chosenProvider,
       model: meta.model,
       keyVerified: true,
-      apiKey: storedKey
+      apiKey: storedKey,
+      ...Utils.keyStatusPatch(chosenProvider, "verified", storedKey)
     };
     if (newlyPastedKey) {
       patch[meta.keyField] = newlyPastedKey;
@@ -239,8 +277,9 @@
   }
 
   /* The shared verifier's run(): save the key first (TEST_CONNECTION bills
-   * the key from storage), then ask the background to verify it. Returns the
-   * verdict object; never throws. */
+   * the key from storage — with its status reset to "unverified" in the SAME
+   * set, so a verdict can never attach to a newer key), then ask the
+   * background to verify it. Returns the verdict object; never throws. */
   async function runKeyVerification(keyProvider, key) {
     const meta = PROVIDERS[keyProvider];
     if (canStore) {
@@ -249,7 +288,8 @@
           provider: keyProvider,
           model: meta.model,
           [meta.keyField]: key,
-          apiKey: key
+          apiKey: key,
+          ...Utils.keyStatusPatch(keyProvider, "unverified", key)
         });
       } catch {
         return { ok: false, code: "WELCOME_SAVE_FAILED", error: "保存失败，请重试", transient: true };
@@ -311,6 +351,7 @@
     const keyProvider = provider;
     const key = els.s2Key.value.trim();
     if (!key) {
+      invalidateKeyVerification();
       els.s2Field.classList.remove("err");
       setKeyMessage("粘贴后立即自动保存并验证", "");
       setVerified(false, null);
@@ -318,7 +359,9 @@
     }
     const formatError = validateKeyFormat(key);
     if (formatError) {
-      // Format errors stay local: no storage write, no network request.
+      // Format errors stay local: no storage write, no network request — and
+      // they retire any verification still in flight for the old value.
+      invalidateKeyVerification();
       els.s2Field.classList.add("err");
       setKeyMessage(`✕ ${formatError}`, "er");
       setVerified(false, null);
@@ -327,21 +370,36 @@
     els.s2Field.classList.remove("err");
     els.s2Msg.className = "msg";
     els.s2Msg.innerHTML = '<span class="spin" aria-hidden="true"></span> 正在保存并验证…';
+    const token = claimKeyVerification(keyProvider, key);
     const result = await keyVerifier.request(keyProvider, key, { trigger });
     if (result && result.superseded) {
       return;
     }
-    if (provider !== keyProvider) {
-      // The user switched provider while this verification was in flight —
-      // the verdict describes the departed provider; selectProvider already
-      // reset the field and the verified state. Never persist another
-      // provider's key under the new choice.
+    // Codex PR #19 P2 (stale verification): apply the verdict only when its
+    // verification is still the current one — the provider was not switched
+    // and the input still holds this exact key. A success for a value the
+    // user already replaced must not persist, enable 继续 or mark verified.
+    if (!isCurrentKeyVerification(token, keyProvider, key)) {
       return;
     }
     if (result && result.ok && !result.environmentSkipped) {
       // Verified: persist the chosen provider atomically (P2-1) before the
       // confirmation message lands.
       await persistVerifiedProvider(keyProvider, key);
+      if (!isCurrentKeyVerification(token, keyProvider, key)) {
+        // The user moved on to another value while the persist was in flight.
+        return;
+      }
+    } else if (result && !result.ok && !Utils.isTransientKeyVerdict(result)) {
+      // A definitive failure describes this key: persist "failed" so the
+      // popup reopens on its setup card instead of trusting the key (P2).
+      // Transient failures (network/timeout/429/5xx) say nothing about the
+      // key and leave the "unverified" the key save wrote.
+      try {
+        await chrome.storage.local.set(Utils.keyStatusPatch(keyProvider, "failed", key));
+      } catch {
+        // The verdict message below still tells the user it failed.
+      }
     }
     setKeyMessageFromResult(result, key);
   }

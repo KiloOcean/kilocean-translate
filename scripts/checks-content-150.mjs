@@ -345,6 +345,20 @@ return {
     if (!/if \(!gesture\) \{[\s\S]*?return false;[\s\S]*?\}/.test(noGestureBranch)) {
       fail("content.js: the no-live-selection branch must reply {ok:false} and return before any billing");
     }
+    // PR #19 follow-up: a selection INSIDE a textarea / text-like input is a
+    // distinct no-gesture case — the hint must say 暂不支持翻译输入框内的文字
+    // (the user DID select text), never the generic 先选中 line, and the
+    // branch still never bills (the sendSelectionTranslation count above is
+    // unchanged at exactly one).
+    if (!/activeElementHasTextSelection\(\)/.test(noGestureBranch)) {
+      fail("content.js: the no-gesture branch must consult activeElementHasTextSelection() to tell input-field selections apart");
+    }
+    if (!/暂不支持翻译输入框内的文字/.test(noGestureBranch)) {
+      fail("content.js: a selection inside a textarea/input must show 暂不支持翻译输入框内的文字, not the generic 先选中 hint");
+    }
+    if (!/inputSelection \? "暂不支持翻译输入框内的文字" : "先选中要翻译的文字，再按 Alt\+T 或右键「翻译选中文字」"/.test(stripComments(noGestureBranch))) {
+      fail("content.js: the no-gesture hint must pick its copy from the input-selection check");
+    }
   }
 
   // No new page-DOM billable path: sendSelectionTranslation may only be
@@ -353,6 +367,67 @@ return {
   const sendCallSites = (content.match(/sendSelectionTranslation\(/g) || []).length;
   if (sendCallSites !== 3) {
     fail(`content.js: sendSelectionTranslation must have exactly 3 occurrences (definition + CONFIRM_SELECTION_TRANSLATE + COMMAND_SELECTION_TRANSLATE), found ${sendCallSites}`);
+  }
+
+  // PR #19 follow-up, functional: activeElementHasTextSelection over fake
+  // focus trees — textarea / text-like inputs with a REAL selection count;
+  // checkboxes, collapsed carets, non-fields and empty focus never do; open
+  // shadow roots are walked to the deepest focused field.
+  {
+    const deepSrc = extract("deepActiveElement");
+    const hasSrc = extract("activeElementHasTextSelection");
+    const typesDecl = /const TEXT_SELECTION_INPUT_TYPES = new Set\(\[[^\]]*\]\);/.exec(contentRaw);
+    if (!deepSrc || !hasSrc || !typesDecl) {
+      fail("content.js: cannot extract deepActiveElement/activeElementHasTextSelection for the input-selection test");
+    } else {
+      const api = new Function(
+        `${typesDecl[0]}\n${deepSrc}\n${hasSrc}\nreturn { deepActiveElement, activeElementHasTextSelection };`
+      )();
+      const field = (tagName, props = {}) => ({ tagName, ...props });
+      const cases = [
+        ["textarea with a selection", field("TEXTAREA", { selectionStart: 2, selectionEnd: 5 }), true],
+        ["text input with a selection", field("INPUT", { type: "text", selectionStart: 0, selectionEnd: 3 }), true],
+        ["search input with a selection", field("INPUT", { type: "search", selectionStart: 1, selectionEnd: 2 }), true],
+        ["password input with a selection", field("INPUT", { type: "password", selectionStart: 1, selectionEnd: 4 }), true],
+        ["input with no type defaults to text", field("INPUT", { selectionStart: 1, selectionEnd: 4 }), true],
+        ["checkbox input never counts", field("INPUT", { type: "checkbox", selectionStart: 0, selectionEnd: 2 }), false],
+        ["number input is not a text-like field", field("INPUT", { type: "number", selectionStart: 0, selectionEnd: 2 }), false],
+        ["collapsed caret is no selection", field("TEXTAREA", { selectionStart: 3, selectionEnd: 3 }), false],
+        ["no selection API on the field", field("INPUT", { type: "text" }), false],
+        ["focused div is not a field", field("DIV"), false],
+        ["focused select is not a field", field("SELECT", { selectionStart: 0, selectionEnd: 1 }), false]
+      ];
+      for (const [label, element, expected] of cases) {
+        const got = api.activeElementHasTextSelection({ activeElement: element });
+        if (got !== expected) {
+          fail(`content.js: activeElementHasTextSelection — ${label}: expected ${expected}, got ${got}`);
+        }
+      }
+      if (api.activeElementHasTextSelection({ activeElement: null }) !== false) {
+        fail("content.js: activeElementHasTextSelection must be false with nothing focused");
+      }
+      // Open shadow roots: the deepest focused element wins (a closed root
+      // reads as its host and is covered by the host cases above).
+      const innerField = field("TEXTAREA", { selectionStart: 1, selectionEnd: 6 });
+      const host = field("DIV", { shadowRoot: { activeElement: innerField } });
+      if (api.activeElementHasTextSelection({ activeElement: host }) !== true) {
+        fail("content.js: activeElementHasTextSelection must walk open shadow roots to the focused textarea");
+      }
+      if (api.deepActiveElement({ activeElement: host }) !== innerField) {
+        fail("content.js: deepActiveElement must return the deepest focused element, not its host");
+      }
+      const nestedHost = field("DIV", { shadowRoot: { activeElement: host } });
+      if (api.activeElementHasTextSelection({ activeElement: nestedHost }) !== true) {
+        fail("content.js: activeElementHasTextSelection must walk nested shadow roots");
+      }
+      // A field whose selectionStart access throws (some input types) reads
+      // as no selection, never crashes the handler.
+      const throwing = field("INPUT", { type: "text" });
+      Object.defineProperty(throwing, "selectionStart", { get() { throw new Error("boom"); } });
+      if (api.activeElementHasTextSelection({ activeElement: throwing }) !== false) {
+        fail("content.js: activeElementHasTextSelection must survive a throwing selectionStart getter (false, never a crash)");
+      }
+    }
   }
 
   // Every in-page button that can bill (pill 重试, marker 重试) is trusted-click
@@ -525,6 +600,58 @@ return {
     }
   }
 
+  // PR #19 follow-up: a terminal pill (翻译失败 / partial / done) must never
+  // animate — the spin exists ONLY in the translating state, so an error pill
+  // cannot read as work still in flight.
+  {
+    const pillCssMatch = /const PROGRESS_PILL_CSS = `([\s\S]*?)`;/.exec(contentRaw);
+    if (!pillCssMatch) {
+      fail("content.js: cannot extract PROGRESS_PILL_CSS for the spinner-state test");
+    } else {
+      const pillCss = stripComments(pillCssMatch[1]);
+      // The only rules that may grant an animation are scoped to the
+      // translating state; every other rule must leave animation at none.
+      const animationRules = pillCss.match(/[^{}]*\{[^}]*animation:[^}]*\}/g) || [];
+      for (const rule of animationRules) {
+        const selector = rule.split("{")[0].trim();
+        if (/animation:(?!\s*none)/.test(rule) && !/\.pill\.translating \.ring$/.test(selector)) {
+          fail(`content.js: the progress pill may only animate in the translating state (.pill.translating .ring), found selector "${selector}"`);
+        }
+      }
+      if (!/\.pill\.translating \.ring \{ animation: pill-spin 0\.9s linear infinite; \}/.test(pillCss)) {
+        fail("content.js: the translating pill's ring must carry the pill-spin animation");
+      }
+      if (!/@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.pill\.translating \.ring \{ animation: none; \}/.test(pillCss)) {
+        fail("content.js: prefers-reduced-motion must disable even the translating spinner");
+      }
+      // The base .ring rule must be inert (border only) — animation lives on
+      // the .translating scope above.
+      const baseRing = /\.pill \.ring \{[^}]*\}/.exec(pillCss);
+      if (!baseRing || /animation/.test(baseRing[0])) {
+        fail("content.js: the base .pill .ring rule must not animate on its own");
+      }
+    }
+    if (renderPillSrc) {
+      // Exactly one spinning ring exists — in the translating branch — and
+      // the error/partial/done branches below it render only static rings
+      // (ringp) or none at all.
+      const translatingAt = renderPillSrc.indexOf('state.phase === "translating"');
+      const errorAt = renderPillSrc.indexOf('state.phase === "error"');
+      if (translatingAt < 0 || errorAt < 0 || translatingAt > errorAt) {
+        fail("content.js: renderProgressPill must branch on phase (translating before error)");
+      } else {
+        const spinningRings = renderPillSrc.match(/class="ring"/g) || [];
+        if (spinningRings.length !== 1 || renderPillSrc.indexOf('class="ring"') > errorAt) {
+          fail('content.js: only the translating pill may render <span class="ring"> (the error/partial/done pills use the static ringp)');
+        }
+        const terminalBranches = renderPillSrc.slice(errorAt);
+        if (/class="ring"/.test(terminalBranches) || /pill-spin/.test(terminalBranches)) {
+          fail("content.js: the error/partial/done pill branches must not render the spinning ring");
+        }
+      }
+    }
+  }
+
   // RETRY_FAILED retries failed blocks only — never a restore/re-run.
   const retrySlice = handlerSlice("RETRY_FAILED");
   if (!retrySlice) {
@@ -594,5 +721,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
     process.exit(1);
   }
-  console.log("OK: checks-content-150 (orderSegmentsByViewport tiers, split-empty failure accounting, COMMAND_SELECTION_TRANSLATE wiring, trusted in-page buttons, progress pill counters, retry-failed path, copy)");
+  console.log("OK: checks-content-150 (orderSegmentsByViewport tiers, split-empty failure accounting, COMMAND_SELECTION_TRANSLATE wiring incl. input-field selection hint, trusted in-page buttons, progress pill counters + translating-only spinner, retry-failed path, copy)");
 }
