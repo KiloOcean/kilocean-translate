@@ -4068,7 +4068,11 @@ async function checkKeyVerifierGate() {
         kimiApiKey: KIMI_STORED,
         apiKey: DS_STORED,
         model: "deepseek-flash",
-        targetLanguage: "zh-CN"
+        targetLanguage: "zh-CN",
+        // PR #19 P1-A: only a stored key VERIFIED for its own fingerprint is
+        // accepted as-is by the shortcut.
+        kimiKeyStatus: "verified",
+        kimiKeyStatusFor: `${KIMI_STORED.length}:${KIMI_STORED.slice(-4)}`
       },
       {
         runtimeMessageHandler: async (message) => {
@@ -4183,6 +4187,159 @@ async function checkKeyVerifierGate() {
       "welcome failed: Continue does not re-mark a failed key as verified"
     );
     assertEqual(welcome.storage.deepseekKeyStatus, "failed", "welcome failed: the failed status survives");
+  }
+
+  // ---- (c4) PR #19 P1-A (专业测试 repro): paste DeepSeek key A (its 401 is
+  // still in flight), switch to Kimi, switch back. A sits in storage as
+  // "unverified" — the stored-key shortcut must NOT offer 已配置 / a plain
+  // 继续, and 继续 must never write verified without a real success.
+  {
+    const KEY_A = fakeKey("p1aRepro", 22);
+    const fingerprintOf = (key) => `${key.length}:${key.slice(-4)}`;
+    let resolveA;
+    const gateA = new Promise((resolve) => { resolveA = resolve; });
+    let testCount = 0;
+    const welcome = createWelcomeVm(
+      { provider: "deepseek", deepseekApiKey: "", kimiApiKey: "", apiKey: "", model: "deepseek-flash", targetLanguage: "zh-CN" },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            testCount += 1;
+            return testCount === 1 ? gateA : { ok: false, code: "API_401", error: "Key 不正确" };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    welcome.fire(welcome.dom.get("s1-next"), "click");
+    const s2Key = welcome.dom.get("s2-key");
+    const s2Next = welcome.dom.get("s2-next");
+    s2Key.value = KEY_A;
+    welcome.fire(s2Key, "paste"); // A saved as unverified, its 401 parks
+    await settle(20);
+    assertEqual(welcome.storage.deepseekApiKey, KEY_A, "welcome P1-A: A is saved before its test");
+    assertEqual(welcome.storage.deepseekKeyStatus, "unverified", "welcome P1-A: A is unverified while its test is in flight");
+    welcome.fire(welcome.providerButtons[1], "click"); // Kimi
+    await settle(20);
+    resolveA({ ok: false, code: "API_401", error: "Key 不正确" }); // stale: lands under Kimi
+    await settle(20);
+    welcome.fire(welcome.providerButtons[0], "click"); // back to DeepSeek
+    await settle(20);
+    const msg = String(welcome.dom.get("s2-msg").textContent);
+    assertFalse(msg.includes("已配置"), "welcome P1-A: an unverified stored key is never offered as 已配置");
+    assertTrue(msg.includes("尚未验证"), "welcome P1-A: the message says the stored key is not verified yet");
+    assertEqual(s2Next.textContent, "验证并继续", "welcome P1-A: 继续 turns into 验证并继续 for an unverified stored key");
+    assertFalse(
+      welcome.writes.some((write) => write.updates.keyVerified === true || write.updates.deepseekKeyStatus === "verified"),
+      "welcome P1-A: nothing marked verified before Continue"
+    );
+    // Continue → a REAL verification of A (401) → failed, no step 3, no verified.
+    welcome.fire(s2Next, "click");
+    await settle(40);
+    assertEqual(testCount, 2, "welcome P1-A: 验证并继续 bills exactly one fresh TEST_CONNECTION for the stored key");
+    assertTrue(welcome.dom.get("step-3").hidden, "welcome P1-A: a 401 never opens step 3");
+    assertTrue(s2Next.disabled, "welcome P1-A: a 401 leaves 继续 disabled");
+    assertEqual(s2Next.textContent, "继续：试翻一段", "welcome P1-A: the button label is restored after the verdict");
+    assertTrue(String(welcome.dom.get("s2-msg").textContent).includes("✕"), "welcome P1-A: the 401 is shown");
+    assertEqual(welcome.storage.deepseekKeyStatus, "failed", "welcome P1-A: the real 401 persists failed");
+    assertEqual(welcome.storage.deepseekKeyStatusFor, fingerprintOf(KEY_A), "welcome P1-A: the failed status names A");
+    assertFalse(
+      welcome.writes.some((write) => write.updates.keyVerified === true || write.updates.deepseekKeyStatus === "verified"),
+      "welcome P1-A: Continue never writes verified for a key that returned 401"
+    );
+    welcome.fire(s2Next, "click"); // disabled now: no-op
+    await settle(20);
+    assertEqual(testCount, 2, "welcome P1-A: a disabled 继续 bills nothing");
+  }
+
+  // ---- (c5) PR #19 P1-A: an unverified stored key that DOES verify: 验证并继续
+  // runs one real test, then persists verified (fingerprinted) and opens step 3.
+  // A stored "verified" whose fingerprint names ANOTHER key counts as unverified.
+  for (const variant of ["unverified", "mismatch"]) {
+    const KEY = fakeKey(`p1aOk${variant}`, 23);
+    const fingerprintOf = (key) => `${key.length}:${key.slice(-4)}`;
+    let testCount = 0;
+    const welcome = createWelcomeVm(
+      {
+        provider: "deepseek",
+        deepseekApiKey: KEY,
+        kimiApiKey: "",
+        apiKey: KEY,
+        model: "deepseek-flash",
+        targetLanguage: "zh-CN",
+        deepseekKeyStatus: variant === "unverified" ? "unverified" : "verified",
+        deepseekKeyStatusFor: variant === "unverified" ? fingerprintOf(KEY) : "99:zzzz"
+      },
+      {
+        runtimeMessageHandler: async (message) => {
+          if (message?.type === "TEST_CONNECTION") {
+            testCount += 1;
+            return { ok: true };
+          }
+          return { ok: false };
+        }
+      }
+    );
+    await settle(20);
+    welcome.fire(welcome.dom.get("s1-next"), "click");
+    const s2Next = welcome.dom.get("s2-next");
+    assertFalse(String(welcome.dom.get("s2-msg").textContent).includes("已配置"), `welcome P1-A (${variant}): no 已配置 shortcut`);
+    assertEqual(s2Next.textContent, "验证并继续", `welcome P1-A (${variant}): 验证并继续 offered`);
+    assertEqual(testCount, 0, `welcome P1-A (${variant}): opening step 2 bills nothing`);
+    welcome.fire(s2Next, "click");
+    await settle(40);
+    assertEqual(testCount, 1, `welcome P1-A (${variant}): exactly one real TEST_CONNECTION`);
+    assertFalse(welcome.dom.get("step-3").hidden, `welcome P1-A (${variant}): a real success opens step 3`);
+    assertEqual(welcome.storage.deepseekKeyStatus, "verified", `welcome P1-A (${variant}): verified only after the real success`);
+    assertEqual(welcome.storage.deepseekKeyStatusFor, fingerprintOf(KEY), `welcome P1-A (${variant}): verified names this key`);
+  }
+
+  // ---- (c6) PR #19 P2 (welcome.js:374): with a verified stored key accepted
+  // (继续 enabled), pasting a REPLACEMENT key disables 继续 until the
+  // replacement's own verdict lands — a click meanwhile does nothing.
+  {
+    const STORED = fakeKey("p2Stored", 22);
+    const REPL = fakeKey("p2Replacement", 24);
+    const fingerprintOf = (key) => `${key.length}:${key.slice(-4)}`;
+    let resolveRepl;
+    const gateRepl = new Promise((resolve) => { resolveRepl = resolve; });
+    const welcome = createWelcomeVm(
+      {
+        provider: "deepseek",
+        deepseekApiKey: STORED,
+        kimiApiKey: "",
+        apiKey: STORED,
+        model: "deepseek-flash",
+        targetLanguage: "zh-CN",
+        deepseekKeyStatus: "verified",
+        deepseekKeyStatusFor: fingerprintOf(STORED)
+      },
+      {
+        runtimeMessageHandler: async (message) => (message?.type === "TEST_CONNECTION" ? gateRepl : { ok: false })
+      }
+    );
+    await settle(20);
+    welcome.fire(welcome.dom.get("s1-next"), "click");
+    const s2Key = welcome.dom.get("s2-key");
+    const s2Next = welcome.dom.get("s2-next");
+    assertTrue(String(welcome.dom.get("s2-msg").textContent).includes("已配置"), "welcome P2 replace: the verified stored key is offered");
+    assertFalse(s2Next.disabled, "welcome P2 replace: the verified stored key enables 继续");
+    s2Key.value = REPL;
+    welcome.fire(s2Key, "paste");
+    await settle(20);
+    assertTrue(s2Next.disabled, "welcome P2 replace: 继续 is disabled while the replacement key is being verified");
+    const writesBefore = welcome.writes.length;
+    welcome.fire(s2Next, "click");
+    await settle(20);
+    assertTrue(welcome.dom.get("step-3").hidden, "welcome P2 replace: a click during verification does not open step 3");
+    assertFalse(
+      welcome.writes.slice(writesBefore).some((write) => write.updates.keyVerified === true),
+      "welcome P2 replace: a click during verification persists nothing verified"
+    );
+    resolveRepl({ ok: true });
+    await settle(40);
+    assertFalse(s2Next.disabled, "welcome P2 replace: the replacement's success re-enables 继续");
+    assertEqual(welcome.storage.deepseekKeyStatusFor, fingerprintOf(REPL), "welcome P2 replace: verified names the replacement");
   }
 
   // ---- (d) welcome.js without shared.js fails loudly, console-free ----
@@ -7064,6 +7221,52 @@ async function checkPopupViews150() {
       `验证失败 · 尾号 ${BAD_KEY.slice(-4)}`,
       "failed reopen: the settings row reads 验证失败 with the rejected key's tail (never 已配置)"
     );
+  }
+
+  // (14c) PR #19 P1-B (专业测试 repro): re-testing an ALREADY verified key in
+  // settings that now returns 401 must flip the settings row AND the main
+  // view's provider line away from 已连接 immediately — not only after the
+  // popup is closed and reopened (the session verified flag must clear).
+  {
+    let tests = 0;
+    const fp = `${DEEPSEEK_KEY.length}:${DEEPSEEK_KEY.slice(-4)}`;
+    const popup = createPopupVm(seededMain({ deepseekKeyStatus: "verified", deepseekKeyStatusFor: fp }), {
+      runtimeMessageHandler: async (message) => {
+        if (message?.type === "TEST_CONNECTION") {
+          tests += 1;
+          return tests === 1 ? { ok: true } : { ok: false, code: "API_401", error: "Key 不正确" };
+        }
+        return { ok: false };
+      }
+    });
+    await popup.hooks.initializePromise;
+    // First test passes: the session flag is set, both surfaces read 已连接.
+    await fireAction(popup.dom.get("test-connection"), "click");
+    assertEqual(tests, 1, "P1-B retest: the first test bills one TEST_CONNECTION");
+    assertEqual(popup.dom.get("provider-status-label").textContent, "✓ DeepSeek 已连接", "P1-B retest: verified before the re-test");
+    assertEqual(
+      popup.dom.get("key-status-deepseek-value").textContent,
+      `已连接 · 尾号 ${DEEPSEEK_KEY.slice(-4)}`,
+      "P1-B retest: the row reads 已连接 before the re-test"
+    );
+    // Re-test → 401.
+    await fireAction(popup.dom.get("test-connection"), "click");
+    assertEqual(tests, 2, "P1-B retest: the re-test bills one more TEST_CONNECTION");
+    assertEqual(popup.dom.get("status-title").textContent, "Key 无效", "P1-B retest: the heading names the 401");
+    assertEqual(popup.storage.deepseekKeyStatus, "failed", "P1-B retest: storage holds failed");
+    assertEqual(popup.storage.deepseekKeyStatusFor, fp, "P1-B retest: the failed status names this key");
+    assertEqual(
+      popup.dom.get("key-status-deepseek-value").textContent,
+      `验证失败 · 尾号 ${DEEPSEEK_KEY.slice(-4)}`,
+      "P1-B retest: the provider row flips to 验证失败 immediately (no stale 已连接)"
+    );
+    assertEqual(popup.dom.get("key-status-deepseek").dataset.tone, "error", "P1-B retest: the provider row uses the error tone");
+    assertEqual(
+      popup.dom.get("provider-status-label").textContent,
+      "DeepSeek Key 验证失败 · 点此重新测试",
+      "P1-B retest: the main view's provider line flips to 验证失败 immediately"
+    );
+    assertEqual(popup.dom.get("provider-status").dataset.tone, "warn", "P1-B retest: the main line leaves the ok tone");
   }
 
   // (14b) Transient failures say nothing about the key: no failed write, the

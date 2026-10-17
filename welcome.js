@@ -86,6 +86,17 @@
   // key is rewritten on persist; an accepted stored key only flips the
   // provider/model/mirror).
   let verifiedKey = null;
+  // PR #19 P1-A (专业测试): a stored key is only accepted as-is when its
+  // persisted status is "verified" AND <provider>KeyStatusFor matches that
+  // key's fingerprint. Any other stored key (unverified, failed, missing
+  // status, mismatched fingerprint) puts step 2 into "verify first" mode:
+  // 继续 becomes 验证并继续 and runs a real TEST_CONNECTION before anything
+  // is marked verified. storedKeyNeedsVerification holds the provider whose
+  // stored key is in that mode (or "").
+  let storedKeyNeedsVerification = "";
+  let storedKeyVerifying = false;
+  const S2_NEXT_LABEL = "继续：试翻一段";
+  const S2_NEXT_VERIFY_LABEL = "验证并继续";
   // Codex PR #19 P2 (stale verification): the verification that currently owns
   // step 2's UI, as {token, provider, key}. Every verification captures its
   // token; a verdict is applied ONLY when its token is still current, the
@@ -188,6 +199,7 @@
     els.s2Field.classList.remove("err");
     setKeyMessage("", "");
     setVerified(false, null);
+    storedKeyVerifying = false;
     checkExistingKey();
   }
 
@@ -208,7 +220,22 @@
   function setVerified(ok, key) {
     verified = ok;
     verifiedKey = ok ? key : null;
+    // Any verdict (or reset) leaves the stored-key "verify first" mode; only
+    // checkExistingKey re-enters it via setStoredKeyNeedsVerification.
+    storedKeyNeedsVerification = "";
+    els.s2Next.textContent = S2_NEXT_LABEL;
     els.s2Next.disabled = !ok;
+  }
+
+  // The stored key exists but is not proven (P1-A): 继续 stays clickable as
+  // 验证并继续, which verifies the stored key for real before step 3.
+  // verified stays false, so nothing on this path can persist "verified".
+  function setStoredKeyNeedsVerification(keyProvider) {
+    verified = false;
+    verifiedKey = null;
+    storedKeyNeedsVerification = keyProvider;
+    els.s2Next.textContent = S2_NEXT_VERIFY_LABEL;
+    els.s2Next.disabled = false;
   }
 
   function validateKeyFormat(key) {
@@ -370,6 +397,11 @@
     els.s2Field.classList.remove("err");
     els.s2Msg.className = "msg";
     els.s2Msg.innerHTML = '<span class="spin" aria-hidden="true"></span> 正在保存并验证…';
+    // PR #19 P2 (welcome.js:374, upgraded with P1-A): while a replacement key
+    // is being verified, 继续 must not accept the previously verified/stored
+    // key — disable it until this key's own verdict lands.
+    storedKeyVerifying = false;
+    setVerified(false, null);
     const token = claimKeyVerification(keyProvider, key);
     const result = await keyVerifier.request(keyProvider, key, { trigger });
     if (result && result.superseded) {
@@ -443,8 +475,15 @@
       const status = stored[statusField];
       const fingerprint = stored[statusForField];
       const matches = fingerprint === Utils.keyFingerprint(existing);
-      // A definitive failed verdict for THIS key must not enable 继续 or be
-      // re-marked verified without a fresh TEST_CONNECTION.
+      // PR #19 P1-A: the shortcut accepts a stored key ONLY when its status is
+      // "verified" for exactly this key's fingerprint.
+      if (status === "verified" && matches) {
+        setKeyMessage(`已配置 · 尾号 ${existing.slice(-4)}（可直接继续，或粘贴新 Key 替换）`, "ok");
+        setVerified(true, null);
+        return;
+      }
+      // A definitive failed verdict for THIS key: 继续 stays disabled until
+      // the user pastes a key that verifies.
       if (status === "failed" && matches) {
         setKeyMessage(
           `上次验证失败 · 尾号 ${existing.slice(-4)} · 请重新粘贴或重新测试`,
@@ -453,24 +492,129 @@
         setVerified(false, null);
         return;
       }
-      setKeyMessage(`已配置 · 尾号 ${existing.slice(-4)}（可直接继续，或粘贴新 Key 替换）`, "ok");
-      setVerified(true, null);
+      // Unverified, missing status, or a status computed on another key: the
+      // key was never proven — require a real verification before 继续.
+      setKeyMessage(
+        `已保存 · 尾号 ${existing.slice(-4)} · 尚未验证（点「验证并继续」先验证，或粘贴新 Key 替换）`,
+        ""
+      );
+      setStoredKeyNeedsVerification(chosenProvider);
     } catch {
       // Ignore — the user can still paste a key.
     }
   }
 
-  els.s2Next.addEventListener("click", async () => {
-    if (!verified) {
+  // 验证并继续 (P1-A): run a REAL verification of the stored key; only its
+  // success persists "verified" and opens step 3. Every await re-checks that
+  // the user did not switch provider / start typing / re-enter this flow.
+  async function verifyStoredKeyAndContinue() {
+    const keyProvider = provider;
+    const key = await readStoredKey(keyProvider);
+    if (provider !== keyProvider || els.s2Key.value.trim() || storedKeyNeedsVerification !== keyProvider) {
       return;
     }
-    // An already-stored key was accepted for the selected provider: persist
-    // the provider switch (provider + default model + mirror + verified flag)
-    // in ONE write before step 3 samples it (a pasted key already persisted
-    // at verification time — nothing to repeat).
-    if (verifiedKey === null) {
+    if (!key || validateKeyFormat(key)) {
+      setKeyMessage("✕ 已保存的 Key 无效，请重新粘贴", "er");
+      setVerified(false, null);
+      return;
+    }
+    storedKeyVerifying = true;
+    els.s2Next.disabled = true;
+    els.s2Msg.className = "msg";
+    els.s2Msg.innerHTML = '<span class="spin" aria-hidden="true"></span> 正在验证已保存的 Key…';
+    const token = claimKeyVerification(keyProvider, key);
+    const result = await keyVerifier.request(keyProvider, key, { trigger: "click" });
+    const stillCurrent = () =>
+      storedKeyVerifying &&
+      keyVerification.token === token &&
+      provider === keyProvider &&
+      !els.s2Key.value.trim();
+    if ((result && result.superseded) || !stillCurrent()) {
+      return;
+    }
+    storedKeyVerifying = false;
+    if (result && result.ok && !result.environmentSkipped) {
       try {
-        await persistVerifiedProvider(provider, null);
+        await persistVerifiedProvider(keyProvider, key);
+      } catch {
+        setKeyMessage("保存失败，请重试", "er");
+        setStoredKeyNeedsVerification(keyProvider);
+        return;
+      }
+      if (provider !== keyProvider || els.s2Key.value.trim()) {
+        return;
+      }
+      setKeyMessage(`✓ 已连接 · 尾号 ${key.slice(-4)} · 已保存`, "ok");
+      setVerified(true, key);
+      showStep(3);
+      return;
+    }
+    if (result && result.ok && result.environmentSkipped) {
+      // No real verification happened: never mark verified.
+      setKeyMessage("当前环境无法验证，请在扩展弹窗里测试连接", "er");
+      setVerified(false, null);
+      return;
+    }
+    if (result && !Utils.isTransientKeyVerdict(result)) {
+      try {
+        await chrome.storage.local.set(Utils.keyStatusPatch(keyProvider, "failed", key));
+      } catch {
+        // The verdict message below still tells the user it failed.
+      }
+      setKeyMessage(`✕ ${(result && result.error) || "连接失败"}（请重新粘贴 Key）`, "er");
+      setVerified(false, null);
+      return;
+    }
+    // Transient (network/timeout/429/5xx): nothing learned about the key —
+    // keep 验证并继续 available for a retry.
+    setKeyMessage(`✕ ${(result && result.error) || "连接失败，请稍后重试"}（可再次点「验证并继续」）`, "er");
+    setStoredKeyNeedsVerification(keyProvider);
+  }
+
+  els.s2Next.addEventListener("click", async () => {
+    if (storedKeyVerifying) {
+      return;
+    }
+    if (!verified) {
+      if (storedKeyNeedsVerification && storedKeyNeedsVerification === provider) {
+        await verifyStoredKeyAndContinue();
+      }
+      return;
+    }
+    // An already-stored key was accepted for the selected provider. Re-check
+    // storage right before persisting: the shortcut is valid only while the
+    // stored status is still "verified" for the stored key's fingerprint
+    // (another surface may have replaced the key or recorded a failure).
+    if (verifiedKey === null) {
+      const chosenProvider = provider;
+      const meta = PROVIDERS[chosenProvider];
+      let stillVerified = false;
+      if (canStore) {
+        try {
+          const stored = await chrome.storage.local.get([
+            meta.keyField,
+            `${chosenProvider}KeyStatus`,
+            `${chosenProvider}KeyStatusFor`
+          ]);
+          const existing = String((stored && stored[meta.keyField]) || "").trim();
+          stillVerified = Boolean(existing) &&
+            stored[`${chosenProvider}KeyStatus`] === "verified" &&
+            stored[`${chosenProvider}KeyStatusFor`] === Utils.keyFingerprint(existing);
+        } catch {
+          stillVerified = false;
+        }
+      }
+      if (provider !== chosenProvider || verifiedKey !== null || !verified) {
+        return;
+      }
+      if (!stillVerified) {
+        setKeyMessage("已保存的 Key 状态已变化，需要重新验证", "");
+        setStoredKeyNeedsVerification(chosenProvider);
+        await verifyStoredKeyAndContinue();
+        return;
+      }
+      try {
+        await persistVerifiedProvider(chosenProvider, null);
       } catch {
         setKeyMessage("保存失败，请重试", "er");
         return;

@@ -2079,11 +2079,23 @@ function renderKeyTestResult(result, provider, key, label) {
     return;
   }
   setupRejectedKey = key;
+  // PR #19 P1-B (专业测试): a failed re-test of a key this popup had already
+  // marked verified must retire the session flag — otherwise
+  // keyVerificationStatus() keeps answering "verified" and the settings row
+  // and the main view's provider line keep claiming 已连接 until the popup is
+  // reopened. With the flag cleared, both re-render from the persisted status
+  // (persistKeyVerdict already reconciled "failed" for a definitive failure;
+  // a transient failure leaves whatever storage holds).
+  keyVerified[provider] = false;
   const [title, detail] = friendlyKeyTestFailure(result, label);
   if (!renderSetupFeedback(`✗ ${title}：${detail}`)) {
     renderStatus(title, detail, "error");
   }
+  // Redraw the settings provider rows AND the main view's provider status
+  // line right away (renderKeyStatus ends in renderProviderStatus; called
+  // explicitly too so the main line never depends on that ordering).
   renderKeyStatus();
+  renderProviderStatus();
 }
 
 function friendlyKeyTestFailure(response, label) {
