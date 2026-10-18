@@ -58,7 +58,7 @@ Codex 线程分级（共享实现）：显式 P0/P1 阻断；未标注线程一�
 |------|--------|
 | **Require status checks to pass before merging** | 没有绿勾不能合 |
 | Required check: **`ci / Build & Test`** | CI job 名（`.github/workflows/ci.yml`） |
-| Required check: **`copilot-pull-request-reviewer`** | Copilot 官方审查 check（配额耗尽时可临时人工豁免，见上） |
+| ~~Required check: `copilot-pull-request-reviewer`~~ | **不设为 required**：它只出现在 Copilot 审过的那个 head 上，后续 push 不会重审，设为 required 会挡住所有 push 后的合并。Copilot 由 Auto Merge 内部判断（任一提交有过 Copilot review） |
 | Required check: **`codex / Codex Review Gate`** | **job / check-run 名**（`.github/workflows/codex-gate.yml`），不是 workflow 展示名 |
 | Required check: **`ci / Secret Scan`** | gitleaks（`ci.yml` 调用 devflow-gates） |
 | Required check: **`qa / QA Gate`** | QA label `qa-passed`（`qa-gate.yml`，见 `QA.md`） |
