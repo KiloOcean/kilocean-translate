@@ -27,8 +27,11 @@ jobs:
     name: Copilot Review
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Request Copilot once per PR (open / ready), not on every push: the
-    # Copilot ruleset already re-reviews pushes and the quota is exhausted.
+    # Request Copilot once per PR (open / ready), never per push: Actions
+    # minutes and Copilot quota are scarce, and no ruleset re-reviews on push
+    # (dota2.ai's Copilot ruleset has review_on_push=false; other repos have
+    # none). Auto Merge therefore only requires one Copilot review on any
+    # commit (copilot_scope: any); head freshness = Codex gate + CI + QA.
     if: vars.DISABLE_COPILOT_REVIEW != 'true' && github.event.pull_request.draft == false && github.event.action != 'synchronize'
     
     steps:
