@@ -17,7 +17,7 @@ Chrome Web Store:
 https://chromewebstore.google.com/detail/lmdbhjngjhlgbpmbjfffegjalchblpke
 
 GitHub:
-https://github.com/KiloOcean/kilocean-translate
+https://github.com/qianhaoq/kilocean-translate
 
 Early days — looking for honest feedback (bugs and “please don’t add X” both useful). No review farming.
 
