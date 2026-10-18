@@ -34,7 +34,7 @@ Kilocean Translate is a Chrome/Edge MV3 extension: progressive page translation 
 node scripts/ci-check.mjs
 ```
 
-Merge policy: docs/MERGE_GATES.md and AGENTS.md — hard gates `ci / Build & Test` + `ci / Secret Scan` + `codex / Codex Review Gate` (P0/P1/unlabeled) + `qa / QA Gate` (`qa-passed`) + blocking threads; never Build-only. Copilot soft-path: missing official check but head APPROVED/COMMENTED OK for Auto Merge; required-check / native conversation resolution limits documented in MERGE_GATES.
+Merge policy: docs/MERGE_GATES.md and AGENTS.md — hard gates `ci / Build & Test` + `ci / Secret Scan` + `codex / Codex Review Gate` (P0/P1/unlabeled) + `qa / QA Gate` (`qa-passed`) + blocking threads; never Build-only. Auto Merge needs one Copilot APPROVED/COMMENTED review on any commit (copilot_scope: any; head Copilot check ignored); required-check / native conversation resolution limits documented in MERGE_GATES.
 
 ## Agent behavior
 

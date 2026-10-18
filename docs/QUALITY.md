@@ -114,7 +114,7 @@ Branch name pattern: main
 - `ci / Build & Test`、`ci / Secret Scan`、`copilot-pull-request-reviewer`、`codex / Codex Review Gate`、`qa / QA Gate` 都应设为必需 check
 - Copilot check **不覆盖** Codex；Codex 靠 `codex-gate.yml` + conversation resolution
 - Custom LLM Review 与 `ai-review.yml` 的 “Copilot Review”（只负责请求审查）不要设为必需
-- auto-merge：**不要求** Copilot 原生 `APPROVED`。head 上必须有 Copilot review 且不是 `CHANGES_REQUESTED`（`APPROVED`/`COMMENTED` 均可），线程必须全部 resolve，且必须有成功的 **ci / Build & Test**、**ci / Secret Scan**、**codex / Codex Review Gate**、**qa / QA Gate** check run（缺失即不合）。
+- auto-merge：**不要求** Copilot 原生 `APPROVED`。PR 上（任一提交）必须有过 Copilot review 且最新一条不是 `CHANGES_REQUESTED`（`APPROVED`/`COMMENTED` 均可），线程必须全部 resolve，且必须有成功的 **ci / Build & Test**、**ci / Secret Scan**、**codex / Codex Review Gate**、**qa / QA Gate** check run（缺失即不合）。
 
 ---
 

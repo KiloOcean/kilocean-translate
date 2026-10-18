@@ -9,7 +9,7 @@ This page is the source of truth for merge policy.
 
 ## Check names after devflow-gates migration
 
-本仓库的 CI / Codex / QA / Auto Merge 改为调用 `qianhaoq/devflow-gates` 的 reusable workflow（固定到 commit `3853cc9`，即 3853cc9dedbf1ffd8b10def841ed4c822dae7906）。Check 名变为 `<caller job> / <called job>`，branch protection 与 `auto-merge.yml` 的 `required_checks` 必须使用以下名字：
+本仓库的 CI / Codex / QA / Auto Merge 改为调用 `qianhaoq/devflow-gates` 的 reusable workflow（固定到 commit `37aef85`，即 37aef857960dd425a1d48ef781818c89d889db2c）。Check 名变为 `<caller job> / <called job>`，branch protection 与 `auto-merge.yml` 的 `required_checks` 必须使用以下名字：
 
 - `ci / Build & Test`
 - `ci / Secret Scan`
@@ -37,7 +37,7 @@ Codex 线程分级（共享实现）：显式 P0/P1 阻断；未标注线程一�
 - Copilot review **可以**临时豁免（人工合入）。
 - **仍然禁止**只靠 Build 绿灯合入。
 - **ci / Secret Scan + codex / Codex Review Gate + qa / QA Gate + conversation resolution** 仍是硬门槛。
-- Auto-merge：**Soft-path** — 若官方 `copilot-pull-request-reviewer` check 缺失，但 head 已有 Copilot `APPROVED`/`COMMENTED` review，则视为 Copilot 门槛满足；仍无 head review → fail-closed。不要放宽成 "Build only"。
+- Auto-merge：`copilot_scope: any` — PR 上任一提交有过 Copilot `APPROVED`/`COMMENTED` review 即满足（head 上的 `copilot-pull-request-reviewer` check 不参与判断）；从未审过 → fail-closed。不要放宽成 "Build only"。
 
 ---
 
@@ -111,9 +111,9 @@ Gate **只申请 read**（`contents` / `pull-requests` / `issues`）。**没有*
 2. 没有 `no-auto-merge` label
 3. head SHA 上有成功的 **`ci / Build & Test`**、**`ci / Secret Scan`**、**`qa / QA Gate`** check run（`required_checks`；fail closed；不用 legacy combined status）
 4. 相关 check 已完成且未失败（忽略 Custom LLM Review、Auto Merge 自己）。同名 check 只看最新 `created_at`
-5. head 上 **`copilot-pull-request-reviewer`** `conclusion: success`（skipped / neutral → 不合）。**Soft-path：** 官方 check 缺失但 head 已有 Copilot `APPROVED`/`COMMENTED` → 视为满足；仍无 head review → fail-closed
+5. （已取消）head 上的 `copilot-pull-request-reviewer` check 不再参与判断（`copilot_scope: any`：缺失、运行中、失败都不阻断）。Copilot 只在 opened / ready_for_review 请求一次，没有按 push 的重审
 6. head 上 **`codex / Codex Review Gate`** `conclusion: success`（缺失 / skipped / neutral → 不合）
-7. 该 head SHA 上已有 Copilot review，且**不是** `CHANGES_REQUESTED`
+7. 该 PR 上（**任一提交**）已有 Copilot review，且最新一条**不是** `CHANGES_REQUESTED`；head 新鲜度由 Codex Gate / CI / QA 保证（仓库变量 `DISABLE_COPILOT_REVIEW=true` 同时关闭请求与该要求）
    - **`APPROVED` 或 `COMMENTED` 均可。不要求原生 `APPROVED`。**
    - 没有 Copilot review → 不合
    - `COMMENTED` + 未解决行内线程 → 不合（靠第 8 条）
@@ -140,7 +140,7 @@ GitHub branch protection **没有**严重度 / soft-path 过滤器：
 
 | 原生设置 | 与本仓工作流的关系 |
 |----------|-------------------|
-| Required check `copilot-pull-request-reviewer` | Auto Merge 的 **soft-path**（配额耗尽、check 缺失但 head 已有 Copilot review）只影响工作流自身判断。若该 check 仍是 required status check，`pulls.merge` / UI 仍会因缺失 check 被拒，除非临时去掉 required、或给合并 actor（含 `github-actions`）开 bypass。配额耗尽时的人工合入仍须 Codex Gate + Build，禁止 Build-only。 |
+| Required check `copilot-pull-request-reviewer` | Auto Merge 的 Copilot 判断（`copilot_scope: any`：任一提交有过 Copilot review 即可，不看 head 上的 check）只影响工作流自身判断。若该 check 仍是 required status check，`pulls.merge` / UI 仍会因缺失 check 被拒，除非临时去掉 required、或给合并 actor（含 `github-actions`）开 bypass。配额耗尽时的人工合入仍须 Codex Gate + Build，禁止 Build-only。 |
 | Require conversation resolution | 无作者/严重度例外。若开启，**未 Resolve 的纯 P2 也会挡住** merge。建议：Codex Gate 可对纯 P2 先行绿灯；合入前仍用 `P2: defer — …` Resolve（或关原生 conversation resolution，改信 Auto Merge 的 GraphQL 严重度门槛；若要「P2 真·保持 open 也能 API 合入」，给 `github-actions` bypass）。 |
 
 ## 评审严重度 | Review severity (P0 / P1 / P2)
