@@ -140,7 +140,7 @@
 
 **Kilocean facts (primary):**  
 - CWS: [lmdbhjngjhlgbpmbjfffegjalchblpke](https://chromewebstore.google.com/detail/lmdbhjngjhlgbpmbjfffegjalchblpke) — listing shows **“No ratings”**, ~**8 users**, v1.3.0 listed on store page (repo `manifest.json` is **1.3.1**).  
-- GitHub: [KiloOcean/kilocean-translate](https://github.com/qianhaoq/kilocean-translate) — **0 stars**, **0 open issues**; history is closed internal PRs only (no external user bug reports yet).  
+- GitHub: [qianhaoq/kilocean-translate](https://github.com/qianhaoq/kilocean-translate) — **0 stars**, **0 open issues**; history is closed internal PRs only (no external user bug reports yet).  
 - Permissions: `activeTab`, `scripting`, `storage` + host `https://api.deepseek.com/*` only. Key local; no account/membership in README.
 
 | Competitor pain | Kilocean today | Gap / risk for Kilocean |
