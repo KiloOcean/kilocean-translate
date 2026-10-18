@@ -3,6 +3,12 @@ name: AI Code Review
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Not a required check: skip docs-only changes (saves Actions minutes).
+    paths-ignore: ['**/*.md', 'docs/**']
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -17,7 +23,10 @@ jobs:
   copilot-review:
     name: Copilot Review
     runs-on: ubuntu-latest
-    if: vars.DISABLE_COPILOT_REVIEW != 'true' && github.event.pull_request.draft == false
+    timeout-minutes: 5
+    # Request Copilot once per PR (open / ready), not on every push: the
+    # Copilot ruleset already re-reviews pushes and the quota is exhausted.
+    if: vars.DISABLE_COPILOT_REVIEW != 'true' && github.event.pull_request.draft == false && github.event.action != 'synchronize'
     
     steps:
       - name: Request Copilot Code Review
@@ -82,6 +91,7 @@ jobs:
     if: github.event.pull_request.draft == false
     name: Custom LLM Review (Optional)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Skip notice (no secrets on pull_request)
         run: |
