@@ -16,6 +16,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+    # Docs-only merges don't need a post-merge CI run (PR CI stays unfiltered:
+    # a required check must never go missing on a PR).
+    paths-ignore: ['**/*.md', 'docs/**']
   # Manual runs (Actions tab / `gh workflow run ci.yml --ref <branch>`).
   workflow_dispatch:
 
@@ -24,7 +27,7 @@ permissions:
 
 jobs:
   ci:
-    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@855d62df74bfbcc25ee902b0681c1b53968f2f56  # devflow-gates main @ 855d62d (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
     with:
       node_version: '20'          # '' skips setup-node
       python_version: ''          # '' skips setup-python
