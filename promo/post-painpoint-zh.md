@@ -13,7 +13,7 @@
 - 双语对照 / 仅译文 / 原文；划词先确认再计费；动态内容跟译
 
 商店：https://chromewebstore.google.com/detail/lmdbhjngjhlgbpmbjfffegjalchblpke
-GitHub：https://github.com/KiloOcean/kilocean-translate
+GitHub：https://github.com/qianhaoq/kilocean-translate
 
 欢迎真实反馈（含差评场景）。不刷评。
 

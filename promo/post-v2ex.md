@@ -18,7 +18,7 @@
 https://chromewebstore.google.com/detail/lmdbhjngjhlgbpmbjfffegjalchblpke
 
 开源：
-https://github.com/KiloOcean/kilocean-translate
+https://github.com/qianhaoq/kilocean-translate
 
 有 bug 或想要的功能直接回帖，按真实反馈排。独立开发，和 DeepSeek 官方无关；API 费用按官方计费。
 
