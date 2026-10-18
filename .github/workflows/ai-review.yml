@@ -6,9 +6,12 @@ on:
     # Not a required check: skip docs-only changes (saves Actions minutes).
     paths-ignore: ['**/*.md', 'docs/**']
 
+# Pushes (synchronize) only cancel older push runs; the opened / reopened /
+# ready_for_review run that requests the Copilot review is in its own
+# group and is never cancelled by a follow-up push.
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: ai-review-${{ github.event.pull_request.number }}-${{ github.event.action == 'synchronize' && 'push' || github.run_id }}
+  cancel-in-progress: ${{ github.event.action == 'synchronize' }}
 
 permissions:
   contents: read
