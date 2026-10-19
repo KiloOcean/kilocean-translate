@@ -12,6 +12,6 @@ I built a Chrome webpage translator around the complaints people keep posting ab
 - Bilingual / translation-only / original; selection translate confirms before it spends tokens; follows dynamic content
 
 Store: https://chromewebstore.google.com/detail/lmdbhjngjhlgbpmbjfffegjalchblpke
-GitHub: https://github.com/KiloOcean/kilocean-translate
+GitHub: https://github.com/qianhaoq/kilocean-translate
 
 Looking for real feedback, including failures. No review farming.
