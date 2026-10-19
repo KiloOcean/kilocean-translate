@@ -16,7 +16,7 @@ CI 绿灯是**必要但不充分**条件。**禁止**仅凭 `ci / Build & Test` 
 
 ### Copilot
 
-- 默认要求 `copilot-pull-request-reviewer`（auto-merge 亦然）
+- 默认要求 Copilot 评审：auto-merge 要求 PR 上任一提交有过 Copilot review（`copilot_scope: any`，不按 push 重审）
 - 配额耗尽时可**人工**豁免，但仍须 Codex + 会话解决 + Build
 - Review 可为 `COMMENTED`（不要求 `APPROVED`）；`CHANGES_REQUESTED` 或未解决线程则不合
 

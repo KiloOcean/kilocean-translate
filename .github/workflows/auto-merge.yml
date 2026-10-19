@@ -64,7 +64,7 @@ jobs:
       (github.event_name != 'pull_request_review' ||
       github.event.review.state == 'approved' ||
       github.event.review.user.login == 'copilot-pull-request-reviewer[bot]')
-    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@d83753839f5bf0a3b795f1578b0d1ff8c4cf9ff5  # devflow-gates main @ d837538 (heal cancelled required; bump deliberately)
     with:
       # Exact check-run names = "<caller job name> / <called job name>"
       # from YOUR ci.yml / codex-gate.yml / qa-gate.yml callers. "ci / Secret Scan"
@@ -76,4 +76,10 @@ jobs:
         qa / QA Gate
         understand / Diff Quiz Gate
       merge_method: squash
-      require_copilot: true   # soft-path: official check may be missing; head Copilot review required, CHANGES_REQUESTED vetoes
+      # Copilot is requested once per PR (ai-review: opened / ready_for_review),
+      # never per push, so require "reviewed at least once, on any commit"
+      # (copilot_scope: any). Per-head freshness = Codex gate + CI + QA.
+      # Same switch as ai-review: repo var DISABLE_COPILOT_REVIEW=true turns
+      # off both the request and this requirement.
+      require_copilot: ${{ vars.DISABLE_COPILOT_REVIEW != 'true' }}
+      copilot_scope: any
