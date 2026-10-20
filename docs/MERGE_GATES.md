@@ -183,3 +183,5 @@ GitHub branch protection **没有**严重度 / soft-path 过滤器：
 | `AGENTS.md` | Agent 操作简报（含 merge policy） |
 
 <!-- gate e2e 2026-09-09 -->
+
+<!-- probe: Diff Quiz Gate check (2026-10-20) -->
