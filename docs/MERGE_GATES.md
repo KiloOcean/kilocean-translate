@@ -185,3 +185,5 @@ GitHub branch protection **没有**严重度 / soft-path 过滤器：
 <!-- gate e2e 2026-09-09 -->
 
 <!-- probe: Diff Quiz Gate check (2026-10-20) -->
+
+<!-- probe2: after refresh perms fix (2026-10-20) -->
