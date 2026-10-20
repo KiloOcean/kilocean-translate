@@ -64,7 +64,7 @@ jobs:
       (github.event_name != 'pull_request_review' ||
       github.event.review.state == 'approved' ||
       github.event.review.user.login == 'copilot-pull-request-reviewer[bot]')
-    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@d83753839f5bf0a3b795f1578b0d1ff8c4cf9ff5  # devflow-gates main @ d837538 (heal cancelled required; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@42fdd49f44c69f4e748c6f8e9bf1ac2b0ffb18e2  # devflow-gates main @ 42fdd49 (方案 B; bump deliberately)
     with:
       # Exact check-run names = "<caller job name> / <called job name>"
       # from YOUR ci.yml / codex-gate.yml / qa-gate.yml callers. "ci / Secret Scan"
