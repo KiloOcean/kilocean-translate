@@ -60,10 +60,12 @@ jobs:
       (contains(github.event.comment.body, '## Diff Quiz Answer') ||
        contains(github.event.comment.body, '## Diff Quiz Override') ||
        startsWith(github.event.comment.body, '/recheck'))
+    # Ceiling must cover nested evaluate job in the reusable (GitHub checks every
+    # called job against this ceiling even when this caller job is skipped).
     permissions:
       contents: read
-      pull-requests: read
-      issues: read
+      pull-requests: write
+      issues: write
       actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@430987e75c8ccc4b87e56cc58ccab2d9bbc378df  # devflow-gates main @ 430987e (pinned; bump deliberately)
     with:
