@@ -1,0 +1,49 @@
+# Cancel-heal companion for Diff Quiz Gate — copy to
+# YOUR_REPO/.github/workflows/understand-gate-cancel-heal.yml
+# alongside understand-gate.yml.
+#
+# ⛔ name 必须与 "Diff Quiz Gate" 不同。若写成同名且
+#   on.workflow_run.workflows: ["Diff Quiz Gate"]，GitHub 视为自监听，
+#   整份 Diff Quiz Gate 工作流 silent 失效（见 docs/PITFALLS.md）。
+#
+# 本文件只监听主门禁 "Diff Quiz Gate" 的 completed；仅 cancelled 且
+# 原触发事件不是 push 时跑 heal（与原 understand-cancel-heal job 逻辑一致）。
+# workflow_run 只在默认分支上的文件生效；链条上限 3 层，不会循环。
+# 调用 reusable 的 job 必须 pull-requests/issues: write（read → startup_failure）。
+
+name: Diff Quiz Gate Cancel Heal
+
+on:
+  workflow_run:
+    workflows: ["Diff Quiz Gate"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+# 每个触发 run 独立 group，永不 cancel-in-progress：heal 不能被新 push 取消
+# （re-run 保留原事件，不会进主门禁的 push 组）。
+concurrency:
+  group: understand-cancel-heal-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  understand-cancel-heal:
+    if: >-
+      github.event.workflow_run.conclusion == 'cancelled' &&
+      github.event.workflow_run.event != 'push'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
+    with:
+      runs_on: ubuntu-latest  # public repo has no self-hosted runners
+      glm_model: 'glm-5.3-flash'
+    secrets:
+      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+
