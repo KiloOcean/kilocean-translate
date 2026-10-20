@@ -5,3 +5,6 @@ node_modules/
 *.pem
 .env
 .env.*
+# Codex CLI 凭证，勿提交
+.codex/
+auth.json
