@@ -48,7 +48,7 @@ jobs:
       actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@430987e75c8ccc4b87e56cc58ccab2d9bbc378df  # devflow-gates main @ 430987e (pinned; bump deliberately)
     with:
-      runs_on: '["self-hosted", "linux", "x64"]'
+      runs_on: ubuntu-latest  # public repo has no self-hosted runners
       glm_model: 'glm-5.3-flash'
     secrets:
       GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
@@ -69,7 +69,7 @@ jobs:
       actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@430987e75c8ccc4b87e56cc58ccab2d9bbc378df  # devflow-gates main @ 430987e (pinned; bump deliberately)
     with:
-      runs_on: '["self-hosted", "linux", "x64"]'
+      runs_on: ubuntu-latest  # public repo has no self-hosted runners
       glm_model: 'glm-5.3-flash'
     secrets:
       GLM_API_KEY: ${{ secrets.GLM_API_KEY }}

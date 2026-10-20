@@ -184,6 +184,9 @@ GitHub branch protection **没有**严重度 / soft-path 过滤器：
 
 <!-- gate e2e 2026-09-09 -->
 
-<!-- probe: Diff Quiz Gate check (2026-10-20) -->
+## 自动修上限（2026-10-20）
 
-<!-- probe2: after refresh perms fix (2026-10-20) -->
+- Gate 仍只挡 **P0/P1（及未标注）**；**不要求人类 approve**。
+- **同类 P1** 自动修复超过 **3 轮**仍未清零（写死）：三轮上限**只**停自动修循环。**未 Resolve 的 P1 永远挡合入**；重试次数不改变严重度。开跟进 issue/PR 交给人/产品继续修。**严禁**因重试次数 observe / won't-fix / Resolve 放行。禁止为凑绿弱化测试。
+
+<!-- probe3: ubuntu-latest (2026-10-20) -->
