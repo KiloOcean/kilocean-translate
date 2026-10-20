@@ -183,3 +183,8 @@ GitHub branch protection **没有**严重度 / soft-path 过滤器：
 | `AGENTS.md` | Agent 操作简报（含 merge policy） |
 
 <!-- gate e2e 2026-09-09 -->
+
+## 自动修上限（2026-10-20）
+
+- Gate 仍只挡 **P0/P1**；**不要求人类 approve**。
+- **同类 P1** 自动修复超过 **3 轮**仍未清零：停止自动循环；开跟进 issue/PR，或降级观察（observe）。禁止为凑绿弱化测试。
