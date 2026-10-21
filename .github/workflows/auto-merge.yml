@@ -46,7 +46,10 @@ permissions:
   contents: write
   pull-requests: write
   checks: read
-  actions: read
+  # Reusable devflow-gates auto-merge (>= c61304d) requests actions: write
+  # to re-run CANCELLED required checks; caller must grant it or the run
+  # fails at startup.
+  actions: write
 
 concurrency:
   group: ${{ (github.event_name == 'workflow_dispatch' && format('auto-merge-pr-{0}', github.event.inputs.pr_number)) || (github.event_name == 'pull_request_review' && format('auto-merge-pr-{0}', github.event.pull_request.number)) || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' && format('auto-merge-pr-{0}', github.event.workflow_run.head_sha)) || 'auto-merge-sweep' }}
