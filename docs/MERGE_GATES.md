@@ -197,3 +197,5 @@ GitHub branch protection **没有**严重度 / soft-path 过滤器：
 - `integrity / Skip Guard` — 拦 skip/xit/optional/continue-on-error 逃避
 
 **暂不**加入 branch protection / auto-merge `required_checks`（等 2026-11-02 理解门禁验收前再定是否升必需）。逃生：`## Test Integrity Override` + 理由。
+
+> Probe note (2026-10-23): open a probe PR to verify observation checks `integrity / Assertion Guard` and `integrity / Skip Guard` appear on the check rollup after #37.
